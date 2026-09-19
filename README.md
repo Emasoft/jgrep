@@ -15,19 +15,11 @@ jgrep "catches an error and silently ignores it" src/
 
 *No index. No embeddings. No LLM round-trips. A whole `src/` tree in ~2 s for about a cent.*
 
+<img src="docs/demo.gif" alt="jgrep demo: semantic search over src/ and a git diff" width="900">
+
 </div>
 
 ---
-
-```
-$ jgrep "catches an error and silently ignores it" src/
-
-src/loop/state.ts:108-115   p=0.96  export function readRun(projectDir: string): RunInfo | null {
-src/loop/stop.ts:20-28      p=0.93  function groupAlive(pgid: number): boolean {
-src/nl/config-store.ts:33-46 p=0.93  export async function loadProviderConfig(): Promise<...> {
-...
-79 hits / 896 chunks (0 cached) · 240406 tokens · $0.0101 · 1.8s
-```
 
 ## Why
 
