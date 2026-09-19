@@ -1,0 +1,25 @@
+{
+  "name": "jevgrep",
+  "version": "0.2.0",
+  "description": "Semantic grep: describe the code you want in English, get file:line hits. Powered by TypeSafe Jev. No index, no embeddings, no dependencies.",
+  "keywords": ["grep", "semantic-search", "code-search", "jev", "typesafe", "lint", "cli"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/kyu1204/jgrep.git" },
+  "homepage": "https://github.com/kyu1204/jgrep",
+  "type": "module",
+  "bin": {
+    "jgrep": "dist/jgrep.js"
+  },
+  "files": ["dist", "skill", "README.md", "LICENSE"],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "bun build src/cli.ts --target=node --outfile=dist/jgrep.js && chmod +x dist/jgrep.js",
+    "test": "bun test src/",
+    "prepublishOnly": "bun run test && bun run build"
+  },
+  "devDependencies": {
+    "@clack/prompts": "^1.8.1"
+  }
+}
