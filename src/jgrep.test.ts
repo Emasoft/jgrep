@@ -99,3 +99,44 @@ test("installSkills copies SKILL.md only into agent homes that exist", async () 
   expect(dirs).toEqual([path.join(home, ".claude", "skills", "jgrep")]);
   expect(fs.readFileSync(path.join(dirs[0], "SKILL.md"), "utf8")).toContain("name: jgrep");
 });
+
+test("rows: csv parser handles quotes, commas and newlines inside quotes", async () => {
+  const { parseCsv } = await import("./rows");
+  const r = parseCsv('handle,bio\n@a,"skincare, daily ""GRWM""\nSeoul"\n@b,makeup\n');
+  expect(r.columns).toEqual(["handle", "bio"]);
+  expect(r.rows).toEqual([{ handle: "@a", bio: 'skincare, daily "GRWM"\nSeoul' }, { handle: "@b", bio: "makeup" }]);
+});
+
+test("rows: request keys, batching cap, cache and flatten", async () => {
+  const { buildRowsRequest, scoreRows, flatten, MAX_QUESTIONS_PER_REQUEST } = await import("./rows");
+  const rows = Array.from({ length: 40 }, (_, i) => ({ handle: `@u${i}`, bio: i % 2 ? "skincare" : "cars" }));
+  const questions = {
+    beauty: { type: "noul" as const, instructions: "beauty content?" },
+    cat: { type: "choice" as const, instructions: "category?", criteria: { skincare: "skin", other: "else" } },
+    fit: { type: "score" as const, instructions: "fit?", criteria: ["none", "some", "great"] },
+  };
+  const req = buildRowsRequest(rows.slice(0, 2), questions);
+  expect(Object.keys(req.questions)).toEqual(["r0.beauty", "r0.cat", "r0.fit", "r1.beauty", "r1.cat", "r1.fit"]);
+  expect((req.questions["r1.cat"] as any).criteria).toEqual({ skincare: "skin", other: "else" });
+  const calls: any[] = [];
+  const fetchImpl = (async (_u: string, init: any) => {
+    const body = JSON.parse(init.body); calls.push(body);
+    const answers: any = {};
+    body.state.rows.forEach((r: any) => {
+      const s = r.bio === "skincare";
+      answers[`${r.id}.beauty`] = { type: "noul", noul: s ? 0.9 : 0.1 };
+      answers[`${r.id}.cat`] = { type: "choice", choice: s ? "skincare" : "other", confidence: 0.8, probabilities: { skincare: s ? 0.85 : 0.1, other: s ? 0.15 : 0.9 } };
+      answers[`${r.id}.fit`] = { type: "score", score: s ? 1.7 : 0.2, confidence: 0.6, probabilities: {} };
+    });
+    return new Response(JSON.stringify({ answers, usage: { input_tokens: 10 } }), { status: 200 });
+  }) as any;
+  const cache = {};
+  const r = await scoreRows(rows, questions, { batch: 16, concurrency: 4, apiKey: "k", fetchImpl, cache });
+  const per = Math.min(16, Math.floor(MAX_QUESTIONS_PER_REQUEST / 3)); // batch cap wins: 16 rows per request
+  expect(calls.every((c) => Object.keys(c.questions).length <= MAX_QUESTIONS_PER_REQUEST)).toBe(true);
+  expect(r.requests).toBe(Math.ceil(40 / per));
+  expect(flatten(r.answers[1])).toEqual({ beauty: 0.9, cat: "skincare", cat_p: 0.85, fit: 1.7, fit_conf: 0.6 });
+  const r2 = await scoreRows(rows, questions, { batch: 16, concurrency: 4, apiKey: "k", fetchImpl, cache });
+  expect(r2.requests).toBe(0);
+  expect(r2.cached).toBe(40);
+});

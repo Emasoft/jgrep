@@ -84,6 +84,32 @@ Exit status is grep's (`0` matched, `1` nothing, `2` error), so CI negates it:
   env: { TYPESAFE_API_KEY: "${{ secrets.TYPESAFE_API_KEY }}" }
 ```
 
+### Score a table (CSV / JSONL), not just code
+
+Every row becomes one state. One description works like grep; a JSON file of
+Jev questions (noul, choice, score) adds one answer column per question.
+
+```bash
+jgrep --rows creators.csv "beauty is the main content of this account"
+jgrep --rows creators.csv --questions beauty.json --out scored.csv
+```
+
+```json
+{
+  "beauty":   { "type": "noul",   "instructions": "Is beauty the main content of this account?" },
+  "category": { "type": "choice", "instructions": "Dominant sub-category?",
+                "criteria": { "skincare": "skin care", "makeup": "cosmetics", "other": "not beauty" } },
+  "fit":      { "type": "score",  "instructions": "Fit for a Korean skincare seeding campaign?",
+                "criteria": ["no fit", "weak", "moderate", "strong", "ideal"] }
+}
+```
+
+Question objects are passed to the API verbatim, so anything Jev accepts works.
+Output columns: `beauty` (probability), `category` + `category_p`, `fit` + `fit_conf`.
+Eight creators and five questions is one request, 3k tokens, well under a cent;
+see [`examples/`](examples/). This is the "AI map-reduce" shape: scrape N
+things, ask k typed questions each, filter in a spreadsheet.
+
 ### Feed your coding agent
 
 Agents burn most of their tokens *looking* for code. jgrep hands them a short
@@ -105,6 +131,8 @@ a fraction of a cent.
 jgrep init                               interactive setup
 jgrep [options] "<description>" [path ...]
 jgrep [options] --diff [ref] "<description>"
+jgrep [options] --rows <file.csv|.jsonl> "<description>"
+jgrep [options] --rows <file> --questions <q.json> [--out scored.csv]
 
   -t, --threshold <p>   print chunks with probability >= p (default 0.7)
   -C, --show            print the matching chunk body under each hit
@@ -112,6 +140,9 @@ jgrep [options] --diff [ref] "<description>"
       --json            machine-readable output
       --diff [ref]      grep git diff hunks (working tree, or against <ref>)
       --staged          with --diff: staged changes only
+      --rows <file>     grep rows of a CSV / JSONL file instead of code
+      --questions <f>   with --rows: JSON of Jev questions asked of every row
+      --out <file>      with --questions: write the CSV here instead of stdout
   -b, --batch <n>       chunks per request (default 16)
   -c, --concurrency <n> parallel requests (default 16)
       --no-cache        ignore and do not write ~/.cache/jgrep

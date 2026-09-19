@@ -70,6 +70,15 @@ jgrep --diff --staged "changes behavior without a corresponding test change"
 jgrep --diff --staged "adds an endpoint or handler with no input validation"
 ```
 
+## Tables, not code
+
+`jgrep --rows data.csv "<description>"` treats every row as a chunk and prints
+matching rows. With `--questions q.json` (a JSON object of Jev questions:
+`{name: {type: noul|choice|score, instructions, criteria?}}`) it writes the
+table back with one answer column per question (`--out scored.csv` or
+`--json`). Use it to label, triage or filter a list of records instead of
+reading them one by one.
+
 ## Requirements
 
 Installed globally as `jgrep`; the key lives in `~/.config/jgrep/env`. If it

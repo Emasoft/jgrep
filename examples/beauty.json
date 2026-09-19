@@ -1,0 +1,9 @@
+{
+  "beauty":      { "type": "noul",   "instructions": "Is beauty (skincare, makeup, hair, nails) the main content of this account?" },
+  "korean":      { "type": "noul",   "instructions": "Are the recent captions written mostly in Korean?" },
+  "korea_based": { "type": "noul",   "instructions": "Are there signals that the creator lives in Korea?" },
+  "category":    { "type": "choice", "instructions": "What is the dominant beauty sub-category?",
+                   "criteria": { "skincare": "skin care routines and products", "makeup": "cosmetics application and looks", "hair": "hair care or styling", "other": "not beauty or unclear" } },
+  "fit":         { "type": "score",  "instructions": "How well would this creator fit a seeding campaign for a mid-price Korean skincare brand targeting Korean consumers?",
+                   "criteria": ["no fit", "weak fit", "moderate fit", "strong fit", "ideal fit"] }
+}

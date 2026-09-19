@@ -125,34 +125,38 @@ export function buildRequest(question: string, chunks: Chunk[], kind: Kind = "co
   return { model: MODEL, state, questions };
 }
 
-type Fetch = typeof fetch;
+export type Fetch = typeof fetch;
 
-async function ask(question: string, chunks: Chunk[], kind: Kind, apiKey: string, f: Fetch): Promise<{ ps: number[]; tokens: number }> {
-  const body = JSON.stringify(buildRequest(question, chunks, kind));
+/** POST one System One request with retries on 429/5xx. */
+export async function postSystemOne(body: unknown, apiKey: string, f: Fetch = fetch): Promise<{ answers: Record<string, any>; usage?: { input_tokens: number } }> {
+  const json = JSON.stringify(body);
   for (let attempt = 0; ; attempt++) {
     const res = await f(ENDPOINT, {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body,
+      body: json,
       signal: AbortSignal.timeout(30_000),
     });
-    if (res.ok) {
-      const json = (await res.json()) as { answers: Record<string, { noul?: number }>; usage?: { input_tokens: number } };
-      return { ps: chunks.map((_, i) => json.answers[`c${i}`]?.noul ?? NaN), tokens: json.usage?.input_tokens ?? 0 };
-    }
+    if (res.ok) return (await res.json()) as any;
     if ((res.status === 429 || res.status >= 500) && attempt < 3) { await new Promise((r) => setTimeout(r, 500 * 2 ** attempt)); continue; }
     if (res.status === 401) throw new Error("TypeSafe API rejected the key (401). Check TYPESAFE_API_KEY.");
-    throw new Error(`TypeSafe API ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    throw new Error(`TypeSafe API ${res.status}: ${(await res.text()).slice(0, 300)}`);
   }
+}
+
+async function ask(question: string, chunks: Chunk[], kind: Kind, apiKey: string, f: Fetch): Promise<{ ps: number[]; tokens: number }> {
+  const json = await postSystemOne(buildRequest(question, chunks, kind), apiKey, f);
+  return { ps: chunks.map((_, i) => json.answers[`c${i}`]?.noul ?? NaN), tokens: json.usage?.input_tokens ?? 0 };
 }
 
 // ---- cache ------------------------------------------------------------------
 // ponytail: one JSON file; move to sqlite if it passes a few MB.
 const CACHE_FILE = path.join(os.homedir(), ".cache", "jgrep", "cache.json");
-export function loadCache(): Record<string, number> {
+export type Cache = Record<string, any>;
+export function loadCache(): Cache {
   try { return JSON.parse(fs.readFileSync(CACHE_FILE, "utf8")); } catch { return {}; }
 }
-export function saveCache(c: Record<string, number>) {
+export function saveCache(c: Cache) {
   try {
     fs.mkdirSync(path.dirname(CACHE_FILE), { recursive: true });
     fs.writeFileSync(CACHE_FILE, JSON.stringify(c));
@@ -163,7 +167,7 @@ const key = (q: string, kind: Kind, c: Chunk) => createHash("sha1").update(`${MO
 // ---- core -------------------------------------------------------------------
 export interface Options {
   threshold: number; batch: number; concurrency: number; apiKey: string; kind?: Kind;
-  fetchImpl?: Fetch; cache?: Record<string, number>; onProgress?: (done: number, total: number) => void;
+  fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
 export interface Result { hits: Hit[]; all: Hit[]; chunks: number; tokens: number; cached: number }
 
