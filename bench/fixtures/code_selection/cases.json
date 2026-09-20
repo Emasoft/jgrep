@@ -1,0 +1,562 @@
+[
+  {
+    "id": "case-001",
+    "description": "Wraps an async operation so that when the operation throws, it is attempted again after a pause that roughly doubles each time, until either it succeeds and its result is returned, or a fixed maximum number of attempts has been spent and the last error is rethrown.",
+    "expected": "retryWithExponentialBackoff",
+    "kind": "typescript",
+    "candidates": [
+      {
+        "name": "retryWithFixedDelay",
+        "code": "async function retryWithFixedDelay(op: () => Promise<unknown>, attempts = 5) {\n  for (let n = 0; ; n++) {\n    try {\n      return await op();\n    } catch (err) {\n      if (n + 1 >= attempts) throw err;\n      await new Promise((r) => setTimeout(r, 500));\n    }\n  }\n}"
+      },
+      {
+        "name": "retryImmediate",
+        "code": "async function retryImmediate(op: () => Promise<unknown>, attempts = 5) {\n  let lastErr: unknown;\n  for (let n = 0; n < attempts; n++) {\n    try {\n      return await op();\n    } catch (err) {\n      lastErr = err;\n    }\n  }\n  throw lastErr;\n}"
+      },
+      {
+        "name": "retryWithExponentialBackoff",
+        "code": "async function retryWithExponentialBackoff(op: () => Promise<unknown>, attempts = 5) {\n  for (let n = 0; ; n++) {\n    try {\n      return await op();\n    } catch (err) {\n      if (n + 1 >= attempts) throw err;\n      await new Promise((r) => setTimeout(r, 250 * 2 ** n));\n    }\n  }\n}"
+      },
+      {
+        "name": "retryUntilValue",
+        "code": "async function retryUntilValue(op: () => Promise<unknown>, attempts = 5) {\n  for (let n = 0; n < attempts; n++) {\n    const value = await op();\n    if (value) return value;\n    await new Promise((r) => setTimeout(r, 100 * 2 ** n));\n  }\n  return undefined;\n}"
+      },
+      {
+        "name": "retryForeverWithBackoff",
+        "code": "async function retryForeverWithBackoff(op: () => Promise<unknown>) {\n  for (let n = 0; ; n++) {\n    try {\n      return await op();\n    } catch {\n      await new Promise((r) => setTimeout(r, 250 * 2 ** n));\n    }\n  }\n}"
+      }
+    ]
+  },
+  {
+    "id": "case-002",
+    "description": "Runs several async tasks at the same time and settles as soon as the first of them settles: it fulfills with that task's value if it fulfilled, or rejects with that task's error if it rejected, without waiting for or cancelling the other tasks.",
+    "expected": "firstToSettle",
+    "kind": "typescript",
+    "candidates": [
+      {
+        "name": "allOrFail",
+        "code": "function allOrFail(tasks: Array<() => Promise<unknown>>) {\n  const running = tasks.map((t) => t());\n  return Promise.all(running);\n}"
+      },
+      {
+        "name": "firstToSucceed",
+        "code": "function firstToSucceed(tasks: Array<() => Promise<unknown>>) {\n  const guarded = tasks.map((t) => t().then(\n    (v) => v,\n    () => new Promise(() => {}),\n  ));\n  return Promise.race(guarded);\n}"
+      },
+      {
+        "name": "firstToSettle",
+        "code": "function firstToSettle(tasks: Array<() => Promise<unknown>>) {\n  return Promise.race(tasks.map((t) => t()));\n}"
+      },
+      {
+        "name": "waitForAllReport",
+        "code": "async function waitForAllReport(tasks: Array<() => Promise<unknown>>) {\n  const outcomes = await Promise.allSettled(tasks.map((t) => t()));\n  return outcomes.map((o) => (o.status === \"fulfilled\" ? o.value : o.reason));\n}"
+      },
+      {
+        "name": "runSequentially",
+        "code": "async function runSequentially(tasks: Array<() => Promise<unknown>>) {\n  const results: unknown[] = [];\n  for (const t of tasks) {\n    results.push(await t());\n  }\n  return results;\n}"
+      }
+    ]
+  },
+  {
+    "id": "case-003",
+    "description": "When the wrapped work throws, the failure is reported on stderr together with its message, and afterwards the very same error object is rethrown so callers still observe the failure. When the work succeeds, nothing is printed and the result is returned unchanged.",
+    "expected": "logThenRethrow",
+    "kind": "typescript",
+    "candidates": [
+      {
+        "name": "logThenRethrow",
+        "code": "async function logThenRethrow(work: () => Promise<unknown>) {\n  try {\n    return await work();\n  } catch (err) {\n    console.error(\"work failed:\", err instanceof Error ? err.message : err);\n    throw err;\n  }\n}"
+      },
+      {
+        "name": "swallowError",
+        "code": "async function swallowError(work: () => Promise<unknown>) {\n  try {\n    return await work();\n  } catch (err) {\n    console.error(\"work failed:\", err instanceof Error ? err.message : err);\n    return null;\n  }\n}"
+      },
+      {
+        "name": "logAndReplace",
+        "code": "async function logAndReplace(work: () => Promise<unknown>) {\n  try {\n    return await work();\n  } catch (err) {\n    console.error(\"work failed:\", err instanceof Error ? err.message : err);\n    throw new Error(\"work failed\");\n  }\n}"
+      },
+      {
+        "name": "rethrowSometimes",
+        "code": "async function rethrowSometimes(work: () => Promise<unknown>) {\n  try {\n    return await work();\n  } catch (err) {\n    const msg = err instanceof Error ? err.message : String(err);\n    console.error(\"work failed:\", msg);\n    if (msg.includes(\"temporary\")) throw err;\n    return null;\n  }\n}"
+      },
+      {
+        "name": "silentDefault",
+        "code": "async function silentDefault(work: () => Promise<unknown>, fallback: unknown) {\n  try {\n    return await work();\n  } catch {\n    return fallback;\n  }\n}"
+      }
+    ]
+  },
+  {
+    "id": "case-004",
+    "description": "Turns a failed provider response into a typed error object that is returned (not thrown): it carries a machine-readable kind derived from the HTTP status, the provider's name, the numeric status, a retryable flag that is true for 429 and for 5xx, and the underlying failure kept reachable as its cause.",
+    "expected": "toProviderError",
+    "kind": "typescript",
+    "candidates": [
+      {
+        "name": "toProviderError",
+        "code": "function toProviderError(status: number, provider: string, cause: unknown) {\n  const err = new Error(`provider ${provider} failed with status ${status}`) as Error & {\n    kind: string; provider: string; status: number; retryable: boolean; cause?: unknown;\n  };\n  err.kind = status === 429 ? \"rate_limited\" : status === 401 ? \"invalid_api_key\" : \"bad_request\";\n  err.retryable = status === 429 || status >= 500;\n  err.provider = provider;\n  err.status = status;\n  err.cause = cause;\n  return err;\n}"
+      },
+      {
+        "name": "toPlainError",
+        "code": "function toPlainError(status: number, provider: string, cause: unknown) {\n  const detail = cause instanceof Error ? cause.message : String(cause);\n  return new Error(`provider ${provider} failed with status ${status}: ${detail}`);\n}"
+      },
+      {
+        "name": "toLogEntry",
+        "code": "function toLogEntry(status: number, provider: string, cause: unknown) {\n  console.error(`[${provider}] status ${status}`, cause);\n  return null;\n}"
+      },
+      {
+        "name": "throwProviderError",
+        "code": "function throwProviderError(status: number, provider: string, _cause: unknown) {\n  throw new Error(`${provider}: unhandled status ${status}`);\n}"
+      },
+      {
+        "name": "toStatusLabel",
+        "code": "function toStatusLabel(status: number, _provider: string, _cause: unknown) {\n  if (status === 429) return \"rate_limited\";\n  if (status === 401) return \"invalid_api_key\";\n  return \"bad_request\";\n}"
+      }
+    ]
+  },
+  {
+    "id": "case-005",
+    "description": "Takes a list of items plus a function that computes a string key for each item, and returns a map from key to the list of ALL items having that key, with the items inside every list kept in the order they appeared in the input.",
+    "expected": "groupBy",
+    "kind": "typescript",
+    "candidates": [
+      {
+        "name": "indexBy",
+        "code": "function indexBy<T>(items: T[], keyOf: (item: T) => string) {\n  const index = new Map<string, T>();\n  for (const item of items) {\n    index.set(keyOf(item), item);\n  }\n  return index;\n}"
+      },
+      {
+        "name": "countBy",
+        "code": "function countBy<T>(items: T[], keyOf: (item: T) => string) {\n  const counts = new Map<string, number>();\n  for (const item of items) {\n    const k = keyOf(item);\n    counts.set(k, (counts.get(k) ?? 0) + 1);\n  }\n  return counts;\n}"
+      },
+      {
+        "name": "partition",
+        "code": "function partition<T>(items: T[], keep: (item: T) => boolean) {\n  const yes: T[] = [], no: T[] = [];\n  for (const item of items) (keep(item) ? yes : no).push(item);\n  return { yes, no };\n}"
+      },
+      {
+        "name": "groupBy",
+        "code": "function groupBy<T>(items: T[], keyOf: (item: T) => string) {\n  const groups = new Map<string, T[]>();\n  for (const item of items) {\n    const k = keyOf(item);\n    const bucket = groups.get(k);\n    if (bucket) bucket.push(item);\n    else groups.set(k, [item]);\n  }\n  return groups;\n}"
+      },
+      {
+        "name": "groupBySorted",
+        "code": "function groupBySorted<T>(items: T[], keyOf: (item: T) => string, compare: (a: T, b: T) => number) {\n  const groups = new Map<string, T[]>();\n  for (const item of items) {\n    const k = keyOf(item);\n    if (!groups.has(k)) groups.set(k, []);\n    groups.get(k)!.push(item);\n  }\n  for (const bucket of groups.values()) bucket.sort(compare);\n  return groups;\n}"
+      }
+    ]
+  },
+  {
+    "id": "case-006",
+    "description": "Splits a list into consecutive pieces of at most n items: pieces never overlap, every returned item is one of the input items, the relative order of items is preserved, a piece other than the last always has exactly n items, and a list whose length is not a multiple of n is still handled without an error.",
+    "expected": "chunk",
+    "kind": "typescript",
+    "candidates": [
+      {
+        "name": "window",
+        "code": "function window<T>(items: T[], size: number) {\n  const windows: T[][] = [];\n  for (let i = 0; i + size <= items.length; i++) {\n    windows.push(items.slice(i, i + size));\n  }\n  return windows;\n}"
+      },
+      {
+        "name": "chunkPadded",
+        "code": "function chunkPadded<T>(items: T[], size: number, pad: T) {\n  const pieces: T[][] = [];\n  for (let i = 0; i < items.length; i += size) {\n    const piece = items.slice(i, i + size);\n    while (piece.length < size) piece.push(pad);\n    pieces.push(piece);\n  }\n  return pieces;\n}"
+      },
+      {
+        "name": "chunk",
+        "code": "function chunk<T>(items: T[], size: number) {\n  const pieces: T[][] = [];\n  for (let i = 0; i < items.length; i += size) {\n    pieces.push(items.slice(i, i + size));\n  }\n  return pieces;\n}"
+      },
+      {
+        "name": "chunkStrict",
+        "code": "function chunkStrict<T>(items: T[], size: number) {\n  if (items.length % size !== 0) {\n    throw new Error(`length ${items.length} is not a multiple of ${size}`);\n  }\n  const pieces: T[][] = [];\n  for (let i = 0; i < items.length; i += size) pieces.push(items.slice(i, i + size));\n  return pieces;\n}"
+      },
+      {
+        "name": "partitionInto",
+        "code": "function partitionInto<T>(items: T[], parts: number) {\n  const out: T[][] = Array.from({ length: parts }, () => []);\n  for (let i = 0; i < items.length; i++) {\n    out[i % parts].push(items[i]);\n  }\n  return out;\n}"
+      }
+    ]
+  },
+  {
+    "id": "case-007",
+    "description": "Prepares untrusted text so it can be embedded in an HTML page's text content: after the transformation, an ampersand, an angle bracket or a quote that was in the input renders as that same literal character to the page's reader, and the output must not introduce any new markup.",
+    "expected": "escapeHtmlText",
+    "kind": "typescript",
+    "candidates": [
+      {
+        "name": "escapeHtmlText",
+        "code": "function escapeHtmlText(input: string) {\n  return input\n    .replace(/&/g, \"&amp;\")\n    .replace(/</g, \"&lt;\")\n    .replace(/>/g, \"&gt;\")\n    .replace(/\"/g, \"&quot;\")\n    .replace(/'/g, \"&#39;\");\n}"
+      },
+      {
+        "name": "escapeAttrUnsafe",
+        "code": "function escapeAttrUnsafe(input: string) {\n  return input\n    .replace(/&/g, \"&amp;\")\n    .replace(/\"/g, \"&quot;\")\n    .replace(/'/g, \"&#39;\");\n}"
+      },
+      {
+        "name": "stripMarkup",
+        "code": "function stripMarkup(input: string) {\n  return input.replace(/<[^>]*>/g, \"\");\n}"
+      },
+      {
+        "name": "escapeBrokenOrder",
+        "code": "function escapeBrokenOrder(input: string) {\n  return input\n    .replace(/</g, \"&lt;\")\n    .replace(/>/g, \"&gt;\")\n    .replace(/&/g, \"&amp;\");\n}"
+      },
+      {
+        "name": "encodeForUrl",
+        "code": "function encodeForUrl(input: string) {\n  return encodeURIComponent(input);\n}"
+      }
+    ]
+  },
+  {
+    "id": "case-008",
+    "description": "Answers whether a string is an absolute URL whose scheme is http or https, deciding by really parsing the string rather than by looking at its first characters; relative references, other schemes, and strings the parser rejects all return false.",
+    "expected": "isHttpUrl",
+    "kind": "typescript",
+    "candidates": [
+      {
+        "name": "isHttpUrlLoose",
+        "code": "function isHttpUrlLoose(input: string) {\n  try {\n    new URL(input);\n    return true;\n  } catch {\n    return false;\n  }\n}"
+      },
+      {
+        "name": "isHttpUrl",
+        "code": "function isHttpUrl(input: string) {\n  let parsed: URL;\n  try {\n    parsed = new URL(input);\n  } catch {\n    return false;\n  }\n  return parsed.protocol === \"http:\" || parsed.protocol === \"https:\";\n}"
+      },
+      {
+        "name": "looksLikeHttpUrl",
+        "code": "function looksLikeHttpUrl(input: string) {\n  const lowered = input.trim().toLowerCase();\n  return lowered.startsWith(\"http://\") || lowered.startsWith(\"https://\");\n}"
+      },
+      {
+        "name": "isRelativeOrHttp",
+        "code": "function isRelativeOrHttp(input: string) {\n  if (input.startsWith(\"//\")) return true;\n  try {\n    const parsed = new URL(input, \"https://fallback.example\");\n    return parsed.protocol === \"http:\" || parsed.protocol === \"https:\";\n  } catch {\n    return false;\n  }\n}"
+      },
+      {
+        "name": "hasHttpSchemeText",
+        "code": "function hasHttpSchemeText(input: string) {\n  return /^https?:/.test(input) || /https?:\\/\\//.test(input);\n}"
+      }
+    ]
+  },
+  {
+    "id": "case-009",
+    "description": "Opens a resource, hands it to the work, and releases it exactly once no matter how the work ends: on success the result is returned and the resource is released; on failure the work's error still propagates to the caller AND the resource is still released exactly once.",
+    "expected": "withResource",
+    "kind": "typescript",
+    "candidates": [
+      {
+        "name": "withResource",
+        "code": "async function withResource(\n  open: () => Promise<{ close: () => Promise<void> }>,\n  work: (resource: { close: () => Promise<void> }) => Promise<unknown>,\n) {\n  const resource = await open();\n  try {\n    return await work(resource);\n  } finally {\n    await resource.close();\n  }\n}"
+      },
+      {
+        "name": "withResourceSuccessOnly",
+        "code": "async function withResourceSuccessOnly(\n  open: () => Promise<{ close: () => Promise<void> }>,\n  work: (resource: { close: () => Promise<void> }) => Promise<unknown>,\n) {\n  const resource = await open();\n  const result = await work(resource);\n  await resource.close();\n  return result;\n}"
+      },
+      {
+        "name": "withResourceSwallow",
+        "code": "async function withResourceSwallow(\n  open: () => Promise<{ close: () => Promise<void> }>,\n  work: (resource: { close: () => Promise<void> }) => Promise<unknown>,\n) {\n  const resource = await open();\n  try {\n    return await work(resource);\n  } catch {\n    return null;\n  } finally {\n    await resource.close();\n  }\n}"
+      },
+      {
+        "name": "withResourceDoubleClose",
+        "code": "async function withResourceDoubleClose(\n  open: () => Promise<{ close: () => Promise<void> }>,\n  work: (resource: { close: () => Promise<void> }) => Promise<unknown>,\n) {\n  const resource = await open();\n  try {\n    return await work(resource);\n  } catch (err) {\n    await resource.close();\n    throw err;\n  } finally {\n    await resource.close();\n  }\n}"
+      },
+      {
+        "name": "withResourceLateClose",
+        "code": "function withResourceLateClose(\n  open: () => Promise<{ close: () => Promise<void> }>,\n  work: (resource: { close: () => Promise<void> }) => Promise<unknown>,\n) {\n  return open().then((resource) =>\n    work(resource).then((result) => resource.close().then(() => result)));\n}"
+      }
+    ]
+  },
+  {
+    "id": "case-010",
+    "description": "Runs the work with an opened file and always closes the file before returning. The error the caller receives is the work's own error if the work failed; only when the work succeeded does a failure while closing become the returned error.",
+    "expected": "withFile",
+    "kind": "go",
+    "candidates": [
+      {
+        "name": "withFileClobber",
+        "code": "type closer interface{ Close() error }\n\nfunc withFileClobber(open func() (closer, error), work func(f closer) error) error {\n\tf, err := open()\n\tif err != nil {\n\t\treturn err\n\t}\n\tdefer func() {\n\t\terr = f.Close()\n\t}()\n\treturn work(f)\n}"
+      },
+      {
+        "name": "withFileCloseErrWhenWorkFailed",
+        "code": "type closer interface{ Close() error }\n\nfunc withFileCloseErrWhenWorkFailed(open func() (closer, error), work func(f closer) error) (err error) {\n\tf, err := open()\n\tif err != nil {\n\t\treturn err\n\t}\n\tdefer func() {\n\t\tif cerr := f.Close(); cerr != nil && err != nil {\n\t\t\terr = cerr\n\t\t}\n\t}()\n\treturn work(f)\n}"
+      },
+      {
+        "name": "withFile",
+        "code": "type closer interface{ Close() error }\n\nfunc withFile(open func() (closer, error), work func(f closer) error) (err error) {\n\tf, err := open()\n\tif err != nil {\n\t\treturn err\n\t}\n\tdefer func() {\n\t\tif cerr := f.Close(); cerr != nil && err == nil {\n\t\t\terr = cerr\n\t\t}\n\t}()\n\treturn work(f)\n}"
+      },
+      {
+        "name": "withFileCloseOnError",
+        "code": "type closer interface{ Close() error }\n\nfunc withFileCloseOnError(open func() (closer, error), work func(f closer) error) (err error) {\n\tf, err := open()\n\tif err != nil {\n\t\treturn err\n\t}\n\terr = work(f)\n\tif err != nil {\n\t\tf.Close()\n\t}\n\treturn err\n}"
+      },
+      {
+        "name": "withFileLogClose",
+        "code": "type closer interface{ Close() error }\n\nfunc withFileLogClose(open func() (closer, error), work func(f closer) error) error {\n\tf, err := open()\n\tif err != nil {\n\t\treturn err\n\t}\n\tdefer func() {\n\t\tif cerr := f.Close(); cerr != nil {\n\t\t\tprintln(\"close failed:\", cerr.Error())\n\t\t}\n\t}()\n\treturn work(f)\n}"
+      }
+    ]
+  },
+  {
+    "id": "case-011",
+    "description": "Wraps an async loader so each produced value is remembered per argument for the lifetime of the cache, and any later call with the same argument returns the remembered value without running the loader again. When the loader throws, nothing is remembered and the next call with that argument runs the loader again.",
+    "expected": "memoizeSuccess",
+    "kind": "typescript",
+    "candidates": [
+      {
+        "name": "memoizeSuccess",
+        "code": "function memoizeSuccess<K, V>(load: (key: K) => Promise<V>) {\n  const cache = new Map<K, V>();\n  return async (key: K): Promise<V> => {\n    const hit = cache.get(key);\n    if (hit !== undefined) return hit;\n    const value = await load(key);\n    cache.set(key, value);\n    return value;\n  };\n}"
+      },
+      {
+        "name": "memoizeAll",
+        "code": "function memoizeAll<K, V>(load: (key: K) => Promise<V>) {\n  const cache = new Map<K, Promise<V>>();\n  return (key: K): Promise<V> => {\n    const hit = cache.get(key);\n    if (hit) return hit;\n    const p = load(key);\n    cache.set(key, p);\n    return p;\n  };\n}"
+      },
+      {
+        "name": "memoizeLast",
+        "code": "function memoizeLast<K, V>(load: (key: K) => Promise<V>) {\n  let lastKey: K | undefined, lastValue: V | undefined, has = false;\n  return async (key: K): Promise<V> => {\n    if (has && key === lastKey) return lastValue as V;\n    const value = await load(key);\n    lastKey = key;\n    lastValue = value;\n    has = true;\n    return value;\n  };\n}"
+      },
+      {
+        "name": "memoizeTtl",
+        "code": "function memoizeTtl<K, V>(load: (key: K) => Promise<V>, ttlMs: number) {\n  const cache = new Map<K, { value: V; expires: number }>();\n  return async (key: K): Promise<V> => {\n    const hit = cache.get(key);\n    if (hit && hit.expires > Date.now()) return hit.value;\n    const value = await load(key);\n    cache.set(key, { value, expires: Date.now() + ttlMs });\n    return value;\n  };\n}"
+      },
+      {
+        "name": "dedupeInflight",
+        "code": "function dedupeInflight<K, V>(load: (key: K) => Promise<V>) {\n  const inflight = new Map<K, Promise<V>>();\n  return (key: K): Promise<V> => {\n    const running = inflight.get(key);\n    if (running) return running;\n    const p = load(key).finally(() => inflight.delete(key));\n    inflight.set(key, p);\n    return p;\n  };\n}"
+      }
+    ]
+  },
+  {
+    "id": "case-012",
+    "description": "A bounded in-memory map: storing a new key when it is already full evicts the key whose last touch (read or write) is oldest, and reading a key counts as touching it, making that key the newest.",
+    "expected": "LruCache",
+    "kind": "typescript",
+    "candidates": [
+      {
+        "name": "FifoCache",
+        "code": "class FifoCache<V> {\n  private entries = new Map<string, V>();\n  constructor(private capacity: number) {}\n  get(key: string) {\n    return this.entries.get(key);\n  }\n  set(key: string, value: V) {\n    if (this.entries.delete(key) === false && this.entries.size >= this.capacity)\n      this.entries.delete(this.entries.keys().next().value as string);\n    this.entries.set(key, value);\n  }\n}"
+      },
+      {
+        "name": "MruCache",
+        "code": "class MruCache<V> {\n  private entries = new Map<string, V>();\n  constructor(private capacity: number) {}\n  get(key: string) {\n    const value = this.entries.get(key);\n    if (value !== undefined) { this.entries.delete(key); this.entries.set(key, value); }\n    return value;\n  }\n  set(key: string, value: V) {\n    if (this.entries.delete(key) === false && this.entries.size >= this.capacity)\n      this.entries.delete([...this.entries.keys()].pop()!);\n    this.entries.set(key, value);\n  }\n}"
+      },
+      {
+        "name": "LfuCache",
+        "code": "class LfuCache<V> {\n  private entries = new Map<string, { value: V; hits: number }>();\n  constructor(private capacity: number) {}\n  get(key: string) {\n    const e = this.entries.get(key);\n    if (e) e.hits++;\n    return e?.value;\n  }\n  set(key: string, value: V) {\n    if (!this.entries.has(key) && this.entries.size >= this.capacity)\n      this.entries.delete([...this.entries].sort((a, b) => a[1].hits - b[1].hits)[0][0]);\n    this.entries.set(key, { value, hits: 0 });\n  }\n}"
+      },
+      {
+        "name": "LruCache",
+        "code": "class LruCache<V> {\n  private entries = new Map<string, V>();\n  constructor(private capacity: number) {}\n  get(key: string) {\n    const value = this.entries.get(key);\n    if (value !== undefined) { this.entries.delete(key); this.entries.set(key, value); }\n    return value;\n  }\n  set(key: string, value: V) {\n    if (this.entries.delete(key) === false && this.entries.size >= this.capacity)\n      this.entries.delete(this.entries.keys().next().value as string);\n    this.entries.set(key, value);\n  }\n}"
+      },
+      {
+        "name": "BoundedNoEvict",
+        "code": "class BoundedNoEvict<V> {\n  private entries = new Map<string, V>();\n  constructor(private capacity: number) {}\n  get(key: string) {\n    return this.entries.get(key);\n  }\n  set(key: string, value: V) {\n    if (this.entries.size < this.capacity) this.entries.set(key, value);\n  }\n}"
+      }
+    ]
+  },
+  {
+    "id": "case-013",
+    "description": "Parses a single line of comma-separated text into its fields, where a field wrapped in double quotes is one field even when it contains commas, and two consecutive double quotes inside a quoted field stand for one literal double quote.",
+    "expected": "parseCsvLine",
+    "kind": "typescript",
+    "candidates": [
+      {
+        "name": "parseCsvLine",
+        "code": "function parseCsvLine(line: string) {\n  const fields: string[] = []; let field = \"\", quoted = false;\n  for (let i = 0; i < line.length; i++) {\n    const c = line[i];\n    if (quoted) {\n      if (c === '\"' && line[i + 1] === '\"') { field += '\"'; i++; }\n      else if (c === '\"') quoted = false;\n      else field += c;\n    } else if (c === '\"' && field === \"\") quoted = true;\n    else if (c === \",\") { fields.push(field); field = \"\"; }\n    else field += c;\n  }\n  fields.push(field);\n  return fields;\n}"
+      },
+      {
+        "name": "splitOnComma",
+        "code": "function splitOnComma(line: string) {\n  return line.split(\",\");\n}"
+      },
+      {
+        "name": "stripQuotesSplit",
+        "code": "function stripQuotesSplit(line: string) {\n  return line.split(\",\").map((f) => f.replace(/\"/g, \"\"));\n}"
+      },
+      {
+        "name": "parseQuotedNoEscape",
+        "code": "function parseQuotedNoEscape(line: string) {\n  const fields: string[] = [];\n  let field = \"\", quoted = false;\n  for (const c of line) {\n    if (c === '\"') { quoted = !quoted; continue; }\n    if (c === \",\" && !quoted) { fields.push(field); field = \"\"; continue; }\n    field += c;\n  }\n  fields.push(field);\n  return fields;\n}"
+      },
+      {
+        "name": "parseTrimmedFields",
+        "code": "function parseTrimmedFields(line: string) {\n  return line.split(\",\").map((f) => f.trim().replace(/^\"(.*)\"$/, \"$1\"));\n}"
+      }
+    ]
+  },
+  {
+    "id": "case-014",
+    "description": "Reads settings lines of the form key=value into an object. Blank lines and lines starting with '#' are skipped; a line with nothing before the '=' or no '=' at all is ignored rather than raising an error; whitespace around keys and values is trimmed; the FIRST '=' separates key from value; and a '#' only starts a comment at the start of a line, never inside a value.",
+    "expected": "parseConfig",
+    "kind": "typescript",
+    "candidates": [
+      {
+        "name": "parseConfigStrict",
+        "code": "function parseConfigStrict(text: string) {\n  const out: Record<string, string> = {};\n  for (const raw of text.split(\"\\n\")) {\n    if (!raw.trim() || raw.trim().startsWith(\"#\")) continue;\n    const eq = raw.indexOf(\"=\");\n    if (eq <= 0) throw new Error(`bad line: ${raw}`);\n    out[raw.slice(0, eq).trim()] = raw.slice(eq + 1).trim();\n  }\n  return out;\n}"
+      },
+      {
+        "name": "parseConfigKeepWs",
+        "code": "function parseConfigKeepWs(text: string) {\n  const out: Record<string, string> = {};\n  for (const raw of text.split(\"\\n\")) {\n    const line = raw.trim();\n    if (!line || line.startsWith(\"#\")) continue;\n    const eq = line.indexOf(\"=\");\n    if (eq <= 0) continue;\n    out[line.slice(0, eq)] = line.slice(eq + 1);\n  }\n  return out;\n}"
+      },
+      {
+        "name": "parseConfig",
+        "code": "function parseConfig(text: string) {\n  const out: Record<string, string> = {};\n  for (const raw of text.split(\"\\n\")) {\n    const line = raw.trim();\n    if (!line || line.startsWith(\"#\")) continue;\n    const eq = line.indexOf(\"=\");\n    if (eq <= 0) continue;\n    out[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();\n  }\n  return out;\n}"
+      },
+      {
+        "name": "parseConfigStripInlineHash",
+        "code": "function parseConfigStripInlineHash(text: string) {\n  const out: Record<string, string> = {};\n  for (const raw of text.split(\"\\n\")) {\n    const line = raw.trim();\n    if (!line || line.startsWith(\"#\")) continue;\n    const eq = line.indexOf(\"=\");\n    if (eq <= 0) continue;\n    out[line.slice(0, eq).trim()] = line.slice(eq + 1).split(\"#\")[0].trim();\n  }\n  return out;\n}"
+      },
+      {
+        "name": "parseConfigLastEquals",
+        "code": "function parseConfigLastEquals(text: string) {\n  const out: Record<string, string> = {};\n  for (const raw of text.split(\"\\n\")) {\n    const line = raw.trim();\n    if (!line || line.startsWith(\"#\")) continue;\n    const eq = line.lastIndexOf(\"=\");\n    if (eq <= 0) continue;\n    out[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();\n  }\n  return out;\n}"
+      }
+    ]
+  },
+  {
+    "id": "case-015",
+    "description": "Hands out permission instantly: while the bucket holds permission, calls are answered yes immediately up to the burst size, and the taken permission regrows continuously at the given rate — after half the time needed for one permission, half a permission has regrown. It never waits or blocks; it only answers yes or no.",
+    "expected": "TokenBucket",
+    "kind": "typescript",
+    "candidates": [
+      {
+        "name": "TokenBucket",
+        "code": "class TokenBucket {\n  private tokens: number;\n  private last = Date.now();\n  constructor(private ratePerSec: number, private burst: number) {\n    this.tokens = burst;\n  }\n  tryAcquire(): boolean {\n    const now = Date.now();\n    this.tokens = Math.min(this.burst, this.tokens + ((now - this.last) / 1000) * this.ratePerSec);\n    this.last = now;\n    if (this.tokens < 1) return false;\n    this.tokens -= 1;\n    return true;\n  }\n}"
+      },
+      {
+        "name": "FixedWindowLimiter",
+        "code": "class FixedWindowLimiter {\n  private windowStart = Date.now();\n  private used = 0;\n  constructor(private ratePerSec: number, private burst: number) {}\n  tryAcquire(): boolean {\n    const now = Date.now();\n    if (now - this.windowStart >= 1000) {\n      this.windowStart = now;\n      this.used = 0;\n    }\n    if (this.used >= Math.min(this.ratePerSec, this.burst)) return false;\n    this.used++;\n    return true;\n  }\n}"
+      },
+      {
+        "name": "QueuingLimiter",
+        "code": "class QueuingLimiter {\n  private nextAllowed = 0;\n  constructor(private intervalMs: number) {}\n  async acquire(): Promise<void> {\n    const now = Date.now();\n    const wait = Math.max(0, this.nextAllowed - now);\n    this.nextAllowed = Math.max(now, this.nextAllowed) + this.intervalMs;\n    await new Promise((r) => setTimeout(r, wait));\n  }\n}"
+      },
+      {
+        "name": "HardCapLimiter",
+        "code": "class HardCapLimiter {\n  private used = 0;\n  constructor(private max: number) {}\n  tryAcquire(): boolean {\n    if (this.used >= this.max) return false;\n    this.used++;\n    return true;\n  }\n}"
+      },
+      {
+        "name": "PerCallLimiter",
+        "code": "class PerCallLimiter {\n  private lastAccepted = -Infinity;\n  constructor(private intervalMs: number) {}\n  tryAcquire(): boolean {\n    const now = Date.now();\n    if (now - this.lastAccepted < this.intervalMs) return false;\n    this.lastAccepted = now;\n    return true;\n  }\n}"
+      }
+    ]
+  },
+  {
+    "id": "case-016",
+    "description": "While events keep arriving, the wrapped function runs immediately on the first call, then at most once per interval — calls that arrive too soon are dropped, not delayed — and when the events stop, no further invocation happens afterwards.",
+    "expected": "throttle",
+    "kind": "typescript",
+    "candidates": [
+      {
+        "name": "debounce",
+        "code": "function debounce(fn: () => void, quietMs: number) {\n  let timer: ReturnType<typeof setTimeout> | undefined;\n  return () => {\n    if (timer) clearTimeout(timer);\n    timer = setTimeout(() => fn(), quietMs);\n  };\n}"
+      },
+      {
+        "name": "throttle",
+        "code": "function throttle(fn: () => void, intervalMs: number) {\n  let last = 0;\n  return () => {\n    const now = Date.now();\n    if (now - last < intervalMs) return;\n    last = now;\n    fn();\n  };\n}"
+      },
+      {
+        "name": "throttleWithTrailing",
+        "code": "function throttleWithTrailing(fn: () => void, intervalMs: number) {\n  let last = 0;\n  let timer: ReturnType<typeof setTimeout> | undefined;\n  return () => {\n    const now = Date.now();\n    if (timer) return;\n    const wait = Math.max(0, intervalMs - (now - last));\n    timer = setTimeout(() => { timer = undefined; last = Date.now(); fn(); }, wait);\n  };\n}"
+      },
+      {
+        "name": "throttleDelayed",
+        "code": "function throttleDelayed(fn: () => void, intervalMs: number) {\n  let last = 0;\n  return () => {\n    const now = Date.now();\n    if (now - last < intervalMs) return;\n    last = now;\n    setTimeout(() => fn(), intervalMs);\n  };\n}"
+      },
+      {
+        "name": "burstyThrottle",
+        "code": "function burstyThrottle(fn: () => void, intervalMs: number, maxPerInterval: number) {\n  const stamps: number[] = [];\n  return () => {\n    const now = Date.now();\n    while (stamps.length && now - stamps[0] >= intervalMs) stamps.shift();\n    if (stamps.length >= maxPerInterval) return;\n    stamps.push(now);\n    fn();\n  };\n}"
+      }
+    ]
+  },
+  {
+    "id": "case-017",
+    "description": "Reads an Authorization header value and returns only the credentials part (the token after the scheme) when the scheme is Bearer, in any letter casing, tolerating extra whitespace; a missing header, another scheme, or nothing after the scheme returns null.",
+    "expected": "bearerCredentials",
+    "kind": "typescript",
+    "candidates": [
+      {
+        "name": "bearerCredentials",
+        "code": "function bearerCredentials(header: string | undefined) {\n  if (!header) return null;\n  const m = /^Bearer\\s+(.+)$/i.exec(header.trim());\n  return m ? m[1].trim() : null;\n}"
+      },
+      {
+        "name": "anySchemeCredentials",
+        "code": "function anySchemeCredentials(header: string | undefined) {\n  if (!header) return null;\n  const parts = header.trim().split(/\\s+/);\n  return parts.length === 2 ? parts[1] : null;\n}"
+      },
+      {
+        "name": "bearerSchemeOnly",
+        "code": "function bearerSchemeOnly(header: string | undefined) {\n  if (!header) return null;\n  return /^bearer\\b/i.test(header.trim()) ? header.trim() : null;\n}"
+      },
+      {
+        "name": "bearerCaseSensitive",
+        "code": "function bearerCaseSensitive(header: string | undefined) {\n  if (!header) return null;\n  const m = /^Bearer\\s+(.+)$/.exec(header.trim());\n  return m ? m[1].trim() : null;\n}"
+      },
+      {
+        "name": "schemeInsteadOfCredentials",
+        "code": "function schemeInsteadOfCredentials(header: string | undefined) {\n  if (!header) return null;\n  const parts = header.trim().split(/\\s+/);\n  if (parts[0].toLowerCase() !== \"bearer\" || parts.length < 2) return null;\n  return parts[0];\n}"
+      }
+    ]
+  },
+  {
+    "id": "case-018",
+    "description": "Decides whether a provided secret matches the expected secret such that the time the comparison takes does not depend on where the two strings first differ: every byte of the inputs is always processed and the loop never returns early on a mismatch.",
+    "expected": "constantTimeEqual",
+    "kind": "go",
+    "candidates": [
+      {
+        "name": "earlyExitEqual",
+        "code": "func earlyExitEqual(a, b string) bool {\n\tif len(a) != len(b) {\n\t\treturn false\n\t}\n\tfor i := 0; i < len(a); i++ {\n\t\tif a[i] != b[i] {\n\t\t\treturn false\n\t\t}\n\t}\n\treturn true\n}"
+      },
+      {
+        "name": "prefixEqual",
+        "code": "func prefixEqual(secret, given string) bool {\n\tn := len(given)\n\tif n > len(secret) {\n\t\treturn false\n\t}\n\treturn secret[:n] == given\n}"
+      },
+      {
+        "name": "constantTimeEqual",
+        "code": "func constantTimeEqual(a, b string) bool {\n\tif len(a) != len(b) {\n\t\treturn false\n\t}\n\tvar v byte\n\tfor i := 0; i < len(a); i++ {\n\t\tv |= a[i] ^ b[i]\n\t}\n\treturn v == 0\n}"
+      },
+      {
+        "name": "xorShortCircuit",
+        "code": "func xorShortCircuit(a, b string) bool {\n\tif len(a) != len(b) {\n\t\treturn false\n\t}\n\tfor i := 0; i < len(a); i++ {\n\t\tif a[i]^b[i] != 0 {\n\t\t\treturn false\n\t\t}\n\t}\n\treturn true\n}"
+      },
+      {
+        "name": "lengthAndSampleEqual",
+        "code": "func lengthAndSampleEqual(a, b string) bool {\n\tif len(a) != len(b) {\n\t\treturn false\n\t}\n\tfor _, i := range []int{0, len(a) / 2, len(a) - 1} {\n\t\tif a[i] != b[i] {\n\t\t\treturn false\n\t\t}\n\t}\n\treturn true\n}"
+      }
+    ]
+  },
+  {
+    "id": "case-019",
+    "description": "Replaces a file's contents so that no reader can observe a partially written file: the new content is written to a temporary file next to the target first, and only after that write succeeded is the target replaced by a single atomic rename. If any step fails, the target's previous content is untouched and the temporary file does not remain behind.",
+    "expected": "atomicWrite",
+    "kind": "typescript",
+    "candidates": [
+      {
+        "name": "atomicWrite",
+        "code": "async function atomicWrite(\n  fs: { writeFile: (p: string, d: string) => Promise<void>; rename: (a: string, b: string) => Promise<void>; unlink: (p: string) => Promise<void> },\n  target: string, data: string,\n) {\n  const tmp = target + \".tmp\";\n  try {\n    await fs.writeFile(tmp, data);\n    await fs.rename(tmp, target);\n  } catch (err) {\n    await fs.unlink(tmp).catch(() => {});\n    throw err;\n  }\n}"
+      },
+      {
+        "name": "directWrite",
+        "code": "async function directWrite(\n  fs: { writeFile: (p: string, d: string) => Promise<void> },\n  target: string, data: string,\n) {\n  await fs.writeFile(target, data);\n}"
+      },
+      {
+        "name": "atomicWriteLeakTmp",
+        "code": "async function atomicWriteLeakTmp(\n  fs: { writeFile: (p: string, d: string) => Promise<void>; rename: (a: string, b: string) => Promise<void> },\n  target: string, data: string,\n) {\n  const tmp = target + \".tmp\";\n  await fs.writeFile(tmp, data);\n  await fs.rename(tmp, target);\n}"
+      },
+      {
+        "name": "atomicWriteUnsafeSwap",
+        "code": "async function atomicWriteUnsafeSwap(\n  fs: { writeFile: (p: string, d: string) => Promise<void>; rename: (a: string, b: string) => Promise<void>; unlink: (p: string) => Promise<void> },\n  target: string, data: string,\n) {\n  const backup = target + \".bak\";\n  await fs.rename(target, backup);\n  try {\n    await fs.writeFile(target, data);\n  } catch (err) {\n    await fs.rename(backup, target);\n    throw err;\n  }\n  await fs.unlink(backup);\n}"
+      },
+      {
+        "name": "appendWrite",
+        "code": "async function appendWrite(\n  fs: { appendFile: (p: string, d: string) => Promise<void> },\n  target: string, data: string,\n) {\n  await fs.appendFile(target, data);\n}"
+      }
+    ]
+  },
+  {
+    "id": "case-020",
+    "description": "Turns file content into its lines: a newline at the very end of the content does not produce a final empty line, empty lines in the middle are kept as empty strings, and each returned line has its terminator removed but no other whitespace changed.",
+    "expected": "splitFileLines",
+    "kind": "typescript",
+    "candidates": [
+      {
+        "name": "splitNaive",
+        "code": "function splitNaive(content: string) {\n  return content.split(\"\\n\");\n}"
+      },
+      {
+        "name": "splitFileLines",
+        "code": "function splitFileLines(content: string) {\n  const lines = content.split(\"\\n\");\n  if (lines.length > 1 && lines[lines.length - 1] === \"\") lines.pop();\n  return lines.map((l) => l.replace(/\\r$/, \"\"));\n}"
+      },
+      {
+        "name": "splitDropAllEmpty",
+        "code": "function splitDropAllEmpty(content: string) {\n  return content.split(\"\\n\").filter((l) => l !== \"\").map((l) => l.replace(/\\r$/, \"\"));\n}"
+      },
+      {
+        "name": "splitTrimmed",
+        "code": "function splitTrimmed(content: string) {\n  return content.split(\"\\n\").map((l) => l.trim());\n}"
+      },
+      {
+        "name": "splitKeepReturns",
+        "code": "function splitKeepReturns(content: string) {\n  const lines = content.split(\"\\n\");\n  if (lines.length > 1 && lines[lines.length - 1] === \"\") lines.pop();\n  return lines;\n}"
+      }
+    ]
+  }
+]
