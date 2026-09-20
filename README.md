@@ -276,7 +276,19 @@ jgrep [options] --rows <file> --questions <q.json> [--out scored.csv]
 
 How reliable is the matching? A benchmark harness — labeled fixtures (SMS spam,
 AG News, hand-written code-selection cases) plus an accuracy runner — lives
-under `bench/`; numbers land here after the first CI bench run.
+under `bench/`, with the fixtures committed so every run is reproducible.
+Latest results:
+
+| benchmark              |   n | accuracy | macro-F1 |
+| ---------------------- | --: | -------: | -------: |
+| SMS spam vs ham        | 200 |     0.95 |     0.95 |
+| AG News (4-way)        | 120 |     0.84 |     0.84 |
+| Code selection (top-1) |  20 |     1.00 |        — |
+
+Numbers above are **one provider's run** — OpenRouter, model
+`~typesafe/jev-latest` — on 2026-09-20 at commit `1b3a4f9`, not a
+cross-provider average. The bench runs **on demand** via the Bench workflow
+(`workflow_dispatch`); TypeSafe numbers land here after the first CI bench run.
 
 ```bash
 bun bench/accuracy.ts --fixture sms --limit 20   # precision/recall on 20 labeled rows
