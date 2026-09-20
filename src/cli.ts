@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import fs from "node:fs";
-import { chunkPaths, diffChunks, gitDiff, jgrep, loadCache, saveCache, resolveApiKey, USD_PER_M_INPUT, type Hit, type Kind } from "./jgrep";
+import { chunkPaths, diffChunks, gitDiff, jgrep, loadCache, saveCache, type Hit, type Kind } from "./jgrep";
 import { readRows, loadQuestions, scoreRows, flatten, toCsv } from "./rows";
+import { DEFAULT_PRICE_PER_MTOK } from "./providers";
 
 const VERSION = "0.3.0";
 const USAGE = `jgrep ${VERSION} — semantic grep powered by Jev (TypeSafe)
@@ -84,7 +85,7 @@ async function main() {
   if (!chunks.length) { console.error(o.diff ? "empty diff" : "no text files found"); process.exit(1); }
   const cache = o.cache ? loadCache() : {};
   const r = await jgrep(o.question, chunks, {
-    ...o, kind, apiKey: resolveApiKey(), cache,
+    ...o, kind, cache,
     onProgress: (d, n) => { if (process.stderr.isTTY) process.stderr.write(`\r${d}/${n} requests`); },
   });
   if (o.cache) saveCache(cache);
@@ -101,7 +102,7 @@ async function main() {
       if (o.show) console.log(h.text.split("\n").map((l) => "    " + l).join("\n") + "\n");
     }
   }
-  const cost = (r.tokens * USD_PER_M_INPUT) / 1e6;
+  const cost = (r.tokens * DEFAULT_PRICE_PER_MTOK) / 1e6;
   console.error(c("90", `${r.hits.length} hits / ${r.chunks} chunks (${r.cached} cached) · ${r.tokens} tokens · $${cost.toFixed(4)} · ${((Date.now() - t0) / 1000).toFixed(1)}s`));
   process.exit(r.hits.length ? 0 : 1);
 }
@@ -114,7 +115,7 @@ async function rowsMain(o: ReturnType<typeof parse>) {
   const questions = loadQuestions(o.questions || o.question);
   const cache = o.cache ? loadCache() : {};
   const r = await scoreRows(rows, questions, {
-    ...o, apiKey: resolveApiKey(), cache,
+    ...o, cache,
     onProgress: (d, n) => { if (process.stderr.isTTY) process.stderr.write(`\r${d}/${n} requests`); },
   });
   if (o.cache) saveCache(cache);
@@ -140,7 +141,7 @@ async function rowsMain(o: ReturnType<typeof parse>) {
       console.log(`${c("35", o.rows)}${c("36", ":")}${c("32", String(s.i + 2))}  ${c(pcol, `p=${s.p.toFixed(2)}`)}  ${preview}`);
     }
   }
-  const cost = (r.tokens * USD_PER_M_INPUT) / 1e6;
+  const cost = (r.tokens * DEFAULT_PRICE_PER_MTOK) / 1e6;
   console.error(c("90", `${o.questions ? Object.keys(questions).length + " questions x " : hits + " hits / "}${rows.length} rows (${r.cached} cached) · ${r.requests} requests · ${r.tokens} tokens · $${cost.toFixed(4)} · ${((Date.now() - t0) / 1000).toFixed(1)}s`));
   if (o.out && !o.json) console.error(c("90", `wrote ${o.out}`));
   process.exit(o.questions || hits ? 0 : 1);

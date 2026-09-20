@@ -6,10 +6,10 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { BACKENDS, postSystemOne, resolveApiKey, type Backend, type Fetch } from "./providers";
 
-export const ENDPOINT = "https://api.typesafe.ai/v1/systemone";
-export const MODEL = "jev-latest";
-export const USD_PER_M_INPUT = 0.042;
+// DI seam for fetch (moved to providers.ts; re-exported so existing imports keep working)
+export type { Fetch };
 
 export interface Chunk { file: string; start: number; end: number; text: string }
 export interface Hit extends Chunk { p: number }
@@ -113,7 +113,7 @@ export function chunkPaths(paths: string[]): Chunk[] {
 }
 
 // ---- Jev --------------------------------------------------------------------
-export function buildRequest(question: string, chunks: Chunk[], kind: Kind = "code") {
+export function buildRequest(question: string, chunks: Chunk[], kind: Kind = "code", model = "jev-latest") {
   const state = { chunks: chunks.map((c, i) => ({ id: `c${i}`, file: c.file, lines: `${c.start}-${c.end}`, [kind]: c.text })) };
   const what = kind === "diff"
     ? "Does that diff hunk (lines starting with + were added, - removed) match this description"
@@ -122,30 +122,11 @@ export function buildRequest(question: string, chunks: Chunk[], kind: Kind = "co
   chunks.forEach((_, i) => {
     questions[`c${i}`] = { type: "noul", instructions: `Look only at the chunk with id "c${i}". ${what}: ${question}` };
   });
-  return { model: MODEL, state, questions };
+  return { model, state, questions };
 }
 
-export type Fetch = typeof fetch;
-
-/** POST one System One request with retries on 429/5xx. */
-export async function postSystemOne(body: unknown, apiKey: string, f: Fetch = fetch): Promise<{ answers: Record<string, any>; usage?: { input_tokens: number } }> {
-  const json = JSON.stringify(body);
-  for (let attempt = 0; ; attempt++) {
-    const res = await f(ENDPOINT, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: json,
-      signal: AbortSignal.timeout(30_000),
-    });
-    if (res.ok) return (await res.json()) as any;
-    if ((res.status === 429 || res.status >= 500) && attempt < 3) { await new Promise((r) => setTimeout(r, 500 * 2 ** attempt)); continue; }
-    if (res.status === 401) throw new Error("TypeSafe API rejected the key (401). Check TYPESAFE_API_KEY.");
-    throw new Error(`TypeSafe API ${res.status}: ${(await res.text()).slice(0, 300)}`);
-  }
-}
-
-async function ask(question: string, chunks: Chunk[], kind: Kind, apiKey: string, f: Fetch): Promise<{ ps: number[]; tokens: number }> {
-  const json = await postSystemOne(buildRequest(question, chunks, kind), apiKey, f);
+async function ask(question: string, chunks: Chunk[], kind: Kind, model: string, backend: Backend, apiKey: string, f: Fetch): Promise<{ ps: number[]; tokens: number }> {
+  const json = await postSystemOne(buildRequest(question, chunks, kind, model), backend, apiKey, { fetchImpl: f });
   return { ps: chunks.map((_, i) => json.answers[`c${i}`]?.noul ?? NaN), tokens: json.usage?.input_tokens ?? 0 };
 }
 
@@ -162,23 +143,30 @@ export function saveCache(c: Cache) {
     fs.writeFileSync(CACHE_FILE, JSON.stringify(c));
   } catch { /* cache is best-effort */ }
 }
-const key = (q: string, kind: Kind, c: Chunk) => createHash("sha1").update(`${MODEL}\0${kind}\0${q}\0${c.text}`).digest("hex");
+const key = (model: string, kind: Kind, q: string, c: Chunk) => createHash("sha1").update(`${model}\0${kind}\0${q}\0${c.text}`).digest("hex");
 
 // ---- core -------------------------------------------------------------------
 export interface Options {
-  threshold: number; batch: number; concurrency: number; apiKey: string; kind?: Kind;
+  threshold: number; batch: number; concurrency: number; apiKey?: string; kind?: Kind;
+  backend?: Backend; model?: string;
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
 export interface Result { hits: Hit[]; all: Hit[]; chunks: number; tokens: number; cached: number }
 
 export async function jgrep(question: string, chunks: Chunk[], o: Options): Promise<Result> {
   const kind = o.kind ?? "code";
+  const backend = o.backend ?? BACKENDS.typesafe; // the core never picks a provider from env — cli.ts resolves in Step 7
+  const model = o.model ?? backend.model;
   const cache = o.cache ?? {};
   const f = o.fetchImpl ?? fetch;
+  // Lazy key resolution: explicit apiKey wins; otherwise resolved once at the first
+  // request, so a fully-cached run (or a test passing apiKey) never touches the filesystem.
+  let apiKey = o.apiKey;
+  const apiKeyOf = (): string => { apiKey ??= resolveApiKey(backend); return apiKey; };
   const all: Hit[] = new Array(chunks.length);
   const todo: number[] = [];
   chunks.forEach((c, i) => {
-    const hit = cache[key(question, kind, c)];
+    const hit = cache[key(model, kind, question, c)];
     if (hit !== undefined) all[i] = { ...c, p: hit }; else todo.push(i);
   });
   const cached = chunks.length - todo.length;
@@ -188,11 +176,11 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
   const worker = async () => {
     while (next < batches.length) {
       const b = batches[next++];
-      const { ps, tokens: t } = await ask(question, b.map((i) => chunks[i]), kind, o.apiKey, f);
+      const { ps, tokens: t } = await ask(question, b.map((i) => chunks[i]), kind, model, backend, apiKeyOf(), f);
       tokens += t;
       b.forEach((ci, j) => {
         all[ci] = { ...chunks[ci], p: ps[j] };
-        if (Number.isFinite(ps[j])) cache[key(question, kind, chunks[ci])] = ps[j];
+        if (Number.isFinite(ps[j])) cache[key(model, kind, question, chunks[ci])] = ps[j];
       });
       o.onProgress?.(++done, batches.length);
     }
@@ -203,36 +191,8 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
 }
 
 // ---- config -----------------------------------------------------------------
-export const CONFIG_FILE = path.join(os.homedir(), ".config", "jgrep", "env");
-
-export function resolveApiKey(env = process.env): string {
-  if (env.TYPESAFE_API_KEY?.trim()) return env.TYPESAFE_API_KEY.trim();
-  for (const file of [path.join(process.cwd(), ".env"), CONFIG_FILE]) {
-    try {
-      const m = fs.readFileSync(file, "utf8").match(/^\s*(?:export\s+)?TYPESAFE_API_KEY\s*=\s*["']?([^"'\r\n#]+)/m);
-      if (m) return m[1].trim();
-    } catch { /* next */ }
-  }
-  throw new Error("No TypeSafe API key. Run `jgrep init` (or export TYPESAFE_API_KEY).");
-}
-
-/** Cheapest possible request; true when the key is accepted. */
-export async function verifyApiKey(apiKey: string, f: typeof fetch = fetch): Promise<{ ok: boolean; status: number; model?: string }> {
-  const res = await f(ENDPOINT, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: MODEL, state: "ping", questions: { ok: { type: "noul", instructions: "Is the state the word ping?" } } }),
-    signal: AbortSignal.timeout(15_000),
-  });
-  const model = res.ok ? ((await res.json()) as { model?: string }).model : undefined;
-  return { ok: res.ok, status: res.status, model };
-}
-
-export function saveApiKey(apiKey: string): string {
-  fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(CONFIG_FILE, `TYPESAFE_API_KEY=${apiKey}\n`, { mode: 0o600 });
-  return CONFIG_FILE;
-}
+// Key resolution/verification/storage moved to providers.ts (WI-1): resolveApiKey,
+// verifyApiKey and the legacy ~/.config/jgrep/env writer live there now.
 
 /** Copy the bundled SKILL.md into each agent's skills dir that exists. Returns the dirs written. */
 export function installSkills(skillSrc: string, home = os.homedir(), agents = ["claude", "codex"]): string[] {

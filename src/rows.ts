@@ -3,7 +3,8 @@
 // rows per request. Output is the table with one answer column per question.
 import fs from "node:fs";
 import { createHash } from "node:crypto";
-import { MODEL, postSystemOne, type Cache, type Fetch } from "./jgrep";
+import { BACKENDS, postSystemOne, resolveApiKey, type Backend, type Fetch } from "./providers";
+import type { Cache } from "./jgrep";
 
 export type Row = Record<string, string>;
 export type Questions = Record<string, { type: "noul" | "choice" | "score"; instructions: string; [k: string]: unknown }>;
@@ -60,7 +61,7 @@ export function loadQuestions(fileOrText: string): Questions {
 // ---- request ----------------------------------------------------------------
 export const MAX_QUESTIONS_PER_REQUEST = 64;
 
-export function buildRowsRequest(rows: Row[], questions: Questions) {
+export function buildRowsRequest(rows: Row[], questions: Questions, model = "jev-latest") {
   const state = { rows: rows.map((r, i) => ({ id: `r${i}`, ...r })) };
   const qs: Record<string, unknown> = {};
   rows.forEach((_, i) => {
@@ -68,23 +69,30 @@ export function buildRowsRequest(rows: Row[], questions: Questions) {
       qs[`r${i}.${name}`] = { ...spec, instructions: `Look only at the row with id "r${i}". ${spec.instructions}` };
     }
   });
-  return { model: MODEL, state, questions: qs };
+  return { model, state, questions: qs };
 }
 
-const key = (qJson: string, r: Row) => createHash("sha1").update(`${MODEL}\0rows\0${qJson}\0${JSON.stringify(r)}`).digest("hex");
+const key = (model: string, qJson: string, r: Row) => createHash("sha1").update(`${model}\0rows\0${qJson}\0${JSON.stringify(r)}`).digest("hex");
 
 export interface RowsOptions {
-  batch: number; concurrency: number; apiKey: string;
+  batch: number; concurrency: number; apiKey?: string;
+  backend?: Backend; model?: string;
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
 
 export async function scoreRows(rows: Row[], questions: Questions, o: RowsOptions): Promise<{ answers: Record<string, Answer>[]; tokens: number; cached: number; requests: number }> {
+  const backend = o.backend ?? BACKENDS.typesafe;
+  const model = o.model ?? backend.model;
   const qJson = JSON.stringify(questions);
   const cache = o.cache ?? {};
   const f = o.fetchImpl ?? fetch;
+  // Lazy key resolution, same rule as jgrep(): explicit apiKey wins, else resolved
+  // once at the first request so fully-cached runs and tests never touch the filesystem.
+  let apiKey = o.apiKey;
+  const apiKeyOf = (): string => { apiKey ??= resolveApiKey(backend); return apiKey; };
   const answers: Record<string, Answer>[] = new Array(rows.length);
   const todo: number[] = [];
-  rows.forEach((r, i) => { const hit = cache[key(qJson, r)]; if (hit) answers[i] = hit; else todo.push(i); });
+  rows.forEach((r, i) => { const hit = cache[key(model, qJson, r)]; if (hit) answers[i] = hit; else todo.push(i); });
   const per = Math.max(1, Math.min(o.batch, Math.floor(MAX_QUESTIONS_PER_REQUEST / Object.keys(questions).length)));
   const batches: number[][] = [];
   for (let i = 0; i < todo.length; i += per) batches.push(todo.slice(i, i + per));
@@ -92,13 +100,13 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
   const worker = async () => {
     while (next < batches.length) {
       const b = batches[next++];
-      const res = await postSystemOne(buildRowsRequest(b.map((i) => rows[i]), questions), o.apiKey, f);
+      const res = await postSystemOne(buildRowsRequest(b.map((i) => rows[i]), questions, model), backend, apiKeyOf(), { fetchImpl: f });
       tokens += res.usage?.input_tokens ?? 0;
       b.forEach((ri, j) => {
         const a: Record<string, Answer> = {};
         for (const name of Object.keys(questions)) a[name] = res.answers[`r${j}.${name}`] ?? { type: "missing" };
         answers[ri] = a;
-        if (Object.values(a).every((x) => x.type !== "missing")) cache[key(qJson, rows[ri])] = a;
+        if (Object.values(a).every((x) => x.type !== "missing")) cache[key(model, qJson, rows[ri])] = a;
       });
       o.onProgress?.(++done, batches.length);
     }

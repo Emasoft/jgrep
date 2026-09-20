@@ -6,11 +6,23 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import * as p from "@clack/prompts";
-import { CONFIG_FILE, installSkills, resolveApiKey, saveApiKey, verifyApiKey } from "./jgrep";
+import { installSkills } from "./jgrep";
+import { PROVIDER_URLS, legacyEnvFile, resolveApiKey, resolveProvider, verifyApiKey } from "./providers";
 
 export const REPO_URL = "https://github.com/kyu1204/jgrep";
-const CONSOLE_URL = "https://console.typesafe.ai";
+const CONSOLE_URL = PROVIDER_URLS.typesafe.console;
 const SKILL_SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "skill", "SKILL.md");
+
+// Legacy global storage (~/.config/jgrep/env, `TYPESAFE_API_KEY=<key>`): the exact
+// file+format the pre-0.4 wizard wrote, preserved so existing installs keep working.
+// (providers.writeKeyFile stores raw <name>.key files — the per-provider wizard swap
+// is Step 8; until then init keeps today's semantics byte-for-byte.)
+function saveLegacyEnvKey(key: string): string {
+  const file = legacyEnvFile();
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, `TYPESAFE_API_KEY=${key}\n`, { mode: 0o600 });
+  return file;
+}
 
 function bail(msg = "Setup cancelled."): never {
   p.cancel(msg);
@@ -27,9 +39,11 @@ function openUrl(url: string) {
 export async function init() {
   p.intro("jgrep init");
 
-  // 1. key
+  // 1. key (backend comes from env via the provider layer; with nothing configured
+  //    this is the typesafe default, so the wizard below behaves exactly as before)
+  const backend = resolveProvider(undefined);
   let existing: string | undefined;
-  try { existing = resolveApiKey(); } catch { /* none */ }
+  try { existing = resolveApiKey(backend); } catch { /* none */ }
   if (existing) {
     const keep = guard(await p.confirm({
       message: `A TypeSafe key is already configured (…${existing.slice(-4)}). Keep it?`,
@@ -46,9 +60,9 @@ export async function init() {
       validate: (v) => (v?.trim() ? undefined : "The key is required: jgrep cannot run without it."),
     })).trim();
     const s = p.spinner();
-    s.start("Checking the key against api.typesafe.ai");
+    s.start(`Checking the key against ${new URL(backend.url).host}`);
     try {
-      const r = await verifyApiKey(typed);
+      const r = await verifyApiKey(backend, typed);
       if (r.ok) { s.stop(`Key accepted (${r.model ?? "jev"})`); apiKey = typed; model = r.model; }
       else { s.stop(`Rejected with HTTP ${r.status}`, 1); }
     } catch (e) {
@@ -70,7 +84,7 @@ export async function init() {
         { value: "none", label: "Don't save", hint: "I'll export TYPESAFE_API_KEY myself" },
       ],
     }));
-    if (where === "global") p.log.success(`Saved to ${saveApiKey(apiKey)} (mode 600)`);
+    if (where === "global") p.log.success(`Saved to ${saveLegacyEnvKey(apiKey)} (mode 600)`);
     else if (where === "project") {
       fs.appendFileSync(".env", `TYPESAFE_API_KEY=${apiKey}\n`);
       p.log.success("Appended to ./.env");
@@ -108,5 +122,5 @@ export async function init() {
     ].join("\n"),
     "Try it",
   );
-  p.outro(model ? `Ready (${model}). Key: ${existing ? "existing" : CONFIG_FILE}` : "Ready.");
+  p.outro(model ? `Ready (${model}). Key: ${existing ? "existing" : legacyEnvFile()}` : "Ready.");
 }
