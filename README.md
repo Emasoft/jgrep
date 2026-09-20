@@ -40,22 +40,56 @@ probabilities into `file:line` hits.
 
 ```bash
 npm i -g jevgrep     # installs the `jgrep` command
-jgrep init           # paste your TypeSafe key, pick where to keep it, done
+jgrep init           # pick a provider, paste your key, pick where to keep it, done
 ```
 
-`jgrep init` verifies the key against the API, stores it with `chmod 600`,
+`jgrep init` first asks **which provider** — TypeSafe, OpenRouter, or a
+self-hosted gateway — verifies the key against it, stores it with `chmod 600`,
 and optionally teaches Claude Code / Codex to use jgrep. Get a key at
-[console.typesafe.ai](https://console.typesafe.ai).
+[console.typesafe.ai](https://console.typesafe.ai) or
+[openrouter.ai/keys](https://openrouter.ai/keys).
 
 <details>
 <summary>Prefer not to run init?</summary>
 
 ```bash
-export TYPESAFE_API_KEY=...                                   # env
-echo 'TYPESAFE_API_KEY=...' >> .env                           # per project
-mkdir -p ~/.config/jgrep && echo 'TYPESAFE_API_KEY=...' > ~/.config/jgrep/env   # global
+export OPENROUTER_API_KEY=...                                            # env
+echo 'OPENROUTER_API_KEY=...' >> .env                                    # per project
+mkdir -p ~/.config/jgrep && echo '...' > ~/.config/jgrep/openrouter.key  # global, one file per provider
 ```
 </details>
+
+## Providers
+
+Three backends speak the same Jev protocol. Pick one with `--api`, or let jgrep
+find a key.
+
+| backend      | endpoint                                                    | default model                            | key                    |
+| ------------ | ----------------------------------------------------------- | ---------------------------------------- | ---------------------- |
+| `typesafe`   | `https://api.typesafe.ai/v1/systemone`                      | `jev-latest`                             | `TYPESAFE_API_KEY`     |
+| `openrouter` | `https://openrouter.ai/api/alpha/decisions`                 | `~typesafe/jev-latest`                   | `OPENROUTER_API_KEY`   |
+| `gateway`    | `$JEV_GATEWAY_URL` (full System One endpoint, e.g. LiteLLM) | `jev-latest` (override with `--model`)   | `JEV_GATEWAY_API_KEY`  |
+
+Provider precedence: `--api` > `$JEV_API` > first backend with a key (typesafe
+first). Key lookup, per provider: env var > `~/.config/jgrep/<name>.key` (mode
+600, written by `jgrep init`) > the legacy `~/.config/jgrep/env` > `./.env` in
+the project (warned on stderr when it isn't gitignored; `chmod 600` is a no-op
+on Windows — init warns there too).
+
+```bash
+OPENROUTER_API_KEY=sk-or-... jgrep "swallows errors" src/   # key found, provider auto-selected
+jgrep --api openrouter "swallows errors" src/               # forced
+JEV_GATEWAY_URL=http://localhost:4000/systemone JEV_GATEWAY_API_KEY=... \
+  jgrep --api gateway "swallows errors" src/                # any System One-speaking endpoint
+```
+
+OpenRouter's `alpha` decisions surface is the one that may move, so jgrep pings
+it once before the run (`--no-probe` skips the ping). If the probe fails, pin a
+version (`--model ~typesafe/jev-1.13`) or fall back to `--api typesafe`.
+
+Cost is the provider's reported number when it sends one (OpenRouter), else
+`tokens × $JEV_PRICE_PER_MTOK` (default `$0.042` per million input tokens,
+output free).
 
 ## Use
 
@@ -76,7 +110,8 @@ jgrep --diff origin/main "adds an HTTP endpoint that has no auth check"
 jgrep --diff origin/main "changes billing logic without touching a test"
 ```
 
-Exit status is grep's (`0` matched, `1` nothing, `2` error), so CI negates it:
+Exit status is grep's (`0` matched, `1` nothing, `2` error or partial failure),
+so CI negates it:
 
 ```yaml
 - run: npm i -g jevgrep
@@ -118,17 +153,69 @@ list of ranges instead of whole files. On a 115 KB module the agent read
 
 ```bash
 jgrep init                   # tick "Claude Code" / "Codex" to install the skill
-jgrep --json "spawns a child process" src/ | jq '.[].file'
+jgrep --json "spawns a child process" src/ | jq '.hits[].file'
 ```
 
 The skill also has the agent run a few `--diff --staged` rules on its own
 change before committing: a second model checking the first one's work, for
 a fraction of a cent.
 
+## Reliability
+
+Failures are isolated by default: a failed batch marks only its chunks errored,
+the rest of the run continues, and answers already paid for are kept in the
+cache.
+
+- **Retries**: statuses 408/429/500/502/503/504/529 and transport errors
+  (timeouts, `ECONNRESET`/`ETIMEDOUT`/`ECONNREFUSED`/`EAI_AGAIN`) retry with
+  full-jitter exponential backoff (500 ms base, 30 s cap), `--retries` times
+  (default 4, so 5 attempts). A provider `Retry-After` is honored, capped at
+  5 minutes.
+- **Deadlines**: `--request-timeout` (30 s) bounds one HTTP attempt;
+  `--timeout` (15 s) is the deadline for a whole batch *including* its retries —
+  an expired batch is recorded as errored and the run moves on.
+- **Pacing**: `--rate REQ/SEC` spaces all requests with a token bucket
+  (0 = unlimited).
+- **Circuit breaker**: 3 consecutive fatal failures — out of credits, bad key,
+  model gone, host unreachable, TLS — abort the run instead of hammering on;
+  chunks never attempted are reported as `circuit_breaker_open`. `--fail-fast`
+  restores abort-on-the-first-fatal.
+
+## Errors & exit codes
+
+Exit status: `0` hits, `1` none, `2` when any chunk errored or a fatal was
+thrown. Hits and the error breakdown are both printed, and every failed chunk
+carries a typed kind with a hint on stderr:
+
+| kind                   | hint |
+| ---------------------- | ---- |
+| `insufficient_credits` | billing URL to top up, or `--api typesafe` if a TypeSafe key exists |
+| `invalid_api_key`      | names the provider's key env and key file; a missing key lists every location it checked |
+| `model_unavailable`    | pin a version with `--model` (e.g. `typesafe/jev-1.13`), or `--api typesafe` |
+| `rate_limited`         | the provider is throttling — pace with `--rate` |
+| `bad_request`          | request-shape problem; the provider's response body is quoted |
+| `malformed_response`   | the API surface may have changed — pin `--model` or report it |
+| `server_unreachable`   | check the network or the provider's status page |
+| `tls_error`            | certificate problem, message quoted verbatim |
+| `timeout`              | raise `--timeout` or `--request-timeout` |
+| `circuit_breaker_open` | provider failing consistently — the chunk was never attempted |
+
+**Breaking in 0.4.0:** `--json` is an object now —
+`{"hits":[…],"errors":[{file,start,end,kind,message}]}` (rows mode:
+`{"answers":[…],"errors":[{row,kind,message}]}`); it was a bare array.
+
+Two cache notes. Keys now include the resolved model id, so entries for another
+provider's model — openrouter's `~typesafe/jev-latest`, any `--model` override —
+are separate from typesafe's `jev-latest`: those queries re-bill once on the
+first run after upgrading, default typesafe queries keep their old keys. And a
+failed batch is retried as a whole: keeping per-answer results from a failed
+batch depends on the provider returning per-question answers alongside errors,
+which is still to be verified on the OpenRouter alpha surface.
+
 ## All options
 
 ```
-jgrep init                               interactive setup
+jgrep init                               interactive setup (provider, key, agent skills)
 jgrep [options] "<description>" [path ...]
 jgrep [options] --diff [ref] "<description>"
 jgrep [options] --rows <file.csv|.jsonl> "<description>"
@@ -137,15 +224,31 @@ jgrep [options] --rows <file> --questions <q.json> [--out scored.csv]
   -t, --threshold <p>   print chunks with probability >= p (default 0.7)
   -C, --show            print the matching chunk body under each hit
   -a, --all             print every chunk with its probability, best first
-      --json            machine-readable output
-      --diff [ref]      grep git diff hunks (working tree, or against <ref>)
+      --json            machine-readable output: {"hits":[...],"errors":[...]}
+                        rows mode: {"answers":[...],"errors":[...]}
+                        (v0.4 breaking change: was a bare array; errors carry
+                        {file,start,end,kind,message} / rows {row,kind,message})
+      --diff [ref]      grep git diff hunks instead of files
+                        (working tree by default, or against <ref>)
       --staged          with --diff: staged changes only
       --rows <file>     grep rows of a CSV / JSONL file instead of code
-      --questions <f>   with --rows: JSON of Jev questions asked of every row
+      --questions <f>   with --rows: JSON of Jev questions (noul/choice/score)
+                        asked of every row; prints the table with answer columns
       --out <file>      with --questions: write the CSV here instead of stdout
+                        (with --json: the JSON object goes to the file)
   -b, --batch <n>       chunks per request (default 16)
   -c, --concurrency <n> parallel requests (default 16)
+      --api <name>      provider: typesafe | openrouter | gateway
+                        precedence: --api > $JEV_API > first key found (typesafe first)
+      --model <id>      model id override (default: the provider's default; or $JEV_MODEL)
+      --timeout <s>     per-batch deadline, retries included (default 15)
+      --request-timeout <s>  per-attempt HTTP timeout (default 30)
+      --retries <n>     failed attempts tolerated per batch (default 4)
+      --rate <req/s>    global request pacing (token bucket); 0 = unlimited
+      --fail-fast       abort on the first fatal error instead of isolating it
+      --no-probe        skip the openrouter startup probe
       --no-cache        ignore and do not write ~/.cache/jgrep
+  -v, --version         print version
 ```
 
 ## How it works
@@ -165,6 +268,16 @@ jgrep [options] --rows <file> --questions <q.json> [--out scored.csv]
 | TypeScript CLI, `src/`       |    896 | 1.8 s | $0.010  |
 | same query again (cache)     |    896 | 0.0 s | $0      |
 | one module, `app/lib/`       |    521 | 1.6 s | $0.006  |
+
+## Accuracy
+
+How reliable is the matching? A benchmark harness — labeled fixtures (SMS spam,
+AG News, hand-written code-selection cases) plus an accuracy runner — lives
+under `bench/`; numbers land here after the first CI bench run.
+
+```bash
+bun bench/accuracy.ts --fixture sms --limit 20   # precision/recall on 20 labeled rows
+```
 
 ## Tips
 

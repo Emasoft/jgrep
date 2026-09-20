@@ -12,10 +12,11 @@ description: >-
 
 # jgrep
 
-`jgrep "<description in English>" [paths]` asks a fast decision model (TypeSafe
-Jev) one yes/no question per 5-60 line chunk and prints the chunks that match.
-It never reads files into your context: you get a short list, then you Read
-only the ranges you need.
+`jgrep "<description in English>" [paths]` asks a fast decision model (Jev, via
+TypeSafe by default — OpenRouter and a self-hosted gateway also speak the
+protocol) one yes/no question per 5-60 line chunk and prints the chunks that
+match. It never reads files into your context: you get a short list, then you
+Read only the ranges you need.
 
 ## When to use it instead of grep or reading files
 
@@ -32,14 +33,24 @@ Do not use it for exact identifiers, strings, or paths. `rg` is free and instant
 jgrep "description" src/                 # hits with p >= 0.7, file order
 jgrep -t 0.85 "description" src/         # fewer, higher-precision hits
 jgrep -C "description" src/              # print the matching chunk bodies
-jgrep --json "description" src/          # [{file,start,end,p,text}]
+jgrep --json "description" src/          # {"hits":[{file,start,end,p,text}],"errors":[...]}
 jgrep -a -t 0 "description" src/ | head  # everything, best first (when 0 hits)
 jgrep --diff --staged "rule"             # lint your staged change
 jgrep --diff origin/main "rule"          # lint the branch against main
+jgrep --api openrouter "rule" src/       # pick a provider: typesafe | openrouter | gateway
 ```
 
-Exit status: 0 hits found, 1 none, 2 error. Every run prints a summary line
-on stderr: `N hits / M chunks · tokens · $cost · seconds`.
+Exit status: 0 hits found, 1 none, 2 on error or when any chunk errored
+(partial failure: hits and the error breakdown are both reported; every failed
+chunk carries a typed kind). Every run prints a summary line on stderr:
+`N hits / M chunks · tokens · $cost · seconds`, with `· K errored (kinds)`
+appended when chunks failed.
+
+Reliability: retries use full-jitter backoff (`--retries`, default 4);
+`--timeout` bounds each batch including retries, `--request-timeout` each
+attempt; `--rate REQ/SEC` paces requests. A circuit breaker aborts after 3
+consecutive fatal failures (`--fail-fast` restores abort-on-the-first);
+`--no-probe` skips the openrouter startup ping.
 
 ## Reading results
 
@@ -81,7 +92,8 @@ reading them one by one.
 
 ## Requirements
 
-Installed globally as `jgrep`; the key lives in `~/.config/jgrep/env`. If it
-reports "No TypeSafe API key", tell the user rather than working around it.
-Run it inside a project directory or pass the project path: it refuses to
-walk a non-git directory with more than 5000 files.
+Installed globally as `jgrep`; the key lives in `~/.config/jgrep/<provider>.key`
+(or the legacy `~/.config/jgrep/env`), with the provider's env var looked up
+first. If it reports "No <provider> API key found. Looked in: …", tell the user
+rather than working around it. Run it inside a project directory or pass the
+project path: it refuses to walk a non-git directory with more than 5000 files.

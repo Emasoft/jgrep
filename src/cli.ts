@@ -18,7 +18,7 @@ declare const process: {
   stderr: { isTTY?: boolean; write(s: string): void };
 };
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const USAGE = `jgrep ${VERSION} — semantic grep powered by Jev (TypeSafe)
 
 usage: jgrep init                       interactive setup (API key, agent skills)
