@@ -87,6 +87,9 @@ OpenRouter's `alpha` decisions surface is the one that may move, so jgrep pings
 it once before the run (`--no-probe` skips the ping). If the probe fails, pin a
 version (`--model ~typesafe/jev-1.13`) or fall back to `--api typesafe`.
 
+Note: the OpenRouter alpha decisions surface expects `choice` criteria as a
+record keyed by label (not an array) — jgrep sends the record form.
+
 Cost is the provider's reported number when it sends one (OpenRouter), else
 `tokens × $JEV_PRICE_PER_MTOK` (default `$0.042` per million input tokens,
 output free).
