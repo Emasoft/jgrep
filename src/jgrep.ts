@@ -7,8 +7,8 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { BACKENDS, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
-import { runPool } from "./pool";
-import type { JevErrorKind } from "./errors";
+import { runPool, type PoolResult } from "./pool";
+import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
 
 // DI seam for fetch (moved to providers.ts; re-exported so existing imports keep working)
 export type { Fetch };
@@ -166,6 +166,11 @@ export interface Result { hits: Hit[]; all: Hit[]; chunks: number; tokens: numbe
  *  batch index rides along and `all` is re-associated after the pool settles. */
 interface BatchOutcome { index: number; entries: { chunkIndex: number; p: number }[] }
 
+/** Appended to an invalid_api_key hint when at least one batch succeeded earlier in the
+ *  SAME run (plan §1.5): a 401/403 then means the key expired/was revoked, not that the
+ *  user handed over the wrong provider's key. */
+export const KEY_WORKED_EARLIER_HINT = "the key worked earlier this run — it may have been expired or revoked";
+
 export async function jgrep(question: string, chunks: Chunk[], o: Options): Promise<Result> {
   const kind = o.kind ?? "code";
   const backend = o.backend ?? BACKENDS.typesafe; // the core never picks a provider from env — cli.ts resolves in Step 7
@@ -195,6 +200,9 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
   };
   let tokens = 0;
   let cost: number | undefined; // stays undefined unless a provider reports a cost
+  // Run-level success flag (plan §1.5): drives the invalid_api_key expired-vs-wrong-key
+  // hint. Tracked HERE (not PoolResult) because failFast throws the pool result away.
+  let hadSuccess = false;
   const worker = async (b: number[], index: number): Promise<BatchOutcome> => {
     const res = await postSystemOne(buildRequest(question, b.map((i) => chunks[i]), kind, model), backend, apiKeyOf(), {
       ...post,
@@ -209,14 +217,34 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
       if (Number.isFinite(p)) cache[key(model, kind, question, chunks[ci])] = p;
       return { chunkIndex: ci, p };
     });
+    hadSuccess = true; // this batch's request succeeded — set before returning (plan §1.5)
     return { index, entries };
   };
-  const pool = await runPool(batches, {
-    concurrency: o.concurrency,
-    failFast: o.failFast,
-    onProgress: o.onProgress ? (done, total) => o.onProgress!(done, total) : undefined,
-  }, worker);
+  let pool: PoolResult<BatchOutcome>;
+  try {
+    pool = await runPool(batches, {
+      concurrency: o.concurrency,
+      failFast: o.failFast,
+      onProgress: o.onProgress ? (done, total) => o.onProgress!(done, total) : undefined,
+    }, worker);
+  } catch (e) {
+    // failFast: runPool rethrows the first fatal error and PoolResult.hadSuccess is lost
+    // with it, so the run-level flag above is the only remaining evidence that the key
+    // worked earlier this run. Amend the hint; otherwise rethrow untouched.
+    if (e instanceof JevProviderError && isFatalError(e) && e.kind === "invalid_api_key" && hadSuccess)
+      e.hint = [e.hint, KEY_WORKED_EARLIER_HINT].filter(Boolean).join(" ");
+    throw e;
+  }
   for (const r of pool.results) for (const e of r.entries) all[e.chunkIndex] = { ...chunks[e.chunkIndex], p: e.p };
+  // Not failFast: recorded 401/403s get the same expired-vs-wrong-key distinction. One
+  // clean place — mutate the JevProviderError's hint in pool.errors BEFORE mapping onto
+  // chunks (ChunkError carries only kind+message; the hint stays on the provider error
+  // that pool-level consumers see).
+  if (pool.hadSuccess) {
+    for (const e of pool.errors) {
+      if (e.error.kind === "invalid_api_key") e.error.hint = [e.error.hint, KEY_WORKED_EARLIER_HINT].filter(Boolean).join(" ");
+    }
+  }
   const errors: ChunkError[] = pool.errors.flatMap((e) =>
     batches[e.index].map((ci) => ({ file: chunks[ci].file, start: chunks[ci].start, end: chunks[ci].end, kind: e.error.kind, message: e.error.message })));
   if (pool.aborted) {

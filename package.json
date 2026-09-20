@@ -5,7 +5,7 @@
   "keywords": ["grep", "semantic-search", "code-search", "jev", "typesafe", "lint", "cli"],
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/Emasoft/jgrep.git" },
-  "homepage": "https://github.com/kyu1204/jgrep",
+  "homepage": "https://github.com/Emasoft/jgrep#readme",
   "type": "module",
   "bin": {
     "jgrep": "dist/jgrep.js"

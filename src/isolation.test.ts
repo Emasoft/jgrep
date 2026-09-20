@@ -147,6 +147,46 @@ test("failFast: one 402 batch makes jgrep() reject with the provider error", asy
   expect(err.provider).toBe("typesafe");
 });
 
+// ---- jgrep: failFast invalid_api_key hint distinguishes expired vs wrong key ------
+
+test("failFast: a 401 after one successful batch amends the hint — key worked earlier this run", async () => {
+  const calls: string[] = [];
+  const fetchImpl = (async (_url: unknown, init: { body: string }) => {
+    calls.push(init.body);
+    if (calls.length === 1) { // concurrency 1: call 1 == batch 0, which must succeed first
+      const body = JSON.parse(init.body);
+      const answers: Record<string, unknown> = {};
+      for (const c of body.state.chunks) answers[c.id] = { type: "noul", noul: 0.9 };
+      return new Response(JSON.stringify({ answers, usage: { input_tokens: 10 } }), { status: 200 });
+    }
+    return new Response("expired", { status: 401 });
+  }) as unknown as Fetch;
+  let caught: unknown;
+  try {
+    await jgrep("q", nChunks(4), { threshold: 0.7, batch: 2, concurrency: 1, failFast: true, apiKey: "k", fetchImpl, cache: {} });
+  } catch (e) { caught = e; }
+  expect(caught).toBeInstanceOf(JevProviderError);
+  const err = caught as JevProviderError;
+  expect(err.kind).toBe("invalid_api_key");
+  expect(err.hint).toContain("worked earlier this run");
+  expect(err.hint).toContain("expired or revoked");
+  // the base hint survives the amendment
+  expect(err.hint).toContain("TYPESAFE_API_KEY");
+});
+
+test("failFast: a 401 as the very first batch keeps the base hint — no earlier-success claim", async () => {
+  const fetchImpl = (async () => new Response("bad key", { status: 401 })) as unknown as Fetch;
+  let caught: unknown;
+  try {
+    await jgrep("q", nChunks(2), { threshold: 0.7, batch: 2, concurrency: 1, failFast: true, apiKey: "k", fetchImpl, cache: {} });
+  } catch (e) { caught = e; }
+  expect(caught).toBeInstanceOf(JevProviderError);
+  const err = caught as JevProviderError;
+  expect(err.kind).toBe("invalid_api_key");
+  expect(err.hint).toBeDefined();
+  expect(err.hint).not.toContain("worked earlier this run");
+});
+
 // ---- jgrep: cost passthrough ---------------------------------------------------
 
 test("cost: provider-reported cost is passed through and summed across batches; absent stays undefined", async () => {

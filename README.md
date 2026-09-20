@@ -190,7 +190,7 @@ carries a typed kind with a hint on stderr:
 | kind                   | hint |
 | ---------------------- | ---- |
 | `insufficient_credits` | billing URL to top up, or `--api typesafe` if a TypeSafe key exists |
-| `invalid_api_key`      | names the provider's key env and key file; a missing key lists every location it checked |
+| `invalid_api_key`      | names the provider's key env and key file; tells you when the key worked earlier this run (expired/revoked) vs never worked (wrong provider's key) |
 | `model_unavailable`    | pin a version with `--model` (e.g. `typesafe/jev-1.13`), or `--api typesafe` |
 | `rate_limited`         | the provider is throttling — pace with `--rate` |
 | `bad_request`          | request-shape problem; the provider's response body is quoted |

@@ -4,9 +4,9 @@
 import fs from "node:fs";
 import { createHash } from "node:crypto";
 import { BACKENDS, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
-import { runPool } from "./pool";
-import type { JevErrorKind } from "./errors";
-import { DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, type Cache } from "./jgrep";
+import { runPool, type PoolResult } from "./pool";
+import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
+import { DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, KEY_WORKED_EARLIER_HINT, type Cache } from "./jgrep";
 
 export type Row = Record<string, string>;
 export type Questions = Record<string, { type: "noul" | "choice" | "score"; instructions: string; [k: string]: unknown }>;
@@ -120,6 +120,10 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
   };
   let tokens = 0;
   let cost: number | undefined; // stays undefined unless a provider reports a cost
+  // Run-level success flag (plan §1.5), same rule as jgrep(): drives the invalid_api_key
+  // expired-vs-wrong-key hint. Tracked HERE (not PoolResult) because failFast throws the
+  // pool result away.
+  let hadSuccess = false;
   const worker = async (b: number[], index: number): Promise<PackOutcome> => {
     const res = await postSystemOne(buildRowsRequest(b.map((i) => rows[i]), questions, model), backend, apiKeyOf(), {
       ...post,
@@ -135,14 +139,34 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
       if (Object.values(a).every((x) => x.type !== "missing")) cache[key(model, qJson, rows[ri])] = a;
       return { row: ri, answers: a };
     });
+    hadSuccess = true; // this pack's request succeeded — set before returning (plan §1.5)
     return { index, rowResults };
   };
-  const pool = await runPool(batches, {
-    concurrency: o.concurrency,
-    failFast: o.failFast,
-    onProgress: o.onProgress ? (done, total) => o.onProgress!(done, total) : undefined,
-  }, worker);
+  let pool: PoolResult<PackOutcome>;
+  try {
+    pool = await runPool(batches, {
+      concurrency: o.concurrency,
+      failFast: o.failFast,
+      onProgress: o.onProgress ? (done, total) => o.onProgress!(done, total) : undefined,
+    }, worker);
+  } catch (e) {
+    // failFast: runPool rethrows the first fatal error and PoolResult.hadSuccess is lost
+    // with it, so the run-level flag above is the only remaining evidence that the key
+    // worked earlier this run. Amend the hint; otherwise rethrow untouched.
+    if (e instanceof JevProviderError && isFatalError(e) && e.kind === "invalid_api_key" && hadSuccess)
+      e.hint = [e.hint, KEY_WORKED_EARLIER_HINT].filter(Boolean).join(" ");
+    throw e;
+  }
   for (const r of pool.results) for (const rr of r.rowResults) answers[rr.row] = rr.answers;
+  // Not failFast: recorded 401/403s get the same expired-vs-wrong-key distinction. One
+  // clean place — mutate the JevProviderError's hint in pool.errors BEFORE mapping onto
+  // rows (RowError carries only kind+message; the hint stays on the provider error that
+  // pool-level consumers see).
+  if (pool.hadSuccess) {
+    for (const e of pool.errors) {
+      if (e.error.kind === "invalid_api_key") e.error.hint = [e.error.hint, KEY_WORKED_EARLIER_HINT].filter(Boolean).join(" ");
+    }
+  }
   const errors: RowError[] = pool.errors.flatMap((e) =>
     batches[e.index].map((row) => ({ row, kind: e.error.kind, message: e.error.message })));
   if (pool.aborted) {

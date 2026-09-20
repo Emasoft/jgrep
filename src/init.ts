@@ -28,7 +28,7 @@ import {
 // keep all process usage to this shape.
 declare const process: { platform: string; exit(code: number): never };
 
-export const REPO_URL = "https://github.com/kyu1204/jgrep";
+export const REPO_URL = "https://github.com/Emasoft/jgrep";
 const SKILL_SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "skill", "SKILL.md");
 
 // ---- wizard data + pure helpers (tested in init.test.ts) ----------------------
