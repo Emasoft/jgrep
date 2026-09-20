@@ -3,8 +3,10 @@
 // rows per request. Output is the table with one answer column per question.
 import fs from "node:fs";
 import { createHash } from "node:crypto";
-import { BACKENDS, postSystemOne, resolveApiKey, type Backend, type Fetch } from "./providers";
-import type { Cache } from "./jgrep";
+import { BACKENDS, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
+import { runPool } from "./pool";
+import type { JevErrorKind } from "./errors";
+import { DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, type Cache } from "./jgrep";
 
 export type Row = Record<string, string>;
 export type Questions = Record<string, { type: "noul" | "choice" | "score"; instructions: string; [k: string]: unknown }>;
@@ -77,10 +79,22 @@ const key = (model: string, qJson: string, r: Row) => createHash("sha1").update(
 export interface RowsOptions {
   batch: number; concurrency: number; apiKey?: string;
   backend?: Backend; model?: string;
+  timeoutSec?: number;         // per-batch deadline, retries included (defaults shared with jgrep)
+  requestTimeoutSec?: number;  // per attempt
+  maxRetries?: number;         // failed attempts tolerated before the final error
+  ratePerSec?: number;         // token-bucket pacing across all requests; 0/undefined = unlimited
+  failFast?: boolean;          // rethrow the first fatal error instead of isolating it
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
 
-export async function scoreRows(rows: Row[], questions: Questions, o: RowsOptions): Promise<{ answers: Record<string, Answer>[]; tokens: number; cached: number; requests: number }> {
+export interface RowError { row: number; kind: JevErrorKind; message: string }
+export interface RowsResult { answers: Record<string, Answer>[]; tokens: number; cached: number; requests: number; errors: RowError[]; cost?: number }
+
+/** One request-pack's outcome; runPool results are completion-ordered, so the pack
+ *  index rides along and `answers` is re-associated after the pool settles. */
+interface PackOutcome { index: number; rowResults: { row: number; answers: Record<string, Answer> }[] }
+
+export async function scoreRows(rows: Row[], questions: Questions, o: RowsOptions): Promise<RowsResult> {
   const backend = o.backend ?? BACKENDS.typesafe;
   const model = o.model ?? backend.model;
   const qJson = JSON.stringify(questions);
@@ -90,29 +104,57 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
   // once at the first request so fully-cached runs and tests never touch the filesystem.
   let apiKey = o.apiKey;
   const apiKeyOf = (): string => { apiKey ??= resolveApiKey(backend); return apiKey; };
-  const answers: Record<string, Answer>[] = new Array(rows.length);
+  const answers: Record<string, Answer>[] = new Array(rows.length); // errored rows stay unset
   const todo: number[] = [];
   rows.forEach((r, i) => { const hit = cache[key(model, qJson, r)]; if (hit) answers[i] = hit; else todo.push(i); });
   const per = Math.max(1, Math.min(o.batch, Math.floor(MAX_QUESTIONS_PER_REQUEST / Object.keys(questions).length)));
   const batches: number[][] = [];
   for (let i = 0; i < todo.length; i += per) batches.push(todo.slice(i, i + per));
-  let tokens = 0, done = 0, next = 0;
-  const worker = async () => {
-    while (next < batches.length) {
-      const b = batches[next++];
-      const res = await postSystemOne(buildRowsRequest(b.map((i) => rows[i]), questions, model), backend, apiKeyOf(), { fetchImpl: f });
-      tokens += res.usage?.input_tokens ?? 0;
-      b.forEach((ri, j) => {
-        const a: Record<string, Answer> = {};
-        for (const name of Object.keys(questions)) a[name] = res.answers[`r${j}.${name}`] ?? { type: "missing" };
-        answers[ri] = a;
-        if (Object.values(a).every((x) => x.type !== "missing")) cache[key(model, qJson, rows[ri])] = a;
-      });
-      o.onProgress?.(++done, batches.length);
-    }
+  // Same defaults and PostOpts wiring as jgrep() — resolved once, read-only in the worker.
+  const timeoutMs = (o.timeoutSec ?? DEFAULT_TIMEOUT_SEC) * 1000;
+  const post: PostOpts = {
+    fetchImpl: f,
+    requestTimeoutMs: (o.requestTimeoutSec ?? DEFAULT_REQUEST_TIMEOUT_SEC) * 1000,
+    maxRetries: o.maxRetries ?? DEFAULT_MAX_RETRIES,
+    limiter: o.ratePerSec && o.ratePerSec > 0 ? new RateLimiter(o.ratePerSec, Math.max(1, o.concurrency)) : undefined,
   };
-  await Promise.all(Array.from({ length: Math.min(o.concurrency, batches.length) }, worker));
-  return { answers, tokens, cached: rows.length - todo.length, requests: batches.length };
+  let tokens = 0;
+  let cost: number | undefined; // stays undefined unless a provider reports a cost
+  const worker = async (b: number[], index: number): Promise<PackOutcome> => {
+    const res = await postSystemOne(buildRowsRequest(b.map((i) => rows[i]), questions, model), backend, apiKeyOf(), {
+      ...post,
+      deadlineMs: Date.now() + timeoutMs, // per-batch deadline, retries included (§1.6.1)
+    });
+    tokens += res.usage?.input_tokens ?? 0;
+    if (res.cost !== undefined) cost = (cost ?? 0) + res.cost;
+    const rowResults = b.map((ri, j) => {
+      const a: Record<string, Answer> = {};
+      for (const name of Object.keys(questions)) a[name] = res.answers[`r${j}.${name}`] ?? { type: "missing" };
+      // Same rule as before: a row with any missing answer is not cached. Complete rows
+      // go into the in-memory cache object now — cli.ts persists it in a finally (Step 7).
+      if (Object.values(a).every((x) => x.type !== "missing")) cache[key(model, qJson, rows[ri])] = a;
+      return { row: ri, answers: a };
+    });
+    return { index, rowResults };
+  };
+  const pool = await runPool(batches, {
+    concurrency: o.concurrency,
+    failFast: o.failFast,
+    onProgress: o.onProgress ? (done, total) => o.onProgress!(done, total) : undefined,
+  }, worker);
+  for (const r of pool.results) for (const rr of r.rowResults) answers[rr.row] = rr.answers;
+  const errors: RowError[] = pool.errors.flatMap((e) =>
+    batches[e.index].map((row) => ({ row, kind: e.error.kind, message: e.error.message })));
+  if (pool.aborted) {
+    // Packs that were dispatched all reported (success or their own error); whatever was
+    // never attempted is reported as a breaker error. No cache entries for those rows.
+    const settled = new Set<number>(pool.results.map((r) => r.index).concat(pool.errors.map((e) => e.index)));
+    for (let bi = 0; bi < batches.length; bi++) {
+      if (settled.has(bi)) continue;
+      for (const row of batches[bi]) errors.push({ row, kind: "circuit_breaker_open", message: "not attempted: provider failing consistently (circuit breaker open)" });
+    }
+  }
+  return { answers, tokens, cached: rows.length - todo.length, requests: batches.length, errors, ...(cost !== undefined ? { cost } : {}) };
 }
 
 // ---- output -----------------------------------------------------------------

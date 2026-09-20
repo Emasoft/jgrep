@@ -6,7 +6,9 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { BACKENDS, postSystemOne, resolveApiKey, type Backend, type Fetch } from "./providers";
+import { BACKENDS, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
+import { runPool } from "./pool";
+import type { JevErrorKind } from "./errors";
 
 // DI seam for fetch (moved to providers.ts; re-exported so existing imports keep working)
 export type { Fetch };
@@ -125,11 +127,6 @@ export function buildRequest(question: string, chunks: Chunk[], kind: Kind = "co
   return { model, state, questions };
 }
 
-async function ask(question: string, chunks: Chunk[], kind: Kind, model: string, backend: Backend, apiKey: string, f: Fetch): Promise<{ ps: number[]; tokens: number }> {
-  const json = await postSystemOne(buildRequest(question, chunks, kind, model), backend, apiKey, { fetchImpl: f });
-  return { ps: chunks.map((_, i) => json.answers[`c${i}`]?.noul ?? NaN), tokens: json.usage?.input_tokens ?? 0 };
-}
-
 // ---- cache ------------------------------------------------------------------
 // ponytail: one JSON file; move to sqlite if it passes a few MB.
 const CACHE_FILE = path.join(os.homedir(), ".cache", "jgrep", "cache.json");
@@ -146,12 +143,28 @@ export function saveCache(c: Cache) {
 const key = (model: string, kind: Kind, q: string, c: Chunk) => createHash("sha1").update(`${model}\0${kind}\0${q}\0${c.text}`).digest("hex");
 
 // ---- core -------------------------------------------------------------------
+// Retry/deadline defaults live in ONE place (here); jgrep()/scoreRows() resolve
+// them once per run and the pool workers only read the resolved values.
+export const DEFAULT_TIMEOUT_SEC = 15;         // per-batch deadline INCLUDING retries (§1.6.1)
+export const DEFAULT_REQUEST_TIMEOUT_SEC = 30; // per attempt
+export const DEFAULT_MAX_RETRIES = 4;          // => 5 total attempts
+
 export interface Options {
   threshold: number; batch: number; concurrency: number; apiKey?: string; kind?: Kind;
   backend?: Backend; model?: string;
+  timeoutSec?: number;         // per-batch deadline, retries included
+  requestTimeoutSec?: number;  // per attempt
+  maxRetries?: number;         // failed attempts tolerated before the final error
+  ratePerSec?: number;         // token-bucket pacing across all requests; 0/undefined = unlimited
+  failFast?: boolean;          // rethrow the first fatal error instead of isolating it
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
-export interface Result { hits: Hit[]; all: Hit[]; chunks: number; tokens: number; cached: number }
+export interface ChunkError { file: string; start: number; end: number; kind: JevErrorKind; message: string }
+export interface Result { hits: Hit[]; all: Hit[]; chunks: number; tokens: number; cached: number; errors: ChunkError[]; cost?: number }
+
+/** What one batch worker hands back; runPool results are completion-ordered, so the
+ *  batch index rides along and `all` is re-associated after the pool settles. */
+interface BatchOutcome { index: number; entries: { chunkIndex: number; p: number }[] }
 
 export async function jgrep(question: string, chunks: Chunk[], o: Options): Promise<Result> {
   const kind = o.kind ?? "code";
@@ -163,7 +176,7 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
   // request, so a fully-cached run (or a test passing apiKey) never touches the filesystem.
   let apiKey = o.apiKey;
   const apiKeyOf = (): string => { apiKey ??= resolveApiKey(backend); return apiKey; };
-  const all: Hit[] = new Array(chunks.length);
+  const all: (Hit | undefined)[] = new Array(chunks.length); // errored chunks stay unset
   const todo: number[] = [];
   chunks.forEach((c, i) => {
     const hit = cache[key(model, kind, question, c)];
@@ -172,22 +185,55 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
   const cached = chunks.length - todo.length;
   const batches: number[][] = [];
   for (let i = 0; i < todo.length; i += o.batch) batches.push(todo.slice(i, i + o.batch));
-  let tokens = 0, done = 0, next = 0;
-  const worker = async () => {
-    while (next < batches.length) {
-      const b = batches[next++];
-      const { ps, tokens: t } = await ask(question, b.map((i) => chunks[i]), kind, model, backend, apiKeyOf(), f);
-      tokens += t;
-      b.forEach((ci, j) => {
-        all[ci] = { ...chunks[ci], p: ps[j] };
-        if (Number.isFinite(ps[j])) cache[key(model, kind, question, chunks[ci])] = ps[j];
-      });
-      o.onProgress?.(++done, batches.length);
-    }
+  // One resolution of the retry/deadline options for the whole run (the worker only reads these).
+  const timeoutMs = (o.timeoutSec ?? DEFAULT_TIMEOUT_SEC) * 1000;
+  const post: PostOpts = {
+    fetchImpl: f,
+    requestTimeoutMs: (o.requestTimeoutSec ?? DEFAULT_REQUEST_TIMEOUT_SEC) * 1000,
+    maxRetries: o.maxRetries ?? DEFAULT_MAX_RETRIES,
+    limiter: o.ratePerSec && o.ratePerSec > 0 ? new RateLimiter(o.ratePerSec, Math.max(1, o.concurrency)) : undefined,
   };
-  await Promise.all(Array.from({ length: Math.min(o.concurrency, batches.length) }, worker));
-  const hits = all.filter((h) => h.p >= o.threshold);
-  return { hits, all, chunks: chunks.length, tokens, cached };
+  let tokens = 0;
+  let cost: number | undefined; // stays undefined unless a provider reports a cost
+  const worker = async (b: number[], index: number): Promise<BatchOutcome> => {
+    const res = await postSystemOne(buildRequest(question, b.map((i) => chunks[i]), kind, model), backend, apiKeyOf(), {
+      ...post,
+      deadlineMs: Date.now() + timeoutMs, // per-batch deadline, retries included (§1.6.1)
+    });
+    tokens += res.usage?.input_tokens ?? 0;
+    if (res.cost !== undefined) cost = (cost ?? 0) + res.cost;
+    // Finite p-values go straight into the in-memory cache object: cli.ts persists it in a
+    // finally (Step 7), so answers paid for survive even when other batches fail.
+    const entries = b.map((ci, j) => {
+      const p = res.answers[`c${j}`]?.noul ?? NaN;
+      if (Number.isFinite(p)) cache[key(model, kind, question, chunks[ci])] = p;
+      return { chunkIndex: ci, p };
+    });
+    return { index, entries };
+  };
+  const pool = await runPool(batches, {
+    concurrency: o.concurrency,
+    failFast: o.failFast,
+    onProgress: o.onProgress ? (done, total) => o.onProgress!(done, total) : undefined,
+  }, worker);
+  for (const r of pool.results) for (const e of r.entries) all[e.chunkIndex] = { ...chunks[e.chunkIndex], p: e.p };
+  const errors: ChunkError[] = pool.errors.flatMap((e) =>
+    batches[e.index].map((ci) => ({ file: chunks[ci].file, start: chunks[ci].start, end: chunks[ci].end, kind: e.error.kind, message: e.error.message })));
+  if (pool.aborted) {
+    // Batches that were dispatched all reported (success or their own error); whatever
+    // was never attempted is reported as a breaker error. No cache entries, no hits.
+    const settled = new Set<number>(pool.results.map((r) => r.index).concat(pool.errors.map((e) => e.index)));
+    for (let bi = 0; bi < batches.length; bi++) {
+      if (settled.has(bi)) continue;
+      for (const ci of batches[bi]) {
+        errors.push({ file: chunks[ci].file, start: chunks[ci].start, end: chunks[ci].end, kind: "circuit_breaker_open", message: "not attempted: provider failing consistently (circuit breaker open)" });
+      }
+    }
+  }
+  const hits: Hit[] = [];
+  const ordered: Hit[] = [];
+  for (const h of all) if (h) { ordered.push(h); if (h.p >= o.threshold) hits.push(h); }
+  return { hits, all: ordered, chunks: chunks.length, tokens, cached, errors, ...(cost !== undefined ? { cost } : {}) };
 }
 
 // ---- config -----------------------------------------------------------------
