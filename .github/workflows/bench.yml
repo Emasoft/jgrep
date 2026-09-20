@@ -1,0 +1,203 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Bench — on-demand accuracy benchmark harness (WI-8, plan Step 13).
+#
+# ⚠️ COST WARNING: this workflow spends REAL MONEY. It calls the live
+#    TypeSafe / OpenRouter APIs using the repository secrets, so it is
+#    workflow_dispatch only — it never runs on push or PR, and ci.yml stays
+#    bench-free. Every run bills tokens for each fixture row/case it scores.
+#
+# How to run:
+#   GitHub → Actions tab → "Bench" → "Run workflow", then pick:
+#     provider: typesafe | openrouter | both   (default: typesafe)
+#     limit:    rows/cases per fixture, e.g. "10" for a pennies smoke run;
+#               "0" = full committed fixtures (default)
+#
+# Secrets: set TYPESAFE_API_KEY and/or OPENROUTER_API_KEY under
+#   Settings → Secrets and variables → Actions. A provider whose secret is
+#   missing is skipped with a ::notice and its steps are skipped — the run
+#   still succeeds (green), so a fresh fork without secrets is never red.
+#
+# Where results land:
+#   bench/results/ is gitignored, so each run uploads the
+#   <provider>-<fixture>-<timestamp>.json files as a `bench-results-<provider>`
+#   artifact (retained 30 days) and appends the markdown metric tables to the
+#   run's job summary.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: "Provider to bench"
+        type: choice
+        options: [typesafe, openrouter, both]
+        default: typesafe
+      limit:
+        description: "Rows/cases per fixture (0 = full fixtures)"
+        type: string
+        default: "0"
+
+# One bench run at a time per ref; a newer dispatch cancels the in-flight one.
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# Explicit `shell: bash` on every run step means `bash --noprofile --norc
+# -eo pipefail {0}`: the `-o pipefail` is what makes `bun bench/... | tee`
+# fail the step when the bench script exits non-zero (the default shell is
+# bash -e only, which would swallow the script's exit code behind tee).
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Job 1 — turn the `provider` choice into a JSON matrix for job 2.
+  setup:
+    name: Prepare matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Compute provider matrix
+        id: matrix
+        env:
+          PROVIDER: ${{ inputs.provider }}
+        run: |
+          case "$PROVIDER" in
+            typesafe)   echo 'matrix=["typesafe"]' >> "$GITHUB_OUTPUT" ;;
+            openrouter) echo 'matrix=["openrouter"]' >> "$GITHUB_OUTPUT" ;;
+            both)       echo 'matrix=["typesafe", "openrouter"]' >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error title=Bad input::provider must be one of: typesafe, openrouter, both (got: $PROVIDER)"
+              exit 1
+              ;;
+          esac
+
+  # Job 2 — one leg per selected provider.
+  bench:
+    name: Bench (${{ matrix.provider }})
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: ${{ fromJson(needs.setup.outputs.matrix) }}
+    # Secret-derived booleans live at JOB level because the `secrets` context is
+    # not available in step `if:` conditions (and a step's own env is not
+    # available to its own `if:` either). Only "true"/"false" lands here — no
+    # key material. The keys themselves are mapped further down, exclusively
+    # into the step of the provider being benched.
+    env:
+      HAS_TYPESAFE_KEY: ${{ secrets.TYPESAFE_API_KEY != '' }}
+      HAS_OPENROUTER_KEY: ${{ secrets.OPENROUTER_API_KEY != '' }}
+      LIMIT: ${{ inputs.limit }}
+    steps:
+      # Same setup steps as ci.yml (checkout, setup-bun, frozen install).
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+
+      # ---- typesafe ------------------------------------------------------------
+      - name: Notice — typesafe skipped (no TYPESAFE_API_KEY)
+        if: matrix.provider == 'typesafe' && env.HAS_TYPESAFE_KEY != 'true'
+        run: |
+          echo "::notice title=Bench — typesafe skipped::TYPESAFE_API_KEY is not set in this repository. Add it under Settings → Secrets and variables → Actions, then re-run Bench (this run stays green)."
+          {
+            echo "## Bench — typesafe (skipped)"
+            echo ""
+            echo "TYPESAFE_API_KEY secret is not set in this repository — nothing was billed and no bench steps ran."
+            echo "Add it under **Settings → Secrets and variables → Actions**, then re-run this workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Bench — typesafe
+        if: matrix.provider == 'typesafe' && env.HAS_TYPESAFE_KEY == 'true'
+        env:
+          # Only this provider's key is exposed to this step, so resolveProvider
+          # cannot auto-pick (or even see) the other provider's key.
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+        run: |
+          ARGS=""
+          if [ -n "$LIMIT" ] && [ "$LIMIT" != "0" ]; then
+            ARGS="--limit $LIMIT"
+          fi
+          {
+            echo "## Bench — typesafe"
+            echo ""
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ) (UTC)"
+            echo "- Inputs: provider=typesafe, limit=${LIMIT:-0}"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          # tee lands the tables in both the log and the job summary; with
+          # pipefail the step still goes red when a script exits non-zero, and
+          # both scripts get their chance to run.
+          status=0
+          # $ARGS is deliberately unquoted: it is "" or "--limit N", and the word
+          # split is what turns it into two argv entries for the bench scripts.
+          # shellcheck disable=SC2086
+          bun bench/accuracy.ts --fixture all --api typesafe $ARGS 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || status=1
+          # shellcheck disable=SC2086
+          bun bench/code_selection.ts --api typesafe $ARGS 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || status=1
+          exit $status
+
+      # ---- openrouter ----------------------------------------------------------
+      - name: Notice — openrouter skipped (no OPENROUTER_API_KEY)
+        if: matrix.provider == 'openrouter' && env.HAS_OPENROUTER_KEY != 'true'
+        run: |
+          echo "::notice title=Bench — openrouter skipped::OPENROUTER_API_KEY is not set in this repository. Add it under Settings → Secrets and variables → Actions, then re-run Bench (this run stays green)."
+          {
+            echo "## Bench — openrouter (skipped)"
+            echo ""
+            echo "OPENROUTER_API_KEY secret is not set in this repository — nothing was billed and no bench steps ran."
+            echo "Add it under **Settings → Secrets and variables → Actions**, then re-run this workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Bench — openrouter
+        if: matrix.provider == 'openrouter' && env.HAS_OPENROUTER_KEY == 'true'
+        env:
+          # Only this provider's key is exposed to this step, so resolveProvider
+          # cannot auto-pick (or even see) the other provider's key.
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          ARGS=""
+          if [ -n "$LIMIT" ] && [ "$LIMIT" != "0" ]; then
+            ARGS="--limit $LIMIT"
+          fi
+          {
+            echo "## Bench — openrouter"
+            echo ""
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ) (UTC)"
+            echo "- Inputs: provider=openrouter, limit=${LIMIT:-0}"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          # tee lands the tables in both the log and the job summary; with
+          # pipefail the step still goes red when a script exits non-zero, and
+          # both scripts get their chance to run.
+          status=0
+          # $ARGS is deliberately unquoted: it is "" or "--limit N", and the word
+          # split is what turns it into two argv entries for the bench scripts.
+          # shellcheck disable=SC2086
+          bun bench/accuracy.ts --fixture all --api openrouter $ARGS 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || status=1
+          # shellcheck disable=SC2086
+          bun bench/code_selection.ts --api openrouter $ARGS 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || status=1
+          exit $status
+
+      # ---- artifacts -----------------------------------------------------------
+      # Runs only when this provider's bench actually ran (the skipped path has
+      # no files, and if-no-files-found: error must not fail a green skip).
+      - name: Upload bench results
+        if: >-
+          (matrix.provider == 'typesafe' && env.HAS_TYPESAFE_KEY == 'true') ||
+          (matrix.provider == 'openrouter' && env.HAS_OPENROUTER_KEY == 'true')
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ matrix.provider }}
+          path: bench/results/*.json
+          if-no-files-found: error
+          retention-days: 30
