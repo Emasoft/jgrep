@@ -19,7 +19,9 @@ declare const process: {
 };
 
 const VERSION = "0.4.0";
-const USAGE = `jgrep ${VERSION} — semantic grep powered by Jev (TypeSafe)
+// Exported so src/skill.test.ts can pin skills/jgrep/SKILL.md's embedded help
+// block to this exact text (the template already embeds the rendered VERSION).
+export const USAGE = `jgrep ${VERSION} — semantic grep powered by Jev (TypeSafe)
 
 usage: jgrep init                       interactive setup (API key, agent skills)
        jgrep [options] "<description>" [path ...]
