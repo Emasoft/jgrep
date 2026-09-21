@@ -13,7 +13,7 @@ import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
 // DI seam for fetch (moved to providers.ts; re-exported so existing imports keep working)
 export type { Fetch };
 
-export interface Chunk { file: string; start: number; end: number; text: string }
+export interface Chunk { file: string; start: number; end: number; text: string; context?: string }
 export interface Hit extends Chunk { p: number }
 export type Kind = "code" | "diff";
 
@@ -35,6 +35,90 @@ export function chunk(file: string, text: string, opts = { minLines: 5, maxLines
     if (len >= opts.maxLines || (boundary && len >= opts.minLines)) flush(i);
   }
   flush(lines.length);
+  return out;
+}
+
+const MD_EXTENSIONS = new Set([".md", ".markdown", ".mdx", ".mkd", ".mdown"]);
+
+/** True for markdown files, which get heading-aware chunking instead of column-0 splits. */
+export function isMarkdownPath(file: string): boolean {
+  return MD_EXTENSIONS.has(path.extname(file).toLowerCase());
+}
+
+/** Heading boundary: 1-6 `#`s followed by whitespace or end of line (`#`, `## Topic`). */
+const isMdHeading = (line: string) => /^#{1,6}(\s|$)/.test(line);
+/** Fence delimiter per the chunker's heuristic: ``` anywhere in leading whitespace. */
+const isMdFence = (line: string) => /^\s*```/.test(line);
+
+/**
+ * Markdown-aware chunking: a `---`/`---` frontmatter block becomes its own first
+ * chunk, then every ATX heading (`#`..`######`) starts a section spanning through
+ * the line before the next heading (any level) or EOF. Each section chunk carries
+ * `context` — the heading trail joined by " > " (e.g. "jgrep > Help") — so the
+ * question can name the sub-section. Sections are semantic units: small ones are
+ * kept whole (no minLines merging). Sections longer than maxLines split at blank
+ * lines OUTSIDE fenced code blocks; a fence that outgrows maxLines is never broken
+ * (that piece exceeds maxLines instead). Ranges are 1-based inclusive, like chunk().
+ */
+export function chunkMarkdown(file: string, text: string, opts = { minLines: 5, maxLines: 60 }): Chunk[] {
+  const lines = text.split("\n");
+  const maxLines = opts.maxLines ?? 60; // minLines unused: headings are semantic units, never merged away
+  const out: Chunk[] = [];
+  const push = (start: number, end: number, context?: string) => {
+    const t = lines.slice(start, end + 1).join("\n");
+    if (!t.trim()) return; // skip completely-whitespace regions only
+    out.push(context === undefined ? { file, start: start + 1, end: end + 1, text: t } : { file, start: start + 1, end: end + 1, text: t, context });
+  };
+  // Oversized region: cut greedily at the last blank line outside fences; a hard
+  // cut at the maxLines boundary is the fallback when no blank line is available.
+  const splitAndPush = (start: number, end: number, context?: string) => {
+    let pieceStart = start;
+    let inFence = false; // regions always begin outside a fence (sections start at headings)
+    while (pieceStart <= end) {
+      if (end - pieceStart + 1 <= maxLines) { push(pieceStart, end, context); break; }
+      let cut = -1;
+      let lastBlank = -1;
+      for (let i = pieceStart; i <= end; i++) {
+        const l = lines[i];
+        if (!inFence && !l.trim()) lastBlank = i;
+        if (isMdFence(l)) inFence = !inFence;
+        if (i - pieceStart + 1 >= maxLines && !inFence) { cut = lastBlank >= pieceStart ? lastBlank : i; break; }
+      }
+      if (cut === -1) { push(pieceStart, end, context); break; } // fence ran past maxLines: exceed rather than break it
+      push(pieceStart, cut, context);
+      pieceStart = cut + 1;
+      inFence = false; // cuts only happen outside fences, so the next piece starts fence-free
+    }
+  };
+  let i = 0;
+  // Frontmatter: file opens with exactly `---` and a later line closes it.
+  if (lines[0] === "---") {
+    const close = lines.indexOf("---", 1);
+    if (close !== -1) { push(0, close); i = close + 1; }
+  }
+  // Sections: one pass, tracking the heading stack for the context trail.
+  const stack: { level: number; title: string }[] = [];
+  let regionStart = i;       // start of the not-yet-chunked region (preamble or current section)
+  let sectionStart = -1;     // heading line of the current section; -1 = still in the preamble
+  let context: string | undefined;
+  let inFence = false;
+  for (; i < lines.length; i++) {
+    const l = lines[i];
+    if (!inFence && isMdHeading(l)) {
+      if (sectionStart === -1) push(regionStart, i - 1); // preamble before the first heading
+      else splitAndPush(regionStart, i - 1, context);
+      const level = /^#{1,6}/.exec(l)![0].length;
+      while (stack.length && stack[stack.length - 1].level >= level) stack.pop();
+      stack.push({ level, title: l.replace(/^#{1,6}\s*/, "").trim() });
+      context = stack.map((s) => s.title).join(" > ");
+      regionStart = i;
+      sectionStart = i;
+    } else if (isMdFence(l)) {
+      inFence = !inFence;
+    }
+  }
+  if (sectionStart === -1) push(regionStart, lines.length - 1);
+  else splitAndPush(regionStart, lines.length - 1, context);
   return out;
 }
 
@@ -109,7 +193,7 @@ export function chunkPaths(paths: string[]): Chunk[] {
   const chunks: Chunk[] = [];
   for (const file of listFiles(paths)) {
     const text = readText(file);
-    if (text !== null) chunks.push(...chunk(file, text));
+    if (text !== null) chunks.push(...(isMarkdownPath(file) ? chunkMarkdown(file, text) : chunk(file, text)));
   }
   return chunks;
 }
@@ -121,8 +205,10 @@ export function buildRequest(question: string, chunks: Chunk[], kind: Kind = "co
     ? "Does that diff hunk (lines starting with + were added, - removed) match this description"
     : "Does that code match this description";
   const questions: Record<string, unknown> = {};
-  chunks.forEach((_, i) => {
-    questions[`c${i}`] = { type: "noul", instructions: `Look only at the chunk with id "c${i}". ${what}: ${question}` };
+  chunks.forEach((c, i) => {
+    // Markdown chunks carry their heading trail so the question can name the sub-section.
+    const ctx = c.context ? `[Section context: ${c.context}] ` : "";
+    questions[`c${i}`] = { type: "noul", instructions: `Look only at the chunk with id "c${i}". ${ctx}${what}: ${question}` };
   });
   return { model, state, questions };
 }
@@ -140,7 +226,12 @@ export function saveCache(c: Cache) {
     fs.writeFileSync(CACHE_FILE, JSON.stringify(c));
   } catch { /* cache is best-effort */ }
 }
-const key = (model: string, kind: Kind, q: string, c: Chunk) => createHash("sha1").update(`${model}\0${kind}\0${q}\0${c.text}`).digest("hex");
+// Markdown chunks fold their context trail into the key; chunks without context
+// keep the exact pre-markdown key string (no trailing \0), so old cache entries stay valid.
+const key = (model: string, kind: Kind, q: string, c: Chunk) =>
+  createHash("sha1")
+    .update(c.context ? `${model}\0${kind}\0${q}\0${c.text}\0${c.context}` : `${model}\0${kind}\0${q}\0${c.text}`)
+    .digest("hex");
 
 // ---- core -------------------------------------------------------------------
 // Retry/deadline defaults live in ONE place (here); jgrep()/scoreRows() resolve
