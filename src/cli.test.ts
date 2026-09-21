@@ -62,7 +62,18 @@ test("cli parse: numeric validation covers the new numerics (timeout/request-tim
     expect(() => parse([flag, "abc", "q"])).toThrow(/numeric option expected/);
     expect(() => parse([flag, "-1", "q"])).toThrow(/numeric option expected/);
   }
-  expect(() => parse(["--timeout", "0", "--rate", "0", "--retries", "0", "q"])).not.toThrow(); // 0 is legal
+  expect(() => parse(["--timeout", "0", "--rate", "0", "--retries", "0", "q"])).not.toThrow(); // 0 is legal (batch is not)
+});
+
+test("cli parse: --batch must be a positive integer — 0 would spin the batching loop, a fraction overlaps batches", () => {
+  expect(() => parse(["-b", "0", "q"])).toThrow(/batch must be a positive integer/);
+  expect(() => parse(["--batch", "0", "q"])).toThrow(/batch must be a positive integer/);
+  expect(() => parse(["-b", "1.5", "q"])).toThrow(/batch must be a positive integer/);
+  expect(() => parse(["-b", "2.5", "q"])).toThrow(/batch must be a positive integer/);
+  expect(() => parse(["-b", "abc", "q"])).toThrow(/numeric option expected/); // still the generic numeric check
+  expect(() => parse(["-b", "-1", "q"])).toThrow(/numeric option expected/); // caught by the >= 0 check first
+  expect(() => parse(["-b", "1", "q"])).not.toThrow();
+  expect(() => parse(["-b", "16", "q"])).not.toThrow();
 });
 
 test("cli parse: old and new flags coexist (--diff positional heuristic untouched)", () => {
@@ -234,6 +245,71 @@ test("cli main: errored chunks/rows never enter the --json array (empty array / 
     expect(p2.exitCode).toBe(2);
     expect(JSON.parse(p2.stdout)).toEqual([null, null]); // errored rows: null entries, position-stable
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}, 20_000);
+
+test("cli main rows single description: --out writes a CSV of the shown hits (no --json needed), stdout keeps the pretty output", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const server = startFakeGateway();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-rowsout-"));
+  try {
+    const csv = path.join(dir, "rows.csv");
+    fs.writeFileSync(csv, "handle\n@a\n@b\n@c\n");
+    const out = path.join(dir, "bots.csv");
+    // --all so `shown` covers every scored row (threshold-only would still be a CSV);
+    // no --json: this is the branch that used to ignore --out entirely.
+    const p = await spawn(
+      ["bun", "src/cli.ts", "--rows", csv, "beauty?", "--api", "gateway", "--no-cache", "--all", "--out", out],
+      gatewayEnv(server.port),
+    );
+    expect(p.exitCode).toBe(0);
+    expect(p.stderr.toString()).toContain(`wrote ${out}`); // written for real, not just claimed
+    // stdout keeps the pretty hits even though the file landed
+    expect(p.stdout).toContain("@a");
+
+    const text = fs.readFileSync(out, "utf8");
+    const lines = text.trimEnd().split("\n");
+    expect(lines[0]).toBe("row,p,match"); // header: source row number, p, flattened answer columns
+    expect(lines).toHaveLength(4); // header + 3 data lines (one per scored row)
+    const body = lines.slice(1).map((l) => l.split(","));
+    expect(body.every((cols) => cols.length === 3)).toBe(true);
+    // `row` is the source row number: 1-based + the header line = s.i + 2
+    expect(body.map((cols) => Number(cols[0]))).toEqual([2, 3, 4]);
+    expect(body.every((cols) => Number(cols[1]) === 0.9 && Number(cols[2]) === 0.9)).toBe(true);
+  } finally {
+    server.stop(true);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}, 20_000);
+
+test("cli main: an invalid JEV_PRICE_PER_MTOK is fatal before any request is made (rows mode used to bill first)", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  let requests = 0;
+  const server = Bun.serve({
+    port: 0,
+    fetch: async () => {
+      requests++;
+      return new Response(JSON.stringify({ answers: {} }), { status: 200 });
+    },
+  });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-price-"));
+  try {
+    const csv = path.join(dir, "rows.csv");
+    fs.writeFileSync(csv, "handle\n@a\n@b\n");
+    const p = await spawn(
+      ["bun", "src/cli.ts", "--rows", csv, "beauty?", "--api", "gateway", "--no-cache"],
+      { ...gatewayEnv(server.port), JEV_PRICE_PER_MTOK: "abc" },
+    );
+    expect(p.exitCode).toBe(2);
+    expect(p.stderr.toString()).toContain("JEV_PRICE_PER_MTOK must be a positive number");
+    expect(requests).toBe(0); // died at startup: nothing was spent
+  } finally {
+    server.stop(true);
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }, 20_000);

@@ -11,6 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - markdown-aware chunking: .md/.mdx files split at headings with section-trail context; fenced code blocks never split — sub-section extraction via -C/--json start-end
 
+### Fixed
+
+- `--batch 0` or a fractional `--batch` (e.g. `-b 1.5`) is rejected by the CLI ("batch must be a positive integer"); library callers get the value floored and clamped at 1 — `+= 0` used to spin the batching loop forever and a fraction overlapped batches.
+- rows mode, single description: `--out` now writes a CSV of the shown hits (`row,p,<answer columns>`) instead of being a silent no-op; `--json --out` still writes JSON; stdout keeps the pretty output.
+- Per-chunk/per-row errors carry the provider error's `hint`: rendered as a grey indented line under each stderr example and included in `--json-errors` objects (hints previously surfaced only on fatal throws).
+- A 200 response that answers only some chunks records the unanswered ones as `malformed_response` errors — they no longer appear as `p:NaN` entries in `all` with no error and no cache entry.
+- rows mode `requests` no longer counts packs the circuit breaker never attempted.
+- `JEV_PRICE_PER_MTOK` is validated right after provider resolution (both modes) — an invalid price can no longer surface only after the run has billed tokens.
+- install-dev.sh: `check` and choice 6 never create the target directory (a missing `~/.local/bin` was mkdir'd under "no mutation").
+- The gateway 402 hint drops the "top up credits at …" clause when the provider has no billing URL ("insufficient credits on the gateway provider").
+- Removed dead code: the redundant unreachable-codes branch in `classifyTransport` (identical fallthrough) and the unused `installSkills` (superseded by init's universal skill installer).
+- Docs: README now says code-mode `--json` is byte-identical to 0.3.0 while rows mode is a flattened answer array; the bench `--limit` note reads "rows per class"; the Bench workflow input says "Rows per class / cases"; the `--help` init line reads "(provider, key, agent skills)".
+- CI runs the bench unit tests too (`bun test src/ bench/`).
+
 ## [0.4.0] - 2026-09-20 — providers, reliability, isolation, benchmarks (issue #1: WI-1, WI-8, WI-11, WI-12)
 
 ### Added

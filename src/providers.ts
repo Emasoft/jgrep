@@ -111,7 +111,7 @@ function findKey(b: Backend, env: Env, homeDir: string, cwd: string): { key: str
 }
 
 /** A .gitignore line that covers ./.env (plain entry or inside a directory). */
-const GITIGNORE_ENV_RE = /(^|\/|\.|^)\.env$/;
+const GITIGNORE_ENV_RE = /((^|\/|\.)\.env$)/;
 
 /** Key came from cwd .env: warn when a .gitignore exists but does not cover it. */
 function warnIfEnvNotGitignored(keyEnv: string, cwd: string): void {
@@ -300,8 +300,13 @@ const firstNumeric = (...vals: unknown[]): number | undefined => {
 /** Actionable hint per error kind (plan §1.5); bad_request's depends on the snippet. */
 function hintFor(kind: JevErrorKind, backend: Backend, snippet: string): string | undefined {
   switch (kind) {
-    case "insufficient_credits":
-      return `top up credits at ${PROVIDER_URLS[backend.name].billing} or switch with --api typesafe if a TypeSafe key exists`;
+    case "insufficient_credits": {
+      // A self-hosted gateway has no billing page to point at — say so plainly.
+      const billing = PROVIDER_URLS[backend.name].billing;
+      return billing
+        ? `top up credits at ${billing} or switch with --api typesafe if a TypeSafe key exists`
+        : "insufficient credits on the gateway provider";
+    }
     case "invalid_api_key":
       return `use a ${backend.name} key — check ${backend.keyEnv} or ${keyFilePath(backend.name)}, or run \`jgrep init\``;
     case "model_unavailable":

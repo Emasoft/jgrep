@@ -86,20 +86,6 @@ test("cli parse: unknown option errors instead of becoming the question", () => 
   expect(() => parse(["-x", "q"])).toThrow(/unknown option -x/);
 });
 
-test("installSkills copies SKILL.md only into agent homes that exist", async () => {
-  const fs = await import("node:fs");
-  const os = await import("node:os");
-  const path = await import("node:path");
-  const { installSkills } = await import("./jgrep");
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-"));
-  fs.mkdirSync(path.join(home, ".claude"));
-  const src = path.join(home, "SKILL.md");
-  fs.writeFileSync(src, "---\nname: jgrep\n---\n");
-  const dirs = installSkills(src, home, ["claude", "codex"]);
-  expect(dirs).toEqual([path.join(home, ".claude", "skills", "jgrep")]);
-  expect(fs.readFileSync(path.join(dirs[0], "SKILL.md"), "utf8")).toContain("name: jgrep");
-});
-
 test("rows: csv parser handles quotes, commas and newlines inside quotes", async () => {
   const { parseCsv } = await import("./rows");
   const r = parseCsv('handle,bio\n@a,"skincare, daily ""GRWM""\nSeoul"\n@b,makeup\n');

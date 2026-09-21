@@ -97,7 +97,7 @@ jgrep --api openrouter "rule" src/       # pick a provider: typesafe | openroute
 ```
 jgrep 0.4.0 — semantic grep powered by Jev (TypeSafe)
 
-usage: jgrep init                       interactive setup (API key, agent skills)
+usage: jgrep init                       interactive setup (provider, key, agent skills)
        jgrep [options] "<description>" [path ...]
        jgrep [options] --diff [ref] "<description>"
        jgrep [options] --rows <file.csv|.jsonl> "<description>"

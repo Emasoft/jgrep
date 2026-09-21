@@ -38,8 +38,8 @@ test("selectVerdict: an exact tie keeps the first candidate and flags it with ma
 
 test("selectVerdict: unusable answers are skipped; single usable has no margin; none usable is empty", () => {
   const candidates = [{ name: "a" }, { name: "b" }];
-  // an errored row leaves no answer object at all; the other row still decides
-  expect(selectVerdict([undefined, { match: { type: "noul", noul: 0.6 } }], candidates))
+  // an errored row maps to null in scoreRows' dense answers array; the other row still decides
+  expect(selectVerdict([null, { match: { type: "noul", noul: 0.6 } }], candidates))
     .toEqual({ predicted: "b", p: 0.6, margin: null });
   // wrong question key and a missing-type answer are unusable
   expect(selectVerdict([{ other: { type: "noul", noul: 1 } }, { match: { type: "missing" } }], candidates))

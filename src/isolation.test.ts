@@ -106,6 +106,75 @@ test("partial isolation: failing batch yields hits + server_unreachable ChunkErr
   expect(r.all.map((h) => h.file)).toEqual(["f0.ts", "f1.ts"]); // errored chunks are absent from `all`
 });
 
+// ---- jgrep: ChunkErrors carry the provider error's hint (fix: hints reach the user) --
+
+test("partial isolation: ChunkErrors carry the provider hint (invalid_api_key)", async () => {
+  const fetchImpl = (async () => new Response("bad key", { status: 401 })) as unknown as Fetch;
+  const r = await jgrep("q", nChunks(2), { threshold: 0.7, batch: 2, concurrency: 1, maxRetries: 0, apiKey: "k", fetchImpl, cache: {} });
+  expect(r.errors).toHaveLength(2);
+  expect(r.errors.every((e) => e.kind === "invalid_api_key")).toBe(true);
+  expect(r.errors[0].hint).toContain("TYPESAFE_API_KEY"); // the actionable hint rides along
+});
+
+test("partial isolation: a 401 after a successful batch carries the AMENDED hint in ChunkErrors", async () => {
+  const calls: string[] = [];
+  const fetchImpl = (async (_url: unknown, init: { body: string }) => {
+    calls.push(init.body);
+    if (calls.length === 1) { // concurrency 1: batch 0 must succeed first
+      const body = JSON.parse(init.body);
+      const answers: Record<string, unknown> = {};
+      for (const c of body.state.chunks) answers[c.id] = { type: "noul", noul: 0.9 };
+      return new Response(JSON.stringify({ answers, usage: { input_tokens: 10 } }), { status: 200 });
+    }
+    return new Response("expired", { status: 401 });
+  }) as unknown as Fetch;
+  const r = await jgrep("q", nChunks(4), { threshold: 0.7, batch: 2, concurrency: 1, maxRetries: 0, apiKey: "k", fetchImpl, cache: {} });
+  expect(r.errors.every((e) => e.kind === "invalid_api_key")).toBe(true);
+  expect(r.errors[0].hint).toContain("worked earlier this run"); // KEY_WORKED_EARLIER_HINT survived the mapping
+  expect(r.errors[0].hint).toContain("TYPESAFE_API_KEY"); // the base hint is preserved too
+});
+
+// ---- jgrep: partial 200 answers are malformed_response, never p:NaN hits -------------
+
+test("partial 200: a missing answer yields a malformed_response ChunkError, not a NaN entry in all/hits", async () => {
+  const fetchImpl = (async (_url: unknown, init: { body: string }) => {
+    const body = JSON.parse(init.body);
+    const answers: Record<string, unknown> = {};
+    for (const c of body.state.chunks) answers[c.id] = { type: "noul", noul: 0.9 };
+    delete answers.c1; // batch-local id: the second chunk of EVERY batch goes unanswered
+    return new Response(JSON.stringify({ answers, usage: { input_tokens: 10 } }), { status: 200 });
+  }) as unknown as Fetch;
+  const cache: Record<string, number> = {};
+  const r = await jgrep("q", nChunks(4), { threshold: 0.7, batch: 2, concurrency: 2, apiKey: "k", fetchImpl, cache });
+  expect(r.errors.map((e) => e.file).sort()).toEqual(["f1.ts", "f3.ts"]); // exactly the unanswered chunks
+  expect(r.errors.every((e) => e.kind === "malformed_response")).toBe(true);
+  expect(r.errors[0].message).toBe("provider returned no usable answer for this chunk");
+  expect(r.all.map((h) => h.file)).toEqual(["f0.ts", "f2.ts"]); // unanswered chunks stay out of `all`
+  expect(r.hits.map((h) => h.file)).toEqual(["f0.ts", "f2.ts"]); // threshold logic unaffected
+  expect(r.chunks).toBe(4);
+  expect(Object.keys(cache)).toHaveLength(2); // unanswered chunks are not cached either
+});
+
+// ---- jgrep: batch normalization (library callers; the CLI rejects outright) ----------
+
+test("batch normalization: jgrep(batch: 0) terminates — floored to 1, one chunk per request", async () => {
+  const { calls, fetchImpl } = okFetch();
+  const r = await jgrep("q", nChunks(4), { threshold: 0.7, batch: 0, concurrency: 2, apiKey: "k", fetchImpl, cache: {} });
+  expect(calls).toHaveLength(4); // 4 batches of 1 — not an infinite loop
+  expect(calls.every((c) => c.state.chunks.length === 1)).toBe(true);
+  expect(r.errors).toEqual([]);
+  expect(r.hits).toHaveLength(4);
+});
+
+test("batch normalization: a fractional batch is floored — jgrep(batch: 2.5) batches by 2 without overlap", async () => {
+  const { calls, fetchImpl } = okFetch();
+  const r = await jgrep("q", nChunks(5), { threshold: 0.7, batch: 2.5, concurrency: 2, apiKey: "k", fetchImpl, cache: {} });
+  expect(calls).toHaveLength(3); // 2 + 2 + 1
+  expect(calls.map((c) => c.state.chunks.length).sort((a: number, b: number) => a - b)).toEqual([1, 2, 2]);
+  expect(r.errors).toEqual([]);
+  expect(r.hits).toHaveLength(5);
+});
+
 // ---- jgrep: batch deadlines ----------------------------------------------------
 
 test("deadline: timeoutSec 0 is already expired -> immediate kind timeout errors, zero fetch calls", async () => {
@@ -275,6 +344,19 @@ test("rows back-compat: a clean run reports errors: [] with unchanged answers", 
   expect(r.answers[1]?.match?.noul).toBe(0.9);
 });
 
+// ---- rows: requests counts only packs the breaker attempted (used to overcount) ----
+
+test("rows: a breaker abort reports requests for ATTEMPTED packs only", async () => {
+  const fetchImpl = (async () => new Response("out of credits", { status: 402 })) as unknown as Fetch;
+  const rows: Row[] = Array.from({ length: 12 }, (_, i) => ({ handle: `@${i}` }));
+  const r = await scoreRows(rows, { match: { type: "noul", instructions: "q" } }, { batch: 2, concurrency: 1, apiKey: "k", fetchImpl, cache: {} });
+  // 6 packs of 2; the breaker trips after the 3rd consecutive 402, so packs 4-6 are
+  // never dispatched: requests = 3 (was 6 — the unprocessed packs were counted too).
+  expect(r.requests).toBe(3);
+  expect(r.errors.filter((e) => e.kind === "insufficient_credits")).toHaveLength(6);
+  expect(r.errors.filter((e) => e.kind === "circuit_breaker_open")).toHaveLength(6);
+});
+
 // ---- rows: dense answers on partial failure ------------------------------------
 // `answers` used to be a holey array (errored rows unset), so rowsMain's
 // `r.answers.map(flatten)` skipped the holes and `Number(flat[i].match)` threw a
@@ -331,11 +413,16 @@ test("cli main rows: --json-errors --out writes the file and an errored run exit
     );
     expect(p.exitCode).toBe(2); // any row errored -> 2 (used to fall through to 0)
     expect(p.stderr.toString()).toContain("server_unreachable");
+    // The provider error's hint reaches the user in the default (non-fatal) path:
+    // printed as a grey line under the error examples on stderr...
+    expect(p.stderr.toString()).toContain("check the network or the provider's status page");
     expect(p.stderr.toString()).toContain(`wrote ${out}`); // written for real, not just claimed
     const parsed = JSON.parse(fs.readFileSync(out, "utf8"));
     expect(parsed.answers).toEqual([null, null, null, null]); // position-aligned: every row errored -> null entries
     expect(parsed.errors).toHaveLength(4);
     expect(parsed.errors.every((e: { kind: string }) => e.kind === "server_unreachable")).toBe(true);
+    // ...and included in the --json-errors objects when present.
+    expect(parsed.errors.every((e: { hint?: string }) => typeof e.hint === "string" && e.hint.length > 0)).toBe(true);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

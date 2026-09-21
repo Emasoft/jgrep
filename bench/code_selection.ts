@@ -190,11 +190,11 @@ export interface Verdict { predicted: string; p: number | null; margin: number |
 /** Top-1 verdict for one case from its RAW scoreRows answers (index-aligned with the
  *  candidates): argmax over the usable `match` noul probabilities. An exact tie keeps
  *  the FIRST candidate (deterministic) and reports margin 0 to flag it. Unusable
- *  answers (errored row -> undefined, type != noul, non-finite p) are skipped; with
+ *  answers (errored row -> null, type != noul, non-finite p) are skipped; with
  *  none usable the prediction is "" and with fewer than two usable answers the margin
  *  is null (undefined, not 0). Raw answers, not flatten(): its 2-decimal rounding
  *  could manufacture argmax ties. */
-export function selectVerdict(answers: (Record<string, Answer> | undefined)[], candidates: { name: string }[]): Verdict {
+export function selectVerdict(answers: (Record<string, Answer> | null)[], candidates: { name: string }[]): Verdict {
   const ps = candidates.map((_, i) => {
     const a = answers[i]?.match;
     return a?.type === "noul" && typeof a.noul === "number" && Number.isFinite(a.noul) ? a.noul : null;

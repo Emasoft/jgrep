@@ -16,7 +16,7 @@ jobs:
         with:
           node-version: 22
       - run: bun install --frozen-lockfile
-      - run: bun test src/
+      - run: bun test src/ bench/
       - run: bun run build
       - run: node dist/jgrep.js --help
       - name: Validate agent skill

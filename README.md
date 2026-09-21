@@ -220,9 +220,9 @@ carries a typed kind with a hint on stderr:
 | `timeout`              | raise `--timeout` or `--request-timeout` |
 | `circuit_breaker_open` | provider failing consistently — the chunk was never attempted |
 
-**`--json` is backward-compatible** (same contract as 0.3.0): it emits the bare
-array — code mode `[{file,start,end,p,text}]`, rows mode `[flattened answer
-objects]` with `null` for an errored row (position-aligned, so index `i` is
+**`--json` is backward-compatible**: code mode is byte-identical to 0.3.0
+(`[{file,start,end,p,text}]`); rows mode is a flattened answer array with
+`null` for an errored row (position-aligned, so index `i` is
 always input row `i`). Errored chunks/rows are not in the array; they surface
 through the stderr summary and exit 2. New in 0.4.0: **`--json-errors`**
 (implies `--json`) opts into the object shape — code mode
@@ -319,7 +319,7 @@ cross-provider average. The bench runs **on demand** via the Bench workflow
 (`workflow_dispatch`); TypeSafe numbers land here after the first CI bench run.
 
 ```bash
-bun bench/accuracy.ts --fixture sms --limit 20   # precision/recall on 20 labeled rows
+bun bench/accuracy.ts --fixture sms --limit 20   # precision/recall on 20 rows per class
 ```
 
 ## Tips

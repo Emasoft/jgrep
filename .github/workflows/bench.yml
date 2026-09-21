@@ -9,7 +9,7 @@
 # How to run:
 #   GitHub → Actions tab → "Bench" → "Run workflow", then pick:
 #     provider: typesafe | openrouter | both   (default: typesafe)
-#     limit:    rows/cases per fixture, e.g. "10" for a pennies smoke run;
+#     limit:    rows per class / cases, e.g. "10" for a pennies smoke run;
 #               "0" = full committed fixtures (default)
 #
 # Secrets: set TYPESAFE_API_KEY and/or OPENROUTER_API_KEY under
@@ -35,7 +35,7 @@ on:
         options: [typesafe, openrouter, both]
         default: typesafe
       limit:
-        description: "Rows/cases per fixture (0 = full fixtures)"
+        description: "Rows per class / cases (0 = full fixtures)"
         type: string
         default: "0"
 

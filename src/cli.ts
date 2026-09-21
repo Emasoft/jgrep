@@ -23,7 +23,7 @@ const VERSION = "0.4.0";
 // block to this exact text (the template already embeds the rendered VERSION).
 export const USAGE = `jgrep ${VERSION} — semantic grep powered by Jev (TypeSafe)
 
-usage: jgrep init                       interactive setup (API key, agent skills)
+usage: jgrep init                       interactive setup (provider, key, agent skills)
        jgrep [options] "<description>" [path ...]
        jgrep [options] --diff [ref] "<description>"
        jgrep [options] --rows <file.csv|.jsonl> "<description>"
@@ -120,6 +120,9 @@ export function parse(argv: string[]) {
   }
   if (![o.threshold, o.batch, o.concurrency, o.timeout, o.requestTimeout, o.retries, o.rate].every((n) => Number.isFinite(n) && n >= 0))
     throw new Error("numeric option expected");
+  // batch < 1 spins the batching loop forever (+= 0) and a fraction overlaps batches;
+  // 0 stays legal for timeout/rate/retries, but never for batch.
+  if (!Number.isInteger(o.batch) || o.batch < 1) throw new Error("batch must be a positive integer");
   return { ...o, question: rest[0], paths: rest.slice(1) };
 }
 
@@ -133,6 +136,7 @@ interface Wiring {
   maxRetries: number;
   ratePerSec?: number;
   failFast: boolean;
+  pricePerMtok: number; // $/Mtok for the cost estimate — resolved (and validated) up front
 }
 
 /** ` · 4 errored (3 timeout, 1 rate_limited)` — kind counts ordered by count desc, then kind asc. */
@@ -145,9 +149,14 @@ function erroredSuffix(errors: { kind: string }[]): string {
   return ` · ${errors.length} errored (${parts.join(", ")})`;
 }
 
-/** Up to 5 example error lines under the summary, then `… and N more` (stderr, red). */
-function printExamples(lines: string[]) {
-  for (const l of lines.slice(0, 5)) console.error(c("31", l));
+/** Up to 5 example error lines under the summary, then `… and N more` (stderr, red).
+ *  A hint rides under its line as a second grey indented line when the provider
+ *  error carried one (so partial-failure runs are as actionable as fatal throws). */
+function printExamples(lines: { line: string; hint?: string }[]) {
+  for (const { line, hint } of lines.slice(0, 5)) {
+    console.error(c("31", line));
+    if (hint) console.error(c("90", `    ${hint}`));
+  }
   if (lines.length > 5) console.error(c("31", `  … and ${lines.length - 5} more`));
 }
 
@@ -157,6 +166,10 @@ async function main() {
   // Provider resolution before anything else: unknown --api, or gateway without
   // JEV_GATEWAY_URL, throws JevProviderError straight to the catch (exit 2).
   const backend = resolveProvider(o.api || undefined);
+  // Resolve (and validate) the price up front, BOTH modes: an invalid
+  // JEV_PRICE_PER_MTOK must be fatal before the run can bill anything, not at
+  // summary time when the tokens have already been spent.
+  const pricePerMtok = resolvePricePerMtok();
   // Startup probe — openrouter only (plan §1.6 deviation 3): the alpha decisions
   // surface is the one that may move, so it gets one cheap ping before the run;
   // --no-probe skips it. typesafe/gateway surfaces are stable and skip the probe.
@@ -174,7 +187,7 @@ async function main() {
     backend, apiKey,
     model: o.model || process.env.JEV_MODEL || undefined,
     timeoutSec: o.timeout, requestTimeoutSec: o.requestTimeout, maxRetries: o.retries,
-    ratePerSec: o.rate || undefined, failFast: o.failFast,
+    ratePerSec: o.rate || undefined, failFast: o.failFast, pricePerMtok,
   };
   if (o.rows) return rowsMain(o, wiring);
   if (!o.question) { console.error(USAGE); process.exit(2); }
@@ -199,7 +212,7 @@ async function main() {
       // --json-errors opts into the object so chunk errors sit next to the hits.
       const hits = rows.map((h) => ({ file: h.file, start: h.start, end: h.end, p: h.p, text: h.text }));
       const payload = o.jsonErrors
-        ? { hits, errors: r.errors.map((e) => ({ file: e.file, start: e.start, end: e.end, kind: e.kind, message: e.message })) }
+        ? { hits, errors: r.errors.map((e) => ({ file: e.file, start: e.start, end: e.end, kind: e.kind, message: e.message, ...(e.hint !== undefined ? { hint: e.hint } : {}) })) }
         : hits;
       console.log(JSON.stringify(payload, null, 2));
     } else {
@@ -210,10 +223,10 @@ async function main() {
         if (o.show) console.log(h.text.split("\n").map((l) => "    " + l).join("\n") + "\n");
       }
     }
-    const cost = r.cost ?? (r.tokens * resolvePricePerMtok()) / 1e6;
+    const cost = r.cost ?? (r.tokens * wiring.pricePerMtok) / 1e6;
     const summary = `${r.hits.length} hits / ${r.chunks} chunks (${r.cached} cached) · ${r.tokens} tokens · $${cost.toFixed(4)} · ${((Date.now() - t0) / 1000).toFixed(1)}s`;
     console.error(c("90", r.errors.length ? summary + erroredSuffix(r.errors) : summary));
-    printExamples(r.errors.map((e) => `  ${e.kind}: ${e.file}:${e.start}-${e.end} ${e.message.slice(0, 120)}`));
+    printExamples(r.errors.map((e) => ({ line: `  ${e.kind}: ${e.file}:${e.start}-${e.end} ${e.message.slice(0, 120)}`, hint: e.hint })));
     // grep semantics when clean; 2 when any chunk errored (partial failure).
     process.exitCode = r.errors.length > 0 ? 2 : (r.hits.length > 0 ? 0 : 1);
   } finally {
@@ -243,11 +256,11 @@ async function rowsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
     // used to print `wrote <out>` while the JSON only ever reached stdout).
     let wrote = false;
     const writeOut = (text: string) => { if (o.out) { fs.writeFileSync(o.out, text); wrote = true; } else console.log(text); };
-    const jsonErrors = r.errors.map((e) => ({ row: e.row, kind: e.kind, message: e.message }));
-    // Backward-compatible (v0.3.0 contract) rows output: --json is the bare,
-    // position-aligned array of flattened rows — an errored row is a null entry,
-    // never a hole (honest and position-stable); --json-errors opts into the
-    // object with the row errors alongside.
+    const jsonErrors = r.errors.map((e) => ({ row: e.row, kind: e.kind, message: e.message, ...(e.hint !== undefined ? { hint: e.hint } : {}) }));
+    // Rows output shape: unlike code mode (byte-identical to the upstream v0.3.0 bare
+    // array), rows --json is a flattened answer array — position-aligned, an errored
+    // row is a null entry, never a hole (honest and position-stable); --json-errors
+    // opts into the object with the row errors alongside.
     const payload = o.jsonErrors
       ? { answers: flat, errors: jsonErrors }
       : flat;
@@ -265,16 +278,23 @@ async function rowsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
       const shown = o.all ? [...scored].sort((a, b) => b.p - a.p) : scored.filter((s) => s.p >= o.threshold);
       hits = scored.filter((s) => s.p >= o.threshold).length;
       if (o.json) writeOut(JSON.stringify(payload, null, 2));
+      else if (o.out) {
+        // --out without --json used to be a silent no-op here: write a CSV of the
+        // SHOWN hits — `row` is the source row number (1-based + header = s.i + 2),
+        // then p and the flattened answer columns for those rows.
+        const cols = [...new Set(shown.flatMap((s) => Object.keys(flat[s.i] ?? {})))];
+        writeOut(toCsv(["row", "p", ...cols], shown.map((s) => ({ row: s.i + 2, p: s.p, ...(flat[s.i] ?? {}) }))));
+      }
       if (!o.json || o.out) for (const s of shown) { // with --json --out the JSON went to the file; stdout keeps the pretty hits
         const preview = Object.values(s.row).filter(Boolean).join(" | ").slice(0, 90);
         const pcol = s.p >= o.threshold ? "32" : "90";
         console.log(`${c("35", o.rows)}${c("36", ":")}${c("32", String(s.i + 2))}  ${c(pcol, `p=${s.p.toFixed(2)}`)}  ${preview}`);
       }
     }
-    const cost = r.cost ?? (r.tokens * resolvePricePerMtok()) / 1e6;
+    const cost = r.cost ?? (r.tokens * wiring.pricePerMtok) / 1e6;
     const summary = `${o.questions ? Object.keys(questions).length + " questions x " : hits + " hits / "}${rows.length} rows (${r.cached} cached) · ${r.requests} requests · ${r.tokens} tokens · $${cost.toFixed(4)} · ${((Date.now() - t0) / 1000).toFixed(1)}s`;
     console.error(c("90", r.errors.length ? summary + erroredSuffix(r.errors) : summary));
-    printExamples(r.errors.map((e) => `  ${e.kind}: row ${e.row} ${e.message.slice(0, 120)}`));
+    printExamples(r.errors.map((e) => ({ line: `  ${e.kind}: row ${e.row} ${e.message.slice(0, 120)}`, hint: e.hint })));
     if (wrote) console.error(c("90", `wrote ${o.out}`));
     // grep semantics when clean; 2 when any row errored (partial failure) — same rule as code mode.
     process.exitCode = r.errors.length > 0 ? 2 : (o.questions || hits ? 0 : 1);

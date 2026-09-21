@@ -962,6 +962,13 @@ resolve_default_target() {
 }
 
 resolve_dest_dir() {
+	# `check` and choice 6 are report-only: they resolve DEST_DIR for the report but
+	# must never CREATE it (a missing ~/.local/bin used to be mkdir'd under
+	# "no mutation"); --dry-run already never mutates.
+	local no_mutation=0
+	if [ "$MODE_CHECK" -eq 1 ] || [ "$OPT_DRY_RUN" -eq 1 ] || [ "$OPT_CHOICE" = "6" ]; then
+		no_mutation=1
+	fi
 	if [ -n "$OPT_TARGET" ]; then
 		if [ "$OPT_DRY_RUN" -eq 1 ]; then
 			DEST_DIR="$OPT_TARGET"
@@ -975,13 +982,15 @@ resolve_dest_dir() {
 		if [ -e "$OPT_TARGET" ] && [ ! -d "$OPT_TARGET" ]; then
 			die "--target $OPT_TARGET exists and is not a directory"
 		fi
-		mkdir -p "$OPT_TARGET" || die "cannot create --target $OPT_TARGET"
+		if [ "$no_mutation" -eq 0 ]; then
+			mkdir -p "$OPT_TARGET" || die "cannot create --target $OPT_TARGET"
+		fi
 		DEST_DIR="$OPT_TARGET"
 		return 0
 	fi
 
 	DEST_DIR="$(resolve_default_target 0)" || die "cannot resolve a default target dir"
-	if [ "$OPT_DRY_RUN" -eq 0 ] && [ "$MODE_CHECK" -eq 0 ] && [ ! -d "$DEST_DIR" ]; then
+	if [ "$no_mutation" -eq 0 ] && [ ! -d "$DEST_DIR" ]; then
 		mkdir -p "$DEST_DIR" || die "cannot create target dir $DEST_DIR"
 	fi
 	return 0

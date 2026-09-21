@@ -87,7 +87,7 @@ export interface RowsOptions {
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
 
-export interface RowError { row: number; kind: JevErrorKind; message: string }
+export interface RowError { row: number; kind: JevErrorKind; message: string; hint?: string }
 /** answers is position-aligned with the input rows and DENSE: an errored row maps to null,
  *  never a hole (a holey array would desync `map` consumers from the row indices). */
 export interface RowsResult { answers: (Record<string, Answer> | null)[]; tokens: number; cached: number; requests: number; errors: RowError[]; cost?: number }
@@ -109,7 +109,10 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
   const answers: (Record<string, Answer> | null)[] = new Array(rows.length).fill(null); // errored rows stay null — dense, never holes
   const todo: number[] = [];
   rows.forEach((r, i) => { const hit = cache[key(model, qJson, r)]; if (hit) answers[i] = hit; else todo.push(i); });
-  const per = Math.max(1, Math.min(o.batch, Math.floor(MAX_QUESTIONS_PER_REQUEST / Object.keys(questions).length)));
+  // Defensive normalization (same rule as jgrep()): a 0/fractional batch would spin
+  // the loop forever (+= 0) or overlap packs. parse() rejects those; library callers
+  // get floored and clamped at 1 instead.
+  const per = Math.max(1, Math.floor(Math.min(o.batch, Math.floor(MAX_QUESTIONS_PER_REQUEST / Object.keys(questions).length))));
   const batches: number[][] = [];
   for (let i = 0; i < todo.length; i += per) batches.push(todo.slice(i, i + per));
   // Same defaults and PostOpts wiring as jgrep() — resolved once, read-only in the worker.
@@ -162,15 +165,19 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
   for (const r of pool.results) for (const rr of r.rowResults) answers[rr.row] = rr.answers;
   // Not failFast: recorded 401/403s get the same expired-vs-wrong-key distinction. One
   // clean place — mutate the JevProviderError's hint in pool.errors BEFORE mapping onto
-  // rows (RowError carries only kind+message; the hint stays on the provider error that
-  // pool-level consumers see).
+  // rows, so the amended hint is what RowError carries down to the CLI.
   if (pool.hadSuccess) {
     for (const e of pool.errors) {
       if (e.error.kind === "invalid_api_key") e.error.hint = [e.error.hint, KEY_WORKED_EARLIER_HINT].filter(Boolean).join(" ");
     }
   }
   const errors: RowError[] = pool.errors.flatMap((e) =>
-    batches[e.index].map((row) => ({ row, kind: e.error.kind, message: e.error.message })));
+    batches[e.index].map((row) => ({
+      row, kind: e.error.kind, message: e.error.message,
+      // The provider error's actionable hint rides along (same rule as jgrep()'s
+      // ChunkError) — incl. the KEY_WORKED_EARLIER_HINT amended above.
+      ...(e.error.hint !== undefined ? { hint: e.error.hint } : {}),
+    })));
   if (pool.aborted) {
     // Packs that were dispatched all reported (success or their own error); whatever was
     // never attempted is reported as a breaker error. No cache entries for those rows.
@@ -180,7 +187,9 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
       for (const row of batches[bi]) errors.push({ row, kind: "circuit_breaker_open", message: "not attempted: provider failing consistently (circuit breaker open)" });
     }
   }
-  return { answers, tokens, cached: rows.length - todo.length, requests: batches.length, errors, ...(cost !== undefined ? { cost } : {}) };
+  // `requests` counts only packs the breaker actually attempted; packs it never
+  // dispatched are not requests.
+  return { answers, tokens, cached: rows.length - todo.length, requests: batches.length - (pool.aborted ? pool.unprocessed : 0), errors, ...(cost !== undefined ? { cost } : {}) };
 }
 
 // ---- output -----------------------------------------------------------------

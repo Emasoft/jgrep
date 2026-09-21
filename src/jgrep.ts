@@ -18,8 +18,8 @@ export interface Hit extends Chunk { p: number }
 export type Kind = "code" | "diff";
 
 // ---- chunking ---------------------------------------------------------------
-// ponytail: language-agnostic heuristic (column-0 line starts a new block).
-// Swap in tree-sitter per language when this misfires on real code.
+// Language-agnostic heuristic: a column-0 line starts a new block. Swap in
+// tree-sitter per language when this misfires on real code.
 export function chunk(file: string, text: string, opts = { minLines: 5, maxLines: 60 }): Chunk[] {
   const lines = text.split("\n");
   const out: Chunk[] = [];
@@ -214,7 +214,7 @@ export function buildRequest(question: string, chunks: Chunk[], kind: Kind = "co
 }
 
 // ---- cache ------------------------------------------------------------------
-// ponytail: one JSON file; move to sqlite if it passes a few MB.
+// One JSON file for now; move to sqlite if it grows past a few MB.
 const CACHE_FILE = path.join(os.homedir(), ".cache", "jgrep", "cache.json");
 export type Cache = Record<string, any>;
 export function loadCache(): Cache {
@@ -250,12 +250,15 @@ export interface Options {
   failFast?: boolean;          // rethrow the first fatal error instead of isolating it
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
-export interface ChunkError { file: string; start: number; end: number; kind: JevErrorKind; message: string }
+export interface ChunkError { file: string; start: number; end: number; kind: JevErrorKind; message: string; hint?: string }
 export interface Result { hits: Hit[]; all: Hit[]; chunks: number; tokens: number; cached: number; errors: ChunkError[]; cost?: number }
 
 /** What one batch worker hands back; runPool results are completion-ordered, so the
- *  batch index rides along and `all` is re-associated after the pool settles. */
-interface BatchOutcome { index: number; entries: { chunkIndex: number; p: number }[] }
+ *  batch index rides along and `all` is re-associated after the pool settles. A
+ *  partial 200 (the provider answered some chunks but not others) is NOT a hit:
+ *  unanswered chunk indices come back in `malformed` and the caller records them as
+ *  malformed_response ChunkErrors — otherwise they would surface as p:NaN entries. */
+interface BatchOutcome { index: number; entries: { chunkIndex: number; p: number }[]; malformed: number[] }
 
 /** Appended to an invalid_api_key hint when at least one batch succeeded earlier in the
  *  SAME run (plan §1.5): a 401/403 then means the key expired/was revoked, not that the
@@ -279,8 +282,11 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
     if (hit !== undefined) all[i] = { ...c, p: hit }; else todo.push(i);
   });
   const cached = chunks.length - todo.length;
+  // Defensive normalization: a 0/fractional batch would spin the loop forever (+= 0)
+  // or overlap batches. parse() rejects those; library callers get clamped instead.
+  const batch = Math.max(1, Math.floor(o.batch));
   const batches: number[][] = [];
-  for (let i = 0; i < todo.length; i += o.batch) batches.push(todo.slice(i, i + o.batch));
+  for (let i = 0; i < todo.length; i += batch) batches.push(todo.slice(i, i + batch));
   // One resolution of the retry/deadline options for the whole run (the worker only reads these).
   const timeoutMs = (o.timeoutSec ?? DEFAULT_TIMEOUT_SEC) * 1000;
   const post: PostOpts = {
@@ -302,14 +308,20 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
     tokens += res.usage?.input_tokens ?? 0;
     if (res.cost !== undefined) cost = (cost ?? 0) + res.cost;
     // Finite p-values go straight into the in-memory cache object: cli.ts persists it in a
-    // finally (Step 7), so answers paid for survive even when other batches fail.
-    const entries = b.map((ci, j) => {
-      const p = res.answers[`c${j}`]?.noul ?? NaN;
-      if (Number.isFinite(p)) cache[key(model, kind, question, chunks[ci])] = p;
-      return { chunkIndex: ci, p };
+    // finally (Step 7), so answers paid for survive even when other batches fail. A chunk
+    // the provider did not answer (missing or non-finite p on a 200) is skipped here and
+    // reported as malformed_response — never a p:NaN entry in all/hits.
+    const entries: { chunkIndex: number; p: number }[] = [];
+    const malformed: number[] = [];
+    b.forEach((ci, j) => {
+      const p = res.answers[`c${j}`]?.noul;
+      if (Number.isFinite(p)) {
+        cache[key(model, kind, question, chunks[ci])] = p;
+        entries.push({ chunkIndex: ci, p });
+      } else malformed.push(ci);
     });
     hadSuccess = true; // this batch's request succeeded — set before returning (plan §1.5)
-    return { index, entries };
+    return { index, entries, malformed };
   };
   let pool: PoolResult<BatchOutcome>;
   try {
@@ -329,15 +341,26 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
   for (const r of pool.results) for (const e of r.entries) all[e.chunkIndex] = { ...chunks[e.chunkIndex], p: e.p };
   // Not failFast: recorded 401/403s get the same expired-vs-wrong-key distinction. One
   // clean place — mutate the JevProviderError's hint in pool.errors BEFORE mapping onto
-  // chunks (ChunkError carries only kind+message; the hint stays on the provider error
-  // that pool-level consumers see).
+  // chunks, so the amended hint is what ChunkError carries down to the CLI.
   if (pool.hadSuccess) {
     for (const e of pool.errors) {
       if (e.error.kind === "invalid_api_key") e.error.hint = [e.error.hint, KEY_WORKED_EARLIER_HINT].filter(Boolean).join(" ");
     }
   }
   const errors: ChunkError[] = pool.errors.flatMap((e) =>
-    batches[e.index].map((ci) => ({ file: chunks[ci].file, start: chunks[ci].start, end: chunks[ci].end, kind: e.error.kind, message: e.error.message })));
+    batches[e.index].map((ci) => ({
+      file: chunks[ci].file, start: chunks[ci].start, end: chunks[ci].end,
+      kind: e.error.kind, message: e.error.message,
+      // The provider error's actionable hint rides along (cli.ts prints it under the
+      // error line and --json-errors includes it) — incl. the KEY_WORKED_EARLIER_HINT
+      // amended above.
+      ...(e.error.hint !== undefined ? { hint: e.error.hint } : {}),
+    })));
+  // A 200 that answered only some chunks of a batch: the unanswered chunks are
+  // recorded per chunk here (the batch itself succeeded, so the pool saw no error).
+  for (const r of pool.results)
+    for (const ci of r.malformed)
+      errors.push({ file: chunks[ci].file, start: chunks[ci].start, end: chunks[ci].end, kind: "malformed_response", message: "provider returned no usable answer for this chunk" });
   if (pool.aborted) {
     // Batches that were dispatched all reported (success or their own error); whatever
     // was never attempted is reported as a breaker error. No cache entries, no hits.
@@ -358,17 +381,5 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
 // ---- config -----------------------------------------------------------------
 // Key resolution/verification/storage moved to providers.ts (WI-1): resolveApiKey,
 // verifyApiKey and the legacy ~/.config/jgrep/env writer live there now.
-
-/** Copy the bundled SKILL.md into each agent's skills dir that exists. Returns the dirs written. */
-export function installSkills(skillSrc: string, home = os.homedir(), agents = ["claude", "codex"]): string[] {
-  const out: string[] = [];
-  for (const a of agents) {
-    const base = path.join(home, `.${a}`);
-    if (!fs.existsSync(base)) continue;
-    const dir = path.join(base, "skills", "jgrep");
-    fs.mkdirSync(dir, { recursive: true });
-    fs.copyFileSync(skillSrc, path.join(dir, "SKILL.md"));
-    out.push(dir);
-  }
-  return out;
-}
+// Agent-skill installation moved to init.ts: the vercel `skills` universal installer
+// (`installToAgentsDir` there is the fallback) replaced the old per-harness copy.
