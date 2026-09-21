@@ -11,11 +11,26 @@
 #   [4] upstream main (copy)  build upstream/main, copy       (fetch + git worktree in a tmpdir)
 #   [5] npm stable            npm install -g jevgrep (upstream's published release)
 #   [6] check only            autodetect report, no mutation
+#   [7] uninstall jgrep       remove every detected install (npm/symlink/copy/brew-aware)
 #
 # Modes: interactive by default. `--choice N` (or a bare N) runs one option fully
 # non-interactively — zero prompts, everything auto-confirmed, deterministic
-# exit codes — for headless dev boxes. `check` prints the full autodetect
-# report and mutates nothing.
+# exit codes — for headless dev boxes. `./install-dev.sh uninstall` is an alias
+# for `--choice 7`. `check` prints the full autodetect report and mutates nothing.
+#
+# Detection: before the menu a `current:` line reports the detected install
+# (type + path + version) and the matching option is marked [CURRENT]. The scan
+# covers every `jgrep` on PATH plus the classic bin dirs (npm global bin,
+# /usr/local/bin, $HOME/.local/bin, brew's bin) even when off-PATH, so stale
+# leftovers are reported; multiple installs produce an explicit warning.
+#
+# Identity: npm also hosts an UNRELATED `jgrep` package, and the jgrep/jevgrep
+# names collide across GitHub. Every npm touch is identity-pinned: installs
+# verify the REGISTRY entry of `jevgrep` (repository.url must contain
+# github.com/kyu1204/jgrep), uninstalls verify the LOCALLY installed manifest,
+# options 3/4 verify the origin/upstream git remotes (Emasoft/jgrep /
+# kyu1204/jgrep), and options 1/2 verify this checkout's package.json name.
+# Mismatches refuse loudly (exit 1, no override).
 #
 # Exit codes: 0 success · 2 usage error · 3 user-declined/aborted · 1 everything else.
 # `--dry-run` always exits 0 (unless the usage itself is invalid).
@@ -27,9 +42,24 @@ set -euo pipefail
 PROG="install-dev.sh"
 
 # ---------------------------------------------------------------------------
+# identity pinning — single source of truth
+# ---------------------------------------------------------------------------
+# On npm the names collide: `jevgrep` is this project's upstream package
+# (repository github.com/kyu1204/jgrep), while `jgrep` ("Recursive grep.",
+# maintainer mustafar) is an UNRELATED package. Many GitHub repos also share
+# the jgrep/jevgrep names. Every npm command below MUST go through
+# $NPM_PACKAGE, and every install/uninstall is identity-verified against
+# $EXPECTED_NPM_REPO before it touches anything (mismatch → loud refusal).
+NPM_PACKAGE="jevgrep"            # the ONLY npm package this script installs/uninstalls
+EXPECTED_NPM_REPO="github.com/kyu1204/jgrep"
+UPSTREAM_SLUG="kyu1204/jgrep"
+FORK_SLUG="Emasoft/jgrep"
+
+# ---------------------------------------------------------------------------
 # state
 # ---------------------------------------------------------------------------
 REPO=""
+INVOCATION_CWD=""
 OPT_CHOICE=""
 OPT_YES=0
 OPT_DRY_RUN=0
@@ -41,14 +71,34 @@ NODE_BIN="" NODE_VER=""
 BUN_BIN="" BUN_VER=""
 NPM_BIN="" NPM_VER=""
 NPM_PREFIX="" NPM_GLOBAL_BIN=""
+BREW_BIN="" BREW_PREFIX="" BREW_BIN_DIR=""
 SHA256_TOOL=""
 
 REPO_BRANCH="" REPO_HEAD="" REPO_DIRTY=""
 ORIGIN_SHA="" UPSTREAM_SHA=""
 UPSTREAM_NPM_VER=""
+DIST_SHA=""
 
+# npm registry identity probe (check report + option 5)
+NPM_REG_URL="" NPM_REG_VER="" NPM_REG_TARBALL="" NPM_IDENTITY_RC=""
+
+# install detection (menu + uninstall share this)
+CANDIDATE_LIST=""          # newline-separated raw candidate paths (deduped)
+CANDIDATE_PATHS=()         # normalized, existing candidates
+INSTALL_COUNT=0
+INSTALL_KINDS=()
+INSTALL_PATHS=()
+INSTALL_SUMMARIES=()
 CURRENT_PATH="" CURRENT_KIND="" CURRENT_DETAIL=""
-CURRENT_VERSION_OUT=""
+CURRENT_VERSION_OUT="" CURRENT_SHA="" CURRENT_RESOLVED="" CURRENT_BRANCH=""
+CURRENT_NPM_VER="" CURRENT_MENU_OPTION=""
+
+# per-candidate classification scratchpad (set by classify_candidate)
+C_KIND="" C_DETAIL="" C_SUMMARY="" C_SHA="" C_RESOLVED="" C_BRANCH="" C_NPM_VER=""
+
+# uninstall bookkeeping
+UNINSTALL_REMOVED=0 UNINSTALL_FAILED=0 UNINSTALL_DECLINED=0
+REMOVED_LIST=""
 
 DEST_DIR=""
 BUILD_SHA=""
@@ -83,6 +133,77 @@ on_path() {
 	*":$1:"*) return 0 ;;
 	*) return 1 ;;
 	esac
+}
+
+normalize_lexical() {
+	# absolute path in -> lexically normalized absolute path out (no filesystem
+	# access: resolves . / .. / // and trailing slashes; bash 3.2-safe)
+	local p="$1" comp out="" rest
+	local -a parts=()
+	case "$p" in
+	/*) ;;
+	*) p="$INVOCATION_CWD/$p" ;;
+	esac
+	rest="${p#/}"
+	IFS=/ read -ra parts <<< "$rest" || true
+	if [ "${#parts[@]}" -gt 0 ]; then
+		for comp in "${parts[@]}"; do
+			case "$comp" in
+			"" | ".") continue ;;
+			"..") out="${out%/*}" ;;
+			*)
+				if [ -z "$out" ]; then
+					out="/$comp"
+				else
+					out="$out/$comp"
+				fi
+				;;
+			esac
+		done
+	fi
+	if [ -z "$out" ]; then
+		out="/"
+	fi
+	printf '%s\n' "$out"
+	return 0
+}
+
+abs_path() {
+	# absolutize + normalize $1 against the invocation cwd (existence NOT required);
+	# existing paths are resolved physically (pwd -P), missing ones lexically
+	local p="$1" d
+	case "$p" in
+	"") return 1 ;;
+	/*) ;;
+	*) p="$INVOCATION_CWD/$p" ;;
+	esac
+	if [ -e "$p" ] || [ -L "$p" ]; then
+		if d="$(cd -- "$(dirname -- "$p")" 2>/dev/null && pwd -P)"; then
+			printf '%s/%s\n' "$d" "$(basename -- "$p")"
+			return 0
+		fi
+	fi
+	normalize_lexical "$p"
+}
+
+add_candidate() {
+	# dedupe a raw candidate path into CANDIDATE_LIST (newline-separated)
+	local p="$1"
+	[ -n "$p" ] || return 0
+	case "
+$CANDIDATE_LIST
+" in
+	*"
+$p
+"*) return 0 ;;
+	esac
+	if [ -z "$CANDIDATE_LIST" ]; then
+		CANDIDATE_LIST="$p"
+	else
+		CANDIDATE_LIST="$CANDIDATE_LIST
+$p"
+	fi
+	return 0
 }
 
 dir_state() {
@@ -130,17 +251,292 @@ sha256_of() {
 	fi
 }
 
-remote_url() {
-	git -C "$REPO" config --get "remote.$1.url" 2>/dev/null || true
+jgrep_identity_line() {
+	# identity proof: $1 must be executable AND answer like jgrep.
+	# `--version` may print "jgrep 0.4.0" (banner style) or a bare "0.4.0"
+	# (what dist/jgrep.js actually prints); `--help` banner starts with "jgrep ".
+	# Prints a normalized "jgrep <version>" on success; nothing + rc 1 otherwise.
+	local f="$1" out=""
+	[ -n "$f" ] || return 1
+	[ -x "$f" ] || return 1
+	out="$("$f" --version </dev/null 2>/dev/null | head -n 1 || true)"
+	case "$out" in
+	"jgrep "*)
+		printf 'jgrep %s\n' "$(printf '%s' "$out" | awk '{print $2}')"
+		return 0
+		;;
+	[0-9].[0-9].[0-9]* | [0-9].[0-9]*.[0-9]*)
+		printf 'jgrep %s\n' "$(printf '%s' "$out" | awk '{print $1}')"
+		return 0
+		;;
+	esac
+	out="$("$f" --help </dev/null 2>/dev/null | head -n 1 || true)"
+	case "$out" in
+	"jgrep "*)
+		printf 'jgrep %s\n' "$(printf '%s' "$out" | awk '{print $2}')"
+		return 0
+		;;
+	esac
+	return 1
 }
 
-remote_configured() {
-	[ -n "$(remote_url "$1")" ]
+describe_identity() {
+	# best-effort "<what it is>" for the refusal message of a non-jgrep file
+	local f="$1" out=""
+	if [ ! -x "$f" ]; then
+		printf 'not executable'
+		return 0
+	fi
+	out="$("$f" --version </dev/null 2>&1 | head -n 1 || true)"
+	if [ -n "$out" ]; then
+		printf 'it says "%s"' "${out:0:60}"
+		return 0
+	fi
+	printf 'no --version output'
+	return 0
+}
+
+remote_url() {
+	git -C "$REPO" config --get "remote.$1.url" 2>/dev/null || true
 }
 
 ref_sha() {
 	# short SHA of a local ref (no network, no fetch) — empty when the ref is absent
 	git -C "$REPO" rev-parse --short --verify "$1" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# identity pinning helpers — git remotes + npm package
+# ---------------------------------------------------------------------------
+remote_expected_slug() {
+	# origin -> $FORK_SLUG, anything else (upstream) -> $UPSTREAM_SLUG
+	if [ "$1" = "origin" ]; then
+		printf '%s\n' "$FORK_SLUG"
+	else
+		printf '%s\n' "$UPSTREAM_SLUG"
+	fi
+	return 0
+}
+
+remote_identity_state() {
+	# $1 = remote name → "ok" | "missing" | "mismatch:<observed url>"
+	local r="$1" url slug
+	slug="$(remote_expected_slug "$r")"
+	url="$(remote_url "$r")"
+	if [ -z "$url" ]; then
+		printf 'missing\n'
+		return 0
+	fi
+	case "$url" in
+	*"$slug"*) printf 'ok\n' ;;
+	*) printf 'mismatch:%s\n' "$url" ;;
+	esac
+	return 0
+}
+
+remote_identity_ok() {
+	[ "$(remote_identity_state "$1")" = "ok" ]
+}
+
+remote_display_url() {
+	local u
+	u="$(remote_url "$1")"
+	[ -n "$u" ] || u="<not configured>"
+	printf '%s\n' "$u"
+	return 0
+}
+
+remote_identity_suffix() {
+	# verdict appended to the remote URL in the check report
+	local slug
+	slug="$(remote_expected_slug "$1")"
+	case "$(remote_identity_state "$1")" in
+	ok) printf '(expected %s) — verified' "$slug" ;;
+	missing) printf '(expected %s) — NOT CONFIGURED' "$slug" ;;
+	mismatch:*) printf '(expected %s) — MISMATCH' "$slug" ;;
+	esac
+	return 0
+}
+
+remote_unavailable_marker() {
+	# marker text for options 3/4 when the remote is missing or mispointed
+	local s
+	s="$(remote_identity_state "$1")"
+	case "$s" in
+	ok) return 0 ;;
+	missing)
+		printf '%s remote does not point to %s (remote not configured)' "$1" "$(remote_expected_slug "$1")"
+		;;
+	mismatch:*)
+		printf '%s remote does not point to %s (observed: %s)' "$1" "$(remote_expected_slug "$1")" "${s#mismatch:}"
+		;;
+	esac
+	return 0
+}
+
+verify_remote_identity_or_die() {
+	# options 3/4 gate: the remote must be configured AND point at its
+	# expected slug; refuses with the observed URL otherwise (exit 1).
+	local r="$1" s
+	s="$(remote_identity_state "$r")"
+	case "$s" in
+	ok) return 0 ;;
+	missing)
+		warn "$PROG: refusing: the git remote '$r' is not configured."
+		warn "  expected: a URL containing $(remote_expected_slug "$r")"
+		exit 1
+		;;
+	mismatch:*)
+		warn "$PROG: refusing: the git remote '$r' does not point at $(remote_expected_slug "$r")."
+		warn "  observed $r URL: ${s#mismatch:}"
+		warn "  expected: a URL containing $(remote_expected_slug "$r")"
+		exit 1
+		;;
+	esac
+	return 0
+}
+
+npm_repo_url_matches() {
+	# $1 = URL → 0 when it points at $EXPECTED_NPM_REPO (accepts the ssh-style
+	# git@github.com:owner/repo spelling too — same repository)
+	local url="$1"
+	[ -n "$url" ] || return 1
+	case "$url" in
+	*"$EXPECTED_NPM_REPO"* | *"github.com:${EXPECTED_NPM_REPO#github.com/}"*) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+npm_registry_identity_probe() {
+	# read-only registry probe; sets NPM_REG_URL / NPM_REG_VER / NPM_REG_TARBALL.
+	# rc 0 = identity verified, 1 = MISMATCH, 2 = registry unreachable/empty.
+	# (version reuses collect_repo_state's UPSTREAM_NPM_VER — one fewer call)
+	NPM_REG_URL="" NPM_REG_VER="" NPM_REG_TARBALL=""
+	NPM_REG_URL="$(npm view "$NPM_PACKAGE" repository.url 2>/dev/null | head -n 1 || true)"
+	NPM_REG_VER="$UPSTREAM_NPM_VER"
+	if [ -n "$NPM_REG_URL" ]; then
+		NPM_REG_TARBALL="$(npm view "$NPM_PACKAGE" dist.tarball 2>/dev/null | head -n 1 || true)"
+		if npm_repo_url_matches "$NPM_REG_URL"; then
+			return 0
+		fi
+		return 1
+	fi
+	return 2
+}
+
+npm_registry_refuse() {
+	# loud refusal for option 5; $1 = "mismatch" | "unreachable". No override.
+	local reason="$1"
+	if [ "$reason" = "unreachable" ]; then
+		warn "$PROG: refusing to install: cannot verify the npm identity of '$NPM_PACKAGE' (registry did not answer)."
+		warn "  expected repository: *$EXPECTED_NPM_REPO* — observed: <no answer from 'npm view $NPM_PACKAGE repository.url'>"
+	else
+		warn "$PROG: refusing to install: the npm package '$NPM_PACKAGE' does not point at $EXPECTED_NPM_REPO anymore."
+		warn "  observed repository.url: $NPM_REG_URL"
+		warn "  expected: a URL containing $EXPECTED_NPM_REPO"
+	fi
+	warn "  no override exists on purpose: npm also hosts an UNRELATED 'jgrep' package (name collision),"
+	warn "  and this check guards against future takeovers of the '$NPM_PACKAGE' name."
+	exit 1
+}
+
+npm_registry_verdict_text() {
+	# one-line verdict for the check report
+	case "${NPM_IDENTITY_RC:-}" in
+	0) printf '— verified (repository.url: %s)' "$NPM_REG_URL" ;;
+	1) printf '— MISMATCH (repository.url: %s)' "$NPM_REG_URL" ;;
+	2) printf '— unverified (registry unreachable)' ;;
+	*) printf '— unverified (not probed)' ;;
+	esac
+	return 0
+}
+
+npm_global_pkg_json() {
+	# absolute path of the globally installed $NPM_PACKAGE manifest, rc 1 when
+	# absent. `npm root -g` is the canonical location on every platform (incl.
+	# Windows layouts); the <prefix>/lib/node_modules and <prefix>/node_modules
+	# fallbacks cover npm layouts where root -g says something else.
+	local root d f
+	if [ -n "$NPM_BIN" ]; then
+		root="$(npm root -g 2>/dev/null || true)"
+		if [ -n "$root" ]; then
+			f="$root/$NPM_PACKAGE/package.json"
+			if [ -f "$f" ]; then
+				printf '%s\n' "$f"
+				return 0
+			fi
+		fi
+	fi
+	for d in "$NPM_PREFIX/lib/node_modules" "$NPM_PREFIX/node_modules"; do
+		[ -n "$d" ] || continue
+		f="$d/$NPM_PACKAGE/package.json"
+		if [ -f "$f" ]; then
+			printf '%s\n' "$f"
+			return 0
+		fi
+	done
+	return 1
+}
+
+npm_pkg_json_repository_url() {
+	# best-effort repository URL from an npm-written package.json (no jq):
+	# "repository": { ... "url": "..." } → string form → legacy _repository.
+	# Prints nothing when no field is found (caller decides what that means).
+	local f="$1" u=""
+	u="$(sed -n 's/.*"repository"[[:space:]]*:[[:space:]]*{[^}]*"url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" 2>/dev/null | head -n 1 || true)"
+	if [ -z "$u" ]; then
+		u="$(sed -n 's/.*"repository"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" 2>/dev/null | head -n 1 || true)"
+	fi
+	if [ -z "$u" ]; then
+		u="$(sed -n 's/.*"_repository"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" 2>/dev/null | head -n 1 || true)"
+	fi
+	[ -n "$u" ] && printf '%s\n' "$u"
+	return 0
+}
+
+verify_npm_package_identity_local() {
+	# offline identity gate for every `npm uninstall -g` this script runs: the
+	# LOCALLY installed $NPM_PACKAGE manifest must point at $EXPECTED_NPM_REPO.
+	# Refuses loudly (exit 1) on mismatch, on a missing repository field, and
+	# when npm claims the package but no manifest can be found.
+	local f url
+	if ! f="$(npm_global_pkg_json)"; then
+		warn "$PROG: refusing to uninstall: npm owns jgrep ('npm ls -g $NPM_PACKAGE' succeeds)"
+		warn "  but the installed package manifest is missing or unreadable — identity unverifiable."
+		warn "  expected repository: *$EXPECTED_NPM_REPO* — observed: <no $NPM_PACKAGE/package.json>"
+		warn "  inspect it manually first: npm ls -g $NPM_PACKAGE && npm root -g"
+		exit 1
+	fi
+	url="$(npm_pkg_json_repository_url "$f")"
+	if [ -z "$url" ]; then
+		warn "$PROG: refusing to uninstall: the installed $NPM_PACKAGE manifest has no repository field — identity unverifiable."
+		warn "  manifest: $f"
+		warn "  expected repository: *$EXPECTED_NPM_REPO* — observed: <no repository field>"
+		exit 1
+	fi
+	if ! npm_repo_url_matches "$url"; then
+		warn "$PROG: refusing to uninstall: the locally installed npm package '$NPM_PACKAGE' does not point at $EXPECTED_NPM_REPO."
+		warn "  observed repository.url: $url"
+		warn "  expected: a URL containing $EXPECTED_NPM_REPO (manifest: $f)"
+		warn "  no override exists on purpose: npm also hosts an UNRELATED 'jgrep' package (name collision),"
+		warn "  and this check guards against future takeovers of the '$NPM_PACKAGE' name."
+		exit 1
+	fi
+	log "==> npm identity verified: $NPM_PACKAGE ($f) -> $url"
+	return 0
+}
+
+verify_local_checkout_identity() {
+	# options 1/2 gate: they build THIS checkout, so its package.json must
+	# name jevgrep (many GitHub repos share the jgrep name).
+	local name=""
+	name="$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$REPO/package.json" 2>/dev/null | head -n 1 || true)"
+	if [ "$name" != "$NPM_PACKAGE" ]; then
+		warn "$PROG: refusing to build: this checkout's package.json says \"name\": \"${name:-<missing>}\", expected \"$NPM_PACKAGE\"."
+		warn "  this script must run from the jevgrep checkout (the jgrep name is shared by unrelated repos)."
+		exit 1
+	fi
+	return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -197,6 +593,14 @@ detect_environment() {
 		fi
 	fi
 
+	if have brew; then
+		BREW_BIN="$(command -v brew)"
+		BREW_PREFIX="$(brew --prefix 2>/dev/null || true)"
+		if [ -n "$BREW_PREFIX" ]; then
+			BREW_BIN_DIR="$BREW_PREFIX/bin"
+		fi
+	fi
+
 	if have shasum; then
 		SHA256_TOOL="shasum"
 	elif have sha256sum; then
@@ -208,12 +612,12 @@ detect_environment() {
 
 npm_owns_live() {
 	[ -n "$NPM_BIN" ] || return 1
-	npm ls -g jevgrep >/dev/null 2>&1
+	npm ls -g "$NPM_PACKAGE" >/dev/null 2>&1
 }
 
 npm_installed_jevgrep_version() {
 	local out=""
-	out="$(npm ls -g jevgrep --depth=0 2>/dev/null | sed -n 's/.*jevgrep@\([^ ]*\).*/\1/p' | head -n 1 || true)"
+	out="$(npm ls -g "$NPM_PACKAGE" --depth=0 2>/dev/null | sed -n "s/.*$NPM_PACKAGE@\([^ ]*\).*/\1/p" | head -n 1 || true)"
 	if [ -z "$out" ]; then
 		out="unknown"
 	fi
@@ -240,79 +644,292 @@ collect_repo_state() {
 	ORIGIN_SHA="$(ref_sha origin/main)"
 	UPSTREAM_SHA="$(ref_sha upstream/main)"
 
+	if [ -f "$REPO/dist/jgrep.js" ]; then
+		DIST_SHA="$(sha256_of "$REPO/dist/jgrep.js" || true)"
+	fi
+
 	if [ -n "$NPM_BIN" ]; then
-		UPSTREAM_NPM_VER="$(npm view jevgrep version 2>/dev/null | head -n 1 || true)"
+		UPSTREAM_NPM_VER="$(npm view "$NPM_PACKAGE" version 2>/dev/null | head -n 1 || true)"
 	fi
 }
 
 # ---------------------------------------------------------------------------
-# classify the current jgrep install
+# install detection: scan ALL jgrep entries, classify each, pick the current
 # ---------------------------------------------------------------------------
-classify_current_install() {
-	CURRENT_KIND="none"
-	CURRENT_DETAIL=""
-	CURRENT_VERSION_OUT=""
-	CURRENT_PATH="$(command -v jgrep 2>/dev/null || true)"
-	if [ -z "$CURRENT_PATH" ]; then
+brew_owns_jevgrep() {
+	[ -n "$BREW_BIN" ] || return 1
+	brew list --formula jevgrep >/dev/null 2>&1
+}
+
+classify_candidate() {
+	# $1 = candidate path (absolute; file or symlink on disk).
+	# Static classification only — never executes the candidate (identity is
+	# proven lazily via jgrep_identity_line for the selected install/uninstall).
+	# Sets: C_KIND C_SUMMARY C_DETAIL C_SHA C_RESOLVED C_BRANCH C_NPM_VER
+	C_KIND="copy" C_SUMMARY="" C_DETAIL="" C_SHA="" C_RESOLVED="" C_BRANCH="" C_NPM_VER=""
+	local f="$1" dir
+	if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+		C_KIND="missing"
+		C_SUMMARY="missing"
+		C_DETAIL="$f (already gone)"
+		return 0
+	fi
+	dir="$(dirname "$f")"
+	C_SHA="$(sha256_of "$f" || true)"
+
+	# npm-owned: inside npm's global bin dir AND npm claims the package
+	if [ -n "$NPM_GLOBAL_BIN" ] && [ "$dir" = "$NPM_GLOBAL_BIN" ] && npm_owns_live; then
+		C_KIND="npm"
+		C_NPM_VER="$(npm_installed_jevgrep_version)"
+		C_SUMMARY="npm ($NPM_PACKAGE $C_NPM_VER)"
+		C_DETAIL="$NPM_PACKAGE $C_NPM_VER — $f"
 		return 0
 	fi
 
-	# normalize a relative PATH hit (rare, but possible) to an absolute one
-	case "$CURRENT_PATH" in
-	/*) ;;
-	*)
-		local nd nb
-		nd="$(dirname "$CURRENT_PATH")"
-		nb="$(basename "$CURRENT_PATH")"
-		if [ "$nd" != "." ] && [ -d "$nd" ]; then
-			CURRENT_PATH="$(cd "$nd" 2>/dev/null && pwd)/$nb" || true
+	# Homebrew-owned: inside brew's bin dir AND brew owns the formula
+	if [ -n "$BREW_BIN_DIR" ] && [ "$dir" = "$BREW_BIN_DIR" ] && brew_owns_jevgrep; then
+		C_KIND="brew"
+		C_SUMMARY="brew (formula jevgrep)"
+		C_DETAIL="Homebrew formula jevgrep — $f"
+		return 0
+	fi
+
+	if [ -L "$f" ]; then
+		local repo_root
+		C_RESOLVED="$(resolve_symlink "$f")"
+		repo_root="$(git -C "$(dirname "$C_RESOLVED")" rev-parse --show-toplevel 2>/dev/null || true)"
+		if [ -n "$repo_root" ] && [ -f "$repo_root/package.json" ]; then
+			C_KIND="symlink-into-repo"
+			C_BRANCH="$(git -C "$repo_root" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+			if [ -z "$C_BRANCH" ]; then
+				C_BRANCH="detached"
+			fi
+			C_SUMMARY="symlink-into-repo ($C_BRANCH) -> $C_RESOLVED"
+			C_DETAIL="$C_BRANCH — $f -> $C_RESOLVED"
+		else
+			C_KIND="symlink"
+			C_SUMMARY="symlink -> $C_RESOLVED"
+			C_DETAIL="$f -> $C_RESOLVED"
 		fi
-		;;
-	esac
+		return 0
+	fi
 
-	CURRENT_VERSION_OUT="$("$CURRENT_PATH" --version 2>/dev/null | head -n 1 || true)"
+	C_KIND="copy"
+	C_SUMMARY="copy (sha256:${C_SHA:0:8})"
+	C_DETAIL="sha256:${C_SHA:0:8} — $f"
+	return 0
+}
 
-	if [ ! -e "$CURRENT_PATH" ] && [ ! -L "$CURRENT_PATH" ]; then
+scan_installs() {
+	# candidates = every `jgrep` on PATH (type -a) PLUS the classic bin dirs —
+	# npm global bin, /usr/local/bin, $HOME/.local/bin, brew's bin — even when
+	# off-PATH (stale leftovers), plus an explicit --target install.
+	CANDIDATE_LIST=""
+	CANDIDATE_PATHS=()
+	INSTALL_COUNT=0
+	INSTALL_KINDS=()
+	INSTALL_PATHS=()
+	INSTALL_SUMMARIES=()
+
+	local p d
+	while IFS= read -r p; do
+		add_candidate "$p"
+	done <<EOF
+$(shadow_paths)
+EOF
+	for d in "$NPM_GLOBAL_BIN" "/usr/local/bin" "$HOME/.local/bin" "$BREW_BIN_DIR"; do
+		[ -n "$d" ] || continue
+		add_candidate "$d/jgrep"
+	done
+	if [ -n "$OPT_TARGET" ]; then
+		add_candidate "$OPT_TARGET/jgrep"
+	fi
+
+	# normalize + keep only entries that actually exist on disk (drops
+	# alias/function hits from `type -a`)
+	while IFS= read -r p; do
+		[ -n "$p" ] || continue
+		p="$(abs_path "$p")"
+		if [ -e "$p" ] || [ -L "$p" ]; then
+			CANDIDATE_PATHS+=("$p")
+		fi
+	done <<EOF
+$CANDIDATE_LIST
+EOF
+
+	if [ "${#CANDIDATE_PATHS[@]}" -eq 0 ]; then
+		return 0
+	fi
+	for p in "${CANDIDATE_PATHS[@]}"; do
+		classify_candidate "$p"
+		INSTALL_COUNT=$((INSTALL_COUNT + 1))
+		INSTALL_KINDS+=("$C_KIND")
+		INSTALL_PATHS+=("$p")
+		INSTALL_SUMMARIES+=("$C_SUMMARY")
+	done
+	return 0
+}
+
+select_current_install() {
+	# the menu-relevant install: what `command -v jgrep` resolves to first;
+	# when nothing is on PATH, an explicit --target install still counts
+	# (it is the dir this invocation manages).
+	CURRENT_PATH="" CURRENT_KIND="none" CURRENT_DETAIL="" CURRENT_VERSION_OUT=""
+	CURRENT_SHA="" CURRENT_RESOLVED="" CURRENT_BRANCH="" CURRENT_NPM_VER=""
+	CURRENT_MENU_OPTION=""
+
+	local sel=""
+	sel="$(command -v jgrep 2>/dev/null || true)"
+	if [ -z "$sel" ] && [ -n "$OPT_TARGET" ]; then
+		if [ -e "$OPT_TARGET/jgrep" ] || [ -L "$OPT_TARGET/jgrep" ]; then
+			sel="$OPT_TARGET/jgrep"
+		fi
+	fi
+	if [ -z "$sel" ]; then
+		return 0
+	fi
+	sel="$(abs_path "$sel")" || true
+	if [ -z "$sel" ]; then
+		return 0
+	fi
+	CURRENT_PATH="$sel"
+	classify_candidate "$sel"
+	CURRENT_KIND="$C_KIND"
+	CURRENT_DETAIL="$C_DETAIL"
+	CURRENT_SHA="$C_SHA"
+	CURRENT_RESOLVED="$C_RESOLVED"
+	CURRENT_BRANCH="$C_BRANCH"
+	CURRENT_NPM_VER="$C_NPM_VER"
+
+	if [ "$CURRENT_KIND" = "missing" ]; then
 		CURRENT_KIND="unknown"
 		CURRENT_DETAIL="not a file on disk (shell alias/function?) — $CURRENT_PATH"
 		return 0
 	fi
 
-	# npm-owned: inside the npm global bin dir AND npm claims the package
-	if [ -n "$NPM_GLOBAL_BIN" ] && [ "$(dirname "$CURRENT_PATH")" = "$NPM_GLOBAL_BIN" ] && npm_owns_live; then
-		CURRENT_KIND="npm"
-		CURRENT_DETAIL="jevgrep $(npm_installed_jevgrep_version) — $CURRENT_PATH"
-		return 0
-	fi
+	# identity proof: the selected install must run and answer like jgrep
+	CURRENT_VERSION_OUT="$(jgrep_identity_line "$CURRENT_PATH" || true)"
 
-	if [ -L "$CURRENT_PATH" ]; then
-		local real repo_root branch
-		real="$(resolve_symlink "$CURRENT_PATH")"
-		repo_root="$(git -C "$(dirname "$real")" rev-parse --show-toplevel 2>/dev/null || true)"
-		if [ -n "$repo_root" ] && [ -f "$repo_root/package.json" ]; then
-			branch="$(git -C "$repo_root" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-			if [ -z "$branch" ]; then
-				branch="detached"
-			fi
-			CURRENT_KIND="symlink-into-repo"
-			CURRENT_DETAIL="$branch — $CURRENT_PATH -> $real"
-		else
-			CURRENT_KIND="symlink"
-			CURRENT_DETAIL="$CURRENT_PATH -> $real"
+	case "$CURRENT_KIND" in
+	npm)
+		CURRENT_MENU_OPTION="5"
+		;;
+	symlink-into-repo)
+		# [1] only when the link points at THIS checkout's build
+		if [ "$CURRENT_RESOLVED" = "$REPO/dist/jgrep.js" ]; then
+			CURRENT_MENU_OPTION="1"
 		fi
+		;;
+	copy)
+		# [2] only when the copy is byte-identical to the current build
+		if [ -n "$DIST_SHA" ] && [ -n "$CURRENT_SHA" ] && [ "$CURRENT_SHA" = "$DIST_SHA" ]; then
+			CURRENT_MENU_OPTION="2"
+		fi
+		;;
+	esac
+	return 0
+}
+
+version_word() {
+	# "jgrep 0.4.0" -> "0.4.0"; empty input -> "version unknown"
+	local line="$1" v=""
+	if [ -n "$line" ]; then
+		v="$(printf '%s' "$line" | awk '{print $2}')"
+	fi
+	if [ -z "$v" ]; then
+		v="version unknown"
+	fi
+	printf '%s\n' "$v"
+	return 0
+}
+
+print_current_line() {
+	# the `current:` line printed right above the menu (+ explicit warnings)
+	local v
+	case "$CURRENT_KIND" in
+	none)
+		log "current: none"
+		;;
+	npm)
+		v="$(version_word "$CURRENT_VERSION_OUT")"
+		if [ "$v" = "version unknown" ] && [ -n "$CURRENT_NPM_VER" ]; then
+			v="$CURRENT_NPM_VER"
+		fi
+		log "current: npm ($NPM_PACKAGE $v) @ $CURRENT_PATH"
+		;;
+	brew)
+		v="$(version_word "$CURRENT_VERSION_OUT")"
+		log "current: brew (jevgrep $v) @ $CURRENT_PATH — Homebrew owns it (formula jevgrep)"
+		;;
+	symlink-into-repo)
+		v="$(version_word "$CURRENT_VERSION_OUT")"
+		log "current: symlink-into-repo ($CURRENT_BRANCH) @ $CURRENT_PATH -> $CURRENT_RESOLVED ($v)"
+		;;
+	symlink)
+		v="$(version_word "$CURRENT_VERSION_OUT")"
+		log "current: symlink @ $CURRENT_PATH -> $CURRENT_RESOLVED ($v)"
+		;;
+	copy)
+		v="$(version_word "$CURRENT_VERSION_OUT")"
+		if [ "$CURRENT_MENU_OPTION" = "2" ]; then
+			log "current: copy @ $CURRENT_PATH ($v, sha256:${CURRENT_SHA:0:8})"
+		else
+			log "current: copy @ $CURRENT_PATH ($v, sha256:${CURRENT_SHA:0:8}, older snapshot — provenance unknown)"
+		fi
+		;;
+	*)
+		log "current: unknown — $CURRENT_DETAIL"
+		;;
+	esac
+	if [ "$INSTALL_COUNT" -gt 1 ]; then
+		warn "warning: $INSTALL_COUNT jgrep installs detected — uninstall [7] cleans all of them"
+	fi
+	if [ "$CURRENT_KIND" = "brew" ]; then
+		warn "warning: Homebrew owns jgrep (formula jevgrep) — manage it with brew, not this script"
+	fi
+	return 0
+}
+
+print_install_list() {
+	# every detected entry: type + path (+ on/off-PATH note)
+	local i=0
+	if [ "$INSTALL_COUNT" -eq 0 ]; then
+		log "  none"
 		return 0
 	fi
-
-	local h
-	h="$(sha256_of "$CURRENT_PATH" || true)"
-	CURRENT_KIND="copy"
-	CURRENT_DETAIL="sha256:${h:0:8} — $CURRENT_PATH"
+	while [ "$i" -lt "$INSTALL_COUNT" ]; do
+		if on_path "$(dirname "${INSTALL_PATHS[$i]}")"; then
+			log "  ${INSTALL_SUMMARIES[$i]} @ ${INSTALL_PATHS[$i]} (on PATH)"
+		else
+			log "  ${INSTALL_SUMMARIES[$i]} @ ${INSTALL_PATHS[$i]} (off-PATH)"
+		fi
+		i=$((i + 1))
+	done
 	return 0
 }
 
 # ---------------------------------------------------------------------------
 # target dir
 # ---------------------------------------------------------------------------
+validate_target() {
+	# absolutize --target (against the invocation cwd) and refuse dangerous
+	# destinations — fatal, exit 2 — before anything else runs.
+	[ -n "$OPT_TARGET" ] || return 0
+	local t
+	t="$(abs_path "$OPT_TARGET")" || usage_error "cannot resolve --target '$OPT_TARGET'"
+	if [ "$t" = "/" ]; then
+		usage_error "--target / is not allowed (refusing to install into /)"
+	fi
+	if [ "$t" = "$HOME" ]; then
+		usage_error "--target $HOME is not allowed (refusing to install into your home directory)"
+	fi
+	if [ "$t" = "$REPO" ]; then
+		usage_error "--target $REPO is not allowed (refusing to target the repo root itself)"
+	fi
+	OPT_TARGET="$t"
+	return 0
+}
+
 resolve_default_target() {
 	# default chain: $(npm prefix -g)/bin -> /usr/local/bin -> $HOME/.local/bin
 	# $1 = 1 → may create $HOME/.local/bin (real installs); 0 → report only
@@ -369,24 +986,30 @@ menu_line() {
 	2) printf '  [2] local pinned (copy)   — build current branch, copy snapshot' ;;
 	3) printf '  [3] fork main (copy)      — build origin/main, copy         (fetch + git worktree in a tmpdir)' ;;
 	4) printf '  [4] upstream main (copy)  — build upstream/main, copy       (fetch + git worktree in a tmpdir)' ;;
-	5) printf '  [5] npm stable            — npm install -g jevgrep (upstream'"'"'s published release)' ;;
+	5) printf '  [5] npm stable            — npm install -g %s (upstream'"'"'s published release)' "$NPM_PACKAGE" ;;
 	6) printf '  [6] check only            — autodetect report, no mutation' ;;
+	7) printf '  [7] uninstall jgrep       — remove every detected install (npm/symlink/copy/brew-aware, identity-verified)' ;;
 	esac
 }
 
 menu_marker() {
+	# the currently-installed type wins over the availability marker
+	if [ -n "$CURRENT_MENU_OPTION" ] && [ "$1" = "$CURRENT_MENU_OPTION" ]; then
+		printf '[CURRENT]'
+		return 0
+	fi
 	case "$1" in
 	1 | 2 | 3 | 4)
 		if [ -z "$BUN_BIN" ]; then
 			printf '[unavailable: bun missing → only npm stable remains]'
 			return 0
 		fi
-		if [ "$1" = "3" ] && ! remote_configured origin; then
-			printf '[unavailable: origin remote missing]'
+		if [ "$1" = "3" ] && ! remote_identity_ok origin; then
+			printf '[unavailable: %s]' "$(remote_unavailable_marker origin)"
 			return 0
 		fi
-		if [ "$1" = "4" ] && ! remote_configured upstream; then
-			printf '[unavailable: upstream remote missing]'
+		if [ "$1" = "4" ] && ! remote_identity_ok upstream; then
+			printf '[unavailable: %s]' "$(remote_unavailable_marker upstream)"
 			return 0
 		fi
 		printf '[AVAILABLE]'
@@ -404,14 +1027,15 @@ menu_marker() {
 			printf ' (warning: node missing — the bin will not run)'
 		fi
 		;;
-	6) printf '[AVAILABLE]' ;;
+	6 | 7) printf '[AVAILABLE]' ;;
 	esac
 	return 0
 }
 
 print_menu_with_markers() {
+	print_current_line
 	local i line marker pad
-	for i in 1 2 3 4 5 6; do
+	for i in 1 2 3 4 5 6 7; do
 		line="$(menu_line "$i")"
 		marker="$(menu_marker "$i")"
 		pad=$((101 - ${#line}))
@@ -429,6 +1053,7 @@ Usage:
   ./install-dev.sh                       interactive menu
   ./install-dev.sh --choice N            NON-interactive: pick menu item N (implies --yes)
   ./install-dev.sh <n>                   bare number = same as --choice n
+  ./install-dev.sh uninstall             alias for --choice 7 (full uninstall, implies --yes)
   ./install-dev.sh check                 autodetect report, no mutation
   ./install-dev.sh help | --help | -h    usage + menu
   ./install-dev.sh [n|--choice N] [--yes] [--dry-run] [--target DIR]
@@ -445,6 +1070,7 @@ Options:
                are printed with DRY-RUN: prefixes; always exits 0.
   --target DIR install into DIR instead of the default target chain
                ($(npm prefix -g)/bin -> /usr/local/bin -> $HOME/.local/bin).
+               /, your home directory, and the repo root are refused.
 
 Menu (stable numbering — an interface contract, never renumbered):
   [1] local dev (symlink)   — build current branch, symlink <target>/jgrep -> <repo>/dist/jgrep.js
@@ -453,6 +1079,21 @@ Menu (stable numbering — an interface contract, never renumbered):
   [4] upstream main (copy)  — build upstream/main, copy       (fetch + git worktree in a tmpdir)
   [5] npm stable            — npm install -g jevgrep (upstream's published release)
   [6] check only            — autodetect report, no mutation
+  [7] uninstall jgrep       — remove every detected install (npm/symlink/copy/brew-aware, identity-verified)
+
+Before the menu a `current:` line reports the detected install (type, path,
+version) and the matching option is marked [CURRENT]. The scan covers every
+`jgrep` on PATH plus the classic bin dirs (npm global bin, /usr/local/bin,
+~/.local/bin, brew's bin) even when off-PATH; multiple installs produce an
+explicit warning. Uninstall is idempotent: "jgrep is not installed — nothing
+to do" when nothing is installed, and it refuses to remove files that are not
+jgrep.
+
+Identity pinning: every npm install/uninstall verifies that the `jevgrep`
+package still points at github.com/kyu1204/jgrep (the npm package `jgrep` is
+UNRELATED — name collision), options 3/4 verify the origin/upstream git
+remotes (Emasoft/jgrep / kyu1204/jgrep), and options 1/2 verify this
+checkout's package.json name. Mismatches refuse loudly; there is no override.
 
 Exit codes: 0 success · 2 usage error · 3 user-declined/aborted · 1 everything else.
 USAGE
@@ -524,11 +1165,16 @@ print_report() {
 	else
 		log "npm:             MISSING — option 5 unavailable"
 	fi
+	if [ -n "$BREW_BIN" ]; then
+		log "brew:            $BREW_BIN — bin dir $BREW_BIN_DIR"
+	else
+		log "brew:            not installed"
+	fi
 	log "sha256 tool:     ${SHA256_TOOL:-NONE (conflict archiving disabled)}"
 
 	case "$CURRENT_KIND" in
 	none) log "current install: none (command -v jgrep: not found)" ;;
-	symlink-into-repo | npm | copy) log "current install: $CURRENT_KIND ($CURRENT_DETAIL)" ;;
+	symlink-into-repo | npm | copy | brew) log "current install: $CURRENT_KIND ($CURRENT_DETAIL)" ;;
 	*) log "current install: $CURRENT_KIND — $CURRENT_DETAIL" ;;
 	esac
 	if [ -n "$CURRENT_PATH" ]; then
@@ -540,11 +1186,16 @@ print_report() {
 	fi
 	log "shadowing:       $(shadow_summary)"
 
+	if [ "$INSTALL_COUNT" -gt 1 ]; then
+		log "installs scan:   $INSTALL_COUNT jgrep entries found:"
+		print_install_list
+	fi
+
 	log "repo:            $REPO_BRANCH @ ${REPO_HEAD:-unknown} — $REPO_DIRTY"
 	log "refs (local):    origin/main @ ${ORIGIN_SHA:-<no local ref>} | upstream/main @ ${UPSTREAM_SHA:-<no local ref>}"
 	if [ -n "$NPM_BIN" ]; then
 		if [ -n "$UPSTREAM_NPM_VER" ]; then
-			log "upstream npm:    jevgrep $UPSTREAM_NPM_VER (registry latest)"
+			log "upstream npm:    $NPM_PACKAGE $UPSTREAM_NPM_VER (registry latest)"
 		else
 			log "upstream npm:    unknown (offline)"
 		fi
@@ -560,8 +1211,11 @@ print_report() {
 	if [ "$verbose" -eq 1 ]; then
 		log "--- full detail (check) ---"
 		log "repo path:       $REPO"
-		log "remotes:         origin -> $(remote_url origin)"
-		log "                 upstream -> $(remote_url upstream)"
+		log "remotes:         origin -> $(remote_display_url origin) $(remote_identity_suffix origin)"
+		log "                 upstream -> $(remote_display_url upstream) $(remote_identity_suffix upstream)"
+		if [ -n "$NPM_BIN" ]; then
+			log "npm package:     $NPM_PACKAGE (expected repository: ${EXPECTED_NPM_REPO#github.com/}) $(npm_registry_verdict_text)"
+		fi
 		log "HEAD:            $REPO_HEAD ($REPO_BRANCH), $(ahead_behind_origin)"
 		if [ -n "$NODE_BIN" ]; then
 			log "node resolved:   $(resolve_symlink "$NODE_BIN")"
@@ -597,6 +1251,8 @@ print_report() {
 		if [ -n "$OPT_TARGET" ]; then
 			log "  --target override: $OPT_TARGET ($(dir_state "$OPT_TARGET"))"
 		fi
+		log "installs scan (all candidates — PATH + classic dirs + --target):"
+		print_install_list
 		local sl
 		sl="$(shadow_paths)"
 		if [ -n "$sl" ]; then
@@ -745,28 +1401,32 @@ archive_existing() {
 
 solve_npm_owned_conflict() {
 	# called when the destination is the npm global bin dir and npm owns jevgrep
+	# identity gate: `npm uninstall -g` only runs on a verified upstream package
+	if [ "$OPT_DRY_RUN" -eq 0 ]; then
+		verify_npm_package_identity_local
+	fi
 	if [ "$OPT_YES" -eq 1 ]; then
 		if [ "$OPT_DRY_RUN" -eq 1 ]; then
-			log "DRY-RUN: npm uninstall -g jevgrep   (auto-confirmed: non-interactive)"
+			log "DRY-RUN: npm uninstall -g $NPM_PACKAGE   (auto-confirmed: non-interactive)"
 			return 0
 		fi
-		log "==> non-interactive: npm owns jgrep — uninstalling jevgrep first"
-		if ! npm uninstall -g jevgrep; then
-			warn "$PROG: npm uninstall -g jevgrep failed."
+		log "==> non-interactive: npm owns jgrep — uninstalling $NPM_PACKAGE first"
+		if ! npm uninstall -g "$NPM_PACKAGE"; then
+			warn "$PROG: npm uninstall -g $NPM_PACKAGE failed."
 			exit 1
 		fi
 		return 0
 	fi
 	echo
-	warn "WARNING: npm owns jgrep here (package jevgrep is installed globally)."
+	warn "WARNING: npm owns jgrep here (package $NPM_PACKAGE is installed globally)."
 	warn "Installing a dev build over it replaces the npm-managed file."
 	local reply=""
 	printf '%s' "npm owns jgrep — uninstall the package first? [y/N] "
 	read -r reply || reply=""
 	case "$reply" in
 	y | Y | yes | YES)
-		if ! npm uninstall -g jevgrep; then
-			warn "$PROG: npm uninstall -g jevgrep failed."
+		if ! npm uninstall -g "$NPM_PACKAGE"; then
+			warn "$PROG: npm uninstall -g $NPM_PACKAGE failed."
 			exit 1
 		fi
 		;;
@@ -925,6 +1585,7 @@ verify_install() {
 # ---------------------------------------------------------------------------
 opt_local_symlink() {
 	log "==> [1] local dev (symlink): build current branch, symlink <target>/jgrep -> <repo>/dist/jgrep.js"
+	verify_local_checkout_identity
 	if [ "$OPT_DRY_RUN" -eq 1 ]; then
 		if ensure_tmp_root; then
 			build_local_dry "$TMP_ROOT/dry-build.js"
@@ -944,6 +1605,7 @@ opt_local_symlink() {
 
 opt_local_copy() {
 	log "==> [2] local pinned (copy): build current branch, copy snapshot"
+	verify_local_checkout_identity
 	if [ "$OPT_DRY_RUN" -eq 1 ]; then
 		if ensure_tmp_root; then
 			build_local_dry "$TMP_ROOT/dry-build.js"
@@ -964,6 +1626,9 @@ opt_local_copy() {
 opt_remote_copy() {
 	# $1 = remote name (origin | upstream)
 	local remote="$1"
+	# remote identity gate (real run AND dry-run): origin must be this fork,
+	# upstream must be the upstream project
+	verify_remote_identity_or_die "$remote"
 	if [ "$remote" = "origin" ]; then
 		log "==> [3] fork main (copy): build origin/main, copy (fetch + git worktree in a tmpdir)"
 	else
@@ -988,19 +1653,29 @@ opt_remote_copy() {
 }
 
 opt_npm_stable() {
-	log "==> [5] npm stable: npm install -g jevgrep (upstream's published release)"
+	log "==> [5] npm stable: npm install -g $NPM_PACKAGE (upstream's published release)"
 	if [ -z "$NPM_BIN" ]; then
 		warn "$PROG: 'npm' is required for option 5 but was not found."
 		exit 1
 	fi
+	# registry identity pinning (real run AND dry-run — the probe is read-only):
+	# refuse unless the registry's jevgrep IS the upstream project
+	NPM_IDENTITY_RC=0
+	npm_registry_identity_probe || NPM_IDENTITY_RC=$?
+	case "$NPM_IDENTITY_RC" in
+	0) log "==> npm identity verified: $NPM_PACKAGE -> $NPM_REG_URL (expected *$EXPECTED_NPM_REPO*)" ;;
+	1) npm_registry_refuse mismatch ;;
+	*) npm_registry_refuse unreachable ;;
+	esac
 	if [ "$OPT_DRY_RUN" -eq 1 ]; then
 		if npm_owns_live; then
-			log "DRY-RUN: npm owns jgrep already — a real run would uninstall jevgrep first (auto-confirmed with --yes)"
+			log "DRY-RUN: npm owns jgrep already — a real run would uninstall $NPM_PACKAGE first (auto-confirmed with --yes)"
 		fi
 		if [ -n "$NPM_GLOBAL_BIN" ] && [ -e "$NPM_GLOBAL_BIN/jgrep" ]; then
 			log "DRY-RUN: npm will overwrite $NPM_GLOBAL_BIN/jgrep"
 		fi
-		log "DRY-RUN: npm install -g jevgrep --yes"
+		log "DRY-RUN: would install $NPM_PACKAGE ${NPM_REG_VER:-version unknown} from ${NPM_REG_TARBALL:-<tarball unknown>}"
+		log "DRY-RUN: npm install -g $NPM_PACKAGE --yes"
 		log "==> dry-run complete (option 5) — nothing was mutated"
 		return 0
 	fi
@@ -1013,21 +1688,332 @@ opt_npm_stable() {
 			archive_existing "$NPM_GLOBAL_BIN/jgrep"
 		fi
 	fi
-	if ! npm install -g jevgrep --yes; then
-		warn "$PROG: npm install -g jevgrep failed."
+	if ! npm install -g "$NPM_PACKAGE" --yes; then
+		warn "$PROG: npm install -g $NPM_PACKAGE failed."
 		exit 1
 	fi
 	if [ -n "$NPM_GLOBAL_BIN" ]; then
 		verify_install "$NPM_GLOBAL_BIN"
 	fi
+	log "==> installed $NPM_PACKAGE ${NPM_REG_VER:-version unknown} from ${NPM_REG_TARBALL:-<tarball unknown>}"
+	log "==> repository verified: $NPM_REG_URL (expected *$EXPECTED_NPM_REPO*)"
 	return 0
 }
 
 opt_check_only() {
 	log "==> [6] check only: autodetect report, no mutation"
 	print_report 1
+	if [ "$NPM_IDENTITY_RC" = "1" ]; then
+		warn "$PROG: warning: npm '$NPM_PACKAGE' does not point at $EXPECTED_NPM_REPO anymore (observed: $NPM_REG_URL) — do NOT run option 5."
+	fi
 	log ""
 	log "==> check complete — no mutation performed"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# [7] uninstall — npm/symlink/copy/brew-aware, identity-verified, idempotent
+# ---------------------------------------------------------------------------
+refuse_removal() {
+	# never removes anything; counts as a failure outside dry-run
+	warn "$PROG: refusing to remove $1: not a jgrep binary ($2)"
+	if [ "$OPT_DRY_RUN" -eq 0 ]; then
+		UNINSTALL_FAILED=$((UNINSTALL_FAILED + 1))
+	fi
+	return 0
+}
+
+remember_removed() {
+	case "
+$REMOVED_LIST
+" in
+	*"
+$1
+"*) return 0 ;;
+	esac
+	if [ -z "$REMOVED_LIST" ]; then
+		REMOVED_LIST="$1"
+	else
+		REMOVED_LIST="$REMOVED_LIST
+$1"
+	fi
+	return 0
+}
+
+uninstall_npm_entry() {
+	# npm-managed entries cannot be archived — the package owns the file
+	local f="$1"
+	if [ "$OPT_DRY_RUN" -eq 1 ]; then
+		log "DRY-RUN: npm uninstall -g $NPM_PACKAGE   (npm-owned entry: $f)"
+		return 0
+	fi
+	log "==> npm owns $f (package $NPM_PACKAGE) — npm uninstall -g $NPM_PACKAGE"
+	log "    npm-managed entries cannot be archived — reinstall with npm i -g $NPM_PACKAGE"
+	if npm uninstall -g "$NPM_PACKAGE"; then
+		UNINSTALL_REMOVED=$((UNINSTALL_REMOVED + 1))
+		remember_removed "$f"
+	else
+		warn "$PROG: npm uninstall -g $NPM_PACKAGE failed (EACCES?)."
+		warn "  hint: check the npm prefix permissions (npm config get prefix -> ${NPM_PREFIX:-?}), e.g."
+		warn "  sudo chown -R \"\$(id -u):\$(id -g)\" \"$NPM_PREFIX\"  ·  or reinstall with npm i -g $NPM_PACKAGE"
+		UNINSTALL_FAILED=$((UNINSTALL_FAILED + 1))
+	fi
+	return 0
+}
+
+uninstall_brew_entry() {
+	# Homebrew owns the file — only brew may remove it (interactive unless --yes)
+	local f="$1" reply=""
+	if [ "$OPT_DRY_RUN" -eq 1 ]; then
+		log "DRY-RUN: brew uninstall jevgrep   (Homebrew owns $f)"
+		return 0
+	fi
+	if [ "$OPT_YES" -eq 1 ]; then
+		log "==> Homebrew owns $f — brew uninstall jevgrep"
+		if brew uninstall jevgrep; then
+			UNINSTALL_REMOVED=$((UNINSTALL_REMOVED + 1))
+			remember_removed "$f"
+		else
+			warn "$PROG: brew uninstall jevgrep failed."
+			UNINSTALL_FAILED=$((UNINSTALL_FAILED + 1))
+		fi
+		return 0
+	fi
+	echo
+	warn "WARNING: Homebrew owns $f (formula jevgrep)."
+	printf '%s' "Run 'brew uninstall jevgrep'? [y/N] "
+	read -r reply || reply=""
+	case "$reply" in
+	y | Y | yes | YES)
+		if brew uninstall jevgrep; then
+			UNINSTALL_REMOVED=$((UNINSTALL_REMOVED + 1))
+			remember_removed "$f"
+		else
+			warn "$PROG: brew uninstall jevgrep failed."
+			UNINSTALL_FAILED=$((UNINSTALL_FAILED + 1))
+		fi
+		;;
+	*)
+		log "==> skipped: brew keeps owning $f (declined)"
+		UNINSTALL_DECLINED=$((UNINSTALL_DECLINED + 1))
+		;;
+	esac
+	return 0
+}
+
+uninstall_symlink_entry() {
+	# remove the LINK only when it resolves to a jgrep build; the repo file
+	# (…/dist/jgrep.js) is never touched
+	local f="$1" real
+	real="$(resolve_symlink "$f")"
+	case "$real" in
+	*/dist/jgrep.js) ;;
+	*)
+		refuse_removal "$f" "symlink does not resolve to a jgrep build ($real)"
+		return 0
+		;;
+	esac
+	if ! jgrep_identity_line "$real" >/dev/null 2>&1; then
+		refuse_removal "$f" "its target $real does not run as jgrep"
+		return 0
+	fi
+	if [ "$OPT_DRY_RUN" -eq 1 ]; then
+		log "DRY-RUN: rm $f   (symlink -> $real; the repo file stays untouched)"
+		return 0
+	fi
+	log "==> verified symlink: $f -> $real"
+	if rm "$f"; then
+		log "==> removed $f (the repo file $real remains untouched)"
+		UNINSTALL_REMOVED=$((UNINSTALL_REMOVED + 1))
+		remember_removed "$f"
+	else
+		warn "$PROG: failed to remove the symlink $f."
+		UNINSTALL_FAILED=$((UNINSTALL_FAILED + 1))
+	fi
+	return 0
+}
+
+uninstall_copy_entry() {
+	# plain file: FIRST prove it really is jgrep (--version), then archive it
+	local f="$1" ident what
+	if [ ! -f "$f" ] || [ -L "$f" ]; then
+		refuse_removal "$f" "not a regular file"
+		return 0
+	fi
+	if [ ! -x "$f" ]; then
+		refuse_removal "$f" "not executable"
+		return 0
+	fi
+	ident="$(jgrep_identity_line "$f" || true)"
+	if [ -z "$ident" ]; then
+		what="$(describe_identity "$f")"
+		refuse_removal "$f" "$what"
+		return 0
+	fi
+	if [ "$OPT_DRY_RUN" -eq 1 ]; then
+		log "DRY-RUN: would archive $f as $f.bak-<UTC timestamp> (verified: $ident)"
+		return 0
+	fi
+	log "==> verified jgrep: $f ($ident)"
+	archive_existing "$f"
+	UNINSTALL_REMOVED=$((UNINSTALL_REMOVED + 1))
+	remember_removed "$f"
+	return 0
+}
+
+uninstall_one() {
+	local f="$1"
+	classify_candidate "$f"
+	log ""
+	log "==> entry: $f — $C_SUMMARY"
+	case "$C_KIND" in
+	missing)
+		log "==> skip: $f is already gone"
+		;;
+	npm)
+		uninstall_npm_entry "$f"
+		;;
+	brew)
+		uninstall_brew_entry "$f"
+		;;
+	symlink-into-repo | symlink)
+		uninstall_symlink_entry "$f"
+		;;
+	copy)
+		uninstall_copy_entry "$f"
+		;;
+	*)
+		refuse_removal "$f" "unrecognized install type"
+		;;
+	esac
+	return 0
+}
+
+offer_backup_cleanup() {
+	# archived siblings in DEST_DIR: <target>/jgrep.bak-* only — exact file paths
+	local f
+	local baks=()
+	for f in "$DEST_DIR"/jgrep.bak-*; do
+		[ -e "$f" ] || continue
+		baks+=("$f")
+	done
+	if [ "${#baks[@]}" -eq 0 ]; then
+		return 0
+	fi
+	log ""
+	log "archived backup(s) in $DEST_DIR:"
+	for f in "${baks[@]}"; do
+		log "  $f"
+	done
+	if [ "$OPT_DRY_RUN" -eq 1 ]; then
+		log "DRY-RUN: would ask to delete ${#baks[@]} archived backup(s) (a real run deletes them with --yes)"
+		return 0
+	fi
+	local reply=""
+	if [ "$OPT_YES" -eq 1 ]; then
+		reply="y"
+	else
+		printf '%s' "also delete ${#baks[@]} archived backup(s)? [y/N] "
+		read -r reply || reply=""
+	fi
+	case "$reply" in
+	y | Y | yes | YES)
+		for f in "${baks[@]}"; do
+			if rm -f "$f"; then
+				log "==> deleted $f"
+			else
+				warn "$PROG: could not delete $f."
+				UNINSTALL_FAILED=$((UNINSTALL_FAILED + 1))
+			fi
+		done
+		;;
+	*)
+		log "==> kept the archived backup(s)"
+		;;
+	esac
+	return 0
+}
+
+uninstall_post_state() {
+	# fresh detection + the new `current:` line; flag shadowed leftovers
+	hash -r 2>/dev/null || true
+	scan_installs
+	select_current_install
+	log ""
+	log "==> after uninstall:"
+	print_current_line
+	if [ "$UNINSTALL_REMOVED" -gt 0 ]; then
+		local now still=""
+		now="$(command -v jgrep 2>/dev/null || true)"
+		if [ -n "$now" ]; then
+			case "
+$REMOVED_LIST
+" in
+			*"
+$now
+"*) still="$now" ;;
+			esac
+		fi
+		if [ -n "$still" ]; then
+			warn "warning: 'jgrep' still resolves to $still (stale shell hash or shadowing entry)."
+			warn "  current resolution (type -a jgrep):"
+			type -a jgrep 1>&2 2>/dev/null || true
+		fi
+	fi
+	return 0
+}
+
+opt_uninstall() {
+	log "==> [7] uninstall jgrep — npm/symlink/copy/brew-aware, identity-verified, idempotent"
+	local total=0
+	if [ "${#CANDIDATE_PATHS[@]}" -gt 0 ]; then
+		total=${#CANDIDATE_PATHS[@]}
+	fi
+	if [ "$total" -eq 0 ]; then
+		log "jgrep is not installed — nothing to do"
+		return 0
+	fi
+	if [ "$total" -gt 1 ]; then
+		warn "warning: $total jgrep installs detected — uninstall [7] cleans all of them"
+	fi
+	# identity gate: never run `npm uninstall -g` unless the LOCALLY installed
+	# package manifest proves it is the upstream jevgrep (offline check; also
+	# covers the npm-claims-but-manifest-missing case)
+	if npm_owns_live; then
+		verify_npm_package_identity_local
+	fi
+	UNINSTALL_REMOVED=0
+	UNINSTALL_FAILED=0
+	UNINSTALL_DECLINED=0
+	REMOVED_LIST=""
+	local p
+	for p in "${CANDIDATE_PATHS[@]}"; do
+		uninstall_one "$p"
+	done
+	offer_backup_cleanup
+
+	if [ "$OPT_DRY_RUN" -eq 1 ]; then
+		log ""
+		log "==> dry-run complete (option 7) — nothing was mutated"
+		return 0
+	fi
+
+	uninstall_post_state
+
+	if [ "$UNINSTALL_FAILED" -gt 0 ]; then
+		if [ "$UNINSTALL_REMOVED" -gt 0 ]; then
+			warn "$PROG: warning: uninstall completed with $UNINSTALL_FAILED failure(s) — partial success."
+			return 0
+		fi
+		die "uninstall failed for all $total candidate(s) — nothing was removed"
+	fi
+	if [ "$UNINSTALL_REMOVED" -eq 0 ] && [ "$UNINSTALL_DECLINED" -gt 0 ]; then
+		warn "$PROG: declined — nothing was removed."
+		exit 3
+	fi
+	if [ "$UNINSTALL_REMOVED" -eq 0 ]; then
+		log "==> nothing needed removal — jgrep was not installed"
+	fi
 	return 0
 }
 
@@ -1039,6 +2025,7 @@ run_choice() {
 	4) opt_remote_copy upstream ;;
 	5) opt_npm_stable ;;
 	6) opt_check_only ;;
+	7) opt_uninstall ;;
 	*)
 		warn "$PROG: internal error: unknown choice '$1'."
 		exit 2
@@ -1062,7 +2049,7 @@ parse_args() {
 			;;
 		--choice)
 			if [ "$#" -lt 2 ]; then
-				usage_error "--choice requires a menu number (1-6)"
+				usage_error "--choice requires a menu number (1-7)"
 			fi
 			OPT_CHOICE="$2"
 			OPT_YES=1
@@ -1084,7 +2071,11 @@ parse_args() {
 		--target=*)
 			OPT_TARGET="${1#--target=}"
 			;;
-		[1-6])
+		uninstall)
+			OPT_CHOICE="7"
+			OPT_YES=1
+			;;
+		[1-7])
 			OPT_CHOICE="$1"
 			OPT_YES=1
 			;;
@@ -1097,8 +2088,8 @@ parse_args() {
 
 	if [ -n "$OPT_CHOICE" ]; then
 		case "$OPT_CHOICE" in
-		1 | 2 | 3 | 4 | 5 | 6) ;;
-		*) usage_error "invalid choice: '$OPT_CHOICE' (expected an integer 1-6)" ;;
+		1 | 2 | 3 | 4 | 5 | 6 | 7) ;;
+		*) usage_error "invalid choice: '$OPT_CHOICE' (expected an integer 1-7)" ;;
 		esac
 	fi
 	return 0
@@ -1108,18 +2099,18 @@ run_interactive() {
 	log ""
 	print_menu_with_markers
 	local reply=""
-	printf '%s' "Select an option [1-6, q]: "
+	printf '%s' "Select an option [1-7, q]: "
 	read -r reply || reply=""
 	case "$reply" in
 	'' | q | Q)
 		exit 0
 		;;
-	1 | 2 | 3 | 4 | 5 | 6)
+	1 | 2 | 3 | 4 | 5 | 6 | 7)
 		log ""
 		run_choice "$reply"
 		;;
 	*)
-		usage_error "unknown option: '$reply' (expected 1-6 or q)"
+		usage_error "unknown option: '$reply' (expected 1-7 or q)"
 		;;
 	esac
 	return 0
@@ -1128,13 +2119,22 @@ run_interactive() {
 main() {
 	parse_args "$@"
 
+	# fatal (exit 2) before anything else runs when --target is dangerous
+	validate_target
+
 	detect_environment
 	collect_repo_state
-	classify_current_install
+	scan_installs
+	select_current_install
 	resolve_dest_dir
 
 	# check mode: full report, zero mutation (local refs only — no fetch)
 	if [ "$MODE_CHECK" -eq 1 ] || [ "$OPT_CHOICE" = "6" ]; then
+		if [ -n "$NPM_BIN" ]; then
+			# read-only registry identity probe for the check report
+			NPM_IDENTITY_RC=0
+			npm_registry_identity_probe || NPM_IDENTITY_RC=$?
+		fi
 		log ""
 		opt_check_only
 		return 0
@@ -1154,6 +2154,12 @@ main() {
 }
 
 # cd to the script's own directory (works from any cwd), then verify the repo.
+# INVOCATION_CWD keeps the caller's cwd so relative --target paths absolutize
+# against where the user ran the script, not against the repo.
+INVOCATION_CWD="$(pwd -P)" || {
+	echo "install-dev.sh: cannot determine the current directory." >&2
+	exit 1
+}
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)" || {
 	echo "install-dev.sh: cannot locate the script directory." >&2
 	exit 1

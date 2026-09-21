@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Agent-skill install** via the vercel `skills` universal installer (`npx skills add`, every agent harness), falling back to `~/.agents/skills/jgrep`.
 - **Benchmark harness**: `bench/accuracy.ts` (SMS spam + AG News) and `bench/code_selection.ts`, with fixtures committed so runs are reproducible; executed on demand by the `workflow_dispatch` Bench workflow.
 - **Published accuracy numbers** (OpenRouter, `~typesafe/jev-latest`): SMS 0.95, AG News 0.84, code selection 1.00.
-- install-dev.sh: dev-only interactive setup script; --choice N runs menu actions unattended for headless dev boxes (not shipped in the npm package)
+- install-dev.sh: dev-only interactive setup script; --choice N runs menu actions unattended for headless dev boxes (not shipped in the npm package); detects installed type/path ([CURRENT] markers), full uninstall (npm/symlink/copy/brew-aware, identity-verified, idempotent), npm/GitHub identity pinning (jevgrep ↔ kyu1204/jgrep)
 
 ### Changed
 

@@ -330,29 +330,60 @@ bun run build     # dist/jgrep.js, plain node, deps bundled
 
 ### install-dev.sh (dev only)
 
-`install-dev.sh` is strictly a development installer for this checkout — it sets
-up a working dev environment (deps, build, tests, the global bin, the agent
-skill). **End users should not use it: install via npm (`npm i -g jevgrep`).**
+`install-dev.sh` is strictly a development installer for this checkout —
+it installs, inspects, and uninstalls every flavor of the `jgrep` bin.
+**End users should not use it: install via npm (`npm i -g jevgrep`).**
 It is never shipped in the npm package.
 
+Interactive menu (stable numbering — never renumbered):
+
 ```text
-1) Full dev setup: deps + build + tests + global jgrep bin + agent skill
-2) Install dependencies + build
-3) Run tests
-4) Install the jgrep bin globally from this checkout (npm i -g .)
-5) Remove the globally installed jgrep bin (npm -g uninstall jevgrep)
-6) Install the agent skill into your AI harnesses (vercel skills installer)
-7) Validate the agent skill (skills-ref)
-q) Quit
+[1] local dev (symlink)   build current branch, symlink <target>/jgrep -> <repo>/dist/jgrep.js
+[2] local pinned (copy)   build current branch, copy snapshot
+[3] fork main (copy)      build origin/main, copy         (fetch + git worktree in a tmpdir)
+[4] upstream main (copy)  build upstream/main, copy       (fetch + git worktree in a tmpdir)
+[5] npm stable            npm install -g jevgrep (upstream's published release)
+[6] check only            autodetect report, no mutation
+[7] uninstall jgrep       remove every detected install (npm/symlink/copy/brew-aware)
+[q] quit
 ```
 
-Run it with no arguments for the interactive menu, or pass `--choice N` to run
-one action fully unattended — no reads, no prompts, everything auto-confirmed —
-for headless dev boxes and CI-style provisioning:
+Before the menu a `current:` line reports the detected install (type, path,
+version) and the matching option is marked `[CURRENT]`; multiple installs
+produce an explicit warning. Options that cannot run right now (bun missing,
+remote mispointed) are shown as `[unavailable: …]` instead of `[AVAILABLE]`.
+
+Headless / unattended mode — `--choice N` (or a bare `N`) runs one option with
+zero prompts, everything auto-confirmed and deterministic exit codes;
+`./install-dev.sh uninstall` is an alias for `--choice 7`; `--dry-run` prints
+the would-be commands and mutates nothing; `--target DIR` installs into `DIR`
+instead of the default chain (`$(npm prefix -g)/bin` → `/usr/local/bin` →
+`~/.local/bin`); `check` prints the full autodetect report:
 
 ```sh
-./install-dev.sh --choice 1   # full setup, zero prompts
+./install-dev.sh --choice 1            # build current branch + symlink, zero prompts
+./install-dev.sh --choice 7 --dry-run  # preview the uninstall
+./install-dev.sh check                 # full report, no mutation
 ```
+
+Fool-proofing, by design:
+
+- **Identity-verified npm package** — before any `npm install`/`npm uninstall`
+  the script verifies that `jevgrep` really is this project's package
+  (`repository.url` must point at `github.com/kyu1204/jgrep`). npm also hosts
+  an **unrelated** `jgrep` package ("Recursive grep."), and the name collides
+  across GitHub — if `jevgrep` ever stops pointing at kyu1204/jgrep (takeover,
+  hijack, registry mix-up) the script refuses loudly instead of installing or
+  removing the wrong thing. No override. Options 3/4 verify the `origin`/
+  `upstream` git remotes the same way; options 1/2 verify the checkout's
+  `package.json` name.
+- **Refuses to remove files that are not jgrep** — uninstall proves each entry
+  (`--version`) before touching it, archives real files as `.bak` with a
+  revert hint, never deletes the repo's `dist/jgrep.js` through a symlink, and
+  leaves brew-owned files to `brew`.
+- **Idempotent** — installing the same build again is a no-op ("already up to
+  date"), and uninstalling with nothing installed prints "jgrep is not
+  installed — nothing to do" and exits 0.
 
 The menu numbers are a stable contract: they will never be renumbered.
 
