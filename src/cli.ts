@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import { chunkPaths, diffChunks, gitDiff, jgrep, loadCache, saveCache, resolveApiKey, USD_PER_M_INPUT, type Hit, type Kind } from "./jgrep";
 import { readRows, loadQuestions, scoreRows, flatten, toCsv } from "./rows";
+import { loadTests, selectTests } from "./tests";
 
 const VERSION = "0.3.0";
 const USAGE = `jgrep ${VERSION} — semantic grep powered by Jev (TypeSafe)
@@ -11,6 +12,7 @@ usage: jgrep init                       interactive setup (API key, agent skills
        jgrep [options] --diff [ref] "<description>"
        jgrep [options] --rows <file.csv|.jsonl> "<description>"
        jgrep [options] --rows <file> --questions <q.json> [--out scored.csv]
+       jgrep [options] --tests [ref] [--staged] [path ...]
 
   -t, --threshold <p>   print chunks with probability >= p (default 0.7)
   -C, --show            print the matching chunk body under each hit
@@ -19,6 +21,9 @@ usage: jgrep init                       interactive setup (API key, agent skills
       --diff [ref]      grep git diff hunks instead of files
                         (working tree by default, or against <ref>)
       --staged          with --diff: staged changes only
+      --tests [ref]     predictive test selection: print the test files a diff
+                        plausibly affects (working tree, or against <ref>);
+                        pipe into your runner:  bun test $(jgrep --tests origin/main)
       --rows <file>     grep rows of a CSV / JSONL file instead of code
       --questions <f>   with --rows: JSON of Jev questions (noul/choice/score)
                         asked of every row; prints the table with answer columns
@@ -42,7 +47,7 @@ const tty = process.stdout.isTTY && !process.env.NO_COLOR;
 const c = (code: string, s: string) => (tty ? `\x1b[${code}m${s}\x1b[0m` : s);
 
 export function parse(argv: string[]) {
-  const o = { threshold: 0.7, batch: 16, concurrency: 16, all: false, show: false, json: false, cache: true, diff: null as string[] | null, rows: "", questions: "", out: "" };
+  const o = { threshold: 0.7, batch: 16, concurrency: 16, all: false, show: false, json: false, cache: true, diff: null as string[] | null, rows: "", questions: "", out: "", tests: false };
   const rest: string[] = [];
   const positionalsAfter = (i: number) => argv.slice(i + 1).filter((x) => !x.startsWith("-")).length;
   for (let i = 0; i < argv.length; i++) {
@@ -58,6 +63,11 @@ export function parse(argv: string[]) {
     else if (a === "--rows") o.rows = argv[++i] ?? "";
     else if (a === "--questions") o.questions = argv[++i] ?? "";
     else if (a === "--out") o.out = argv[++i] ?? "";
+    else if (a === "--tests") {
+      o.tests = true; o.diff ??= [];
+      const next = argv[i + 1];
+      if (next && !next.startsWith("-") && !fs.existsSync(next)) o.diff.push(argv[++i]); // a ref, not a path
+    }
     else if (a === "--diff") {
       o.diff ??= [];
       // `--diff <ref>` when a ref follows and the question is still available elsewhere
@@ -76,6 +86,7 @@ export function parse(argv: string[]) {
 async function main() {
   if (process.argv[2] === "init") { const { init } = await import("./init"); return init(); }
   const o = parse(process.argv.slice(2));
+  if (o.tests) return testsMain(o);
   if (o.rows) return rowsMain(o);
   if (!o.question) { console.error(USAGE); process.exit(2); }
   const t0 = Date.now();
@@ -104,6 +115,27 @@ async function main() {
   const cost = (r.tokens * USD_PER_M_INPUT) / 1e6;
   console.error(c("90", `${r.hits.length} hits / ${r.chunks} chunks (${r.cached} cached) · ${r.tokens} tokens · $${cost.toFixed(4)} · ${((Date.now() - t0) / 1000).toFixed(1)}s`));
   process.exit(r.hits.length ? 0 : 1);
+}
+
+async function testsMain(o: ReturnType<typeof parse>) {
+  const t0 = Date.now();
+  const diff = gitDiff(o.diff ?? []);
+  if (!diff.trim()) { console.error("empty diff"); process.exit(1); }
+  const paths = [o.question, ...o.paths].filter((p): p is string => !!p);
+  const tests = loadTests(paths.length ? paths : ["."]);
+  if (!tests.length) { console.error("no test files found"); process.exit(1); }
+  const threshold = o.threshold === 0.7 ? 0.5 : o.threshold; // recall matters more here
+  const cache = o.cache ? loadCache() : {};
+  const r = await selectTests(diff, tests, { ...o, threshold, apiKey: resolveApiKey(), cache,
+    onProgress: (d, n) => { if (process.stderr.isTTY) process.stderr.write(`\r${d}/${n} requests`); } });
+  if (o.cache) saveCache(cache);
+  if (process.stderr.isTTY) process.stderr.write("\r\x1b[K");
+  const rows = o.all ? [...r.all].sort((a, b) => b.p - a.p) : r.selected;
+  if (o.json) console.log(JSON.stringify(rows, null, 2));
+  else for (const s of rows) console.log(o.all || process.stdout.isTTY ? `${s.file}${c("90", `  p=${s.p.toFixed(2)} ${s.reason}`)}` : s.file);
+  const cost = (r.tokens * USD_PER_M_INPUT) / 1e6;
+  console.error(c("90", `${r.selected.length} of ${tests.length} tests selected (${r.all.filter((s) => s.reason === "direct" || s.reason === "import").length} by name/import, ${r.cached} cached) · ${r.requests} requests · ${r.tokens} tokens · $${cost.toFixed(4)} · ${((Date.now() - t0) / 1000).toFixed(1)}s`));
+  process.exit(r.selected.length ? 0 : 1);
 }
 
 async function rowsMain(o: ReturnType<typeof parse>) {

@@ -70,6 +70,12 @@ jgrep --diff --staged "changes behavior without a corresponding test change"
 jgrep --diff --staged "adds an endpoint or handler with no input validation"
 ```
 
+## Which tests to run for a change
+
+`jgrep --tests [ref]` prints the test files a diff plausibly affects (by name, by
+import graph, then by Jev). Use it before running a large suite:
+`jgrep --tests origin/main | xargs <runner>`; run the full suite afterwards.
+
 ## Tables, not code
 
 `jgrep --rows data.csv "<description>"` treats every row as a chunk and prints
