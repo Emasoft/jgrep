@@ -68,6 +68,7 @@ export async function runPool<T, R>(
   let stopped = false; // no new dispatches; in-flight items still finish
   let aborted = false; // the circuit breaker tripped
   let hadSuccess = false;
+  let rejected = false; // a failFast error is propagating: late settlements mutate nothing
   const results: R[] = [];
   const errors: PoolResult<R>["errors"] = [];
 
@@ -78,30 +79,39 @@ export async function runPool<T, R>(
       const index = next++;
       try {
         const r = await worker(items[index], index);
-        results.push(r); // completion order, not item order
-        hadSuccess = true;
-        consecutiveFatal = 0; // any success resets the breaker counter
+        if (!rejected) {
+          results.push(r); // completion order, not item order
+          hadSuccess = true;
+          consecutiveFatal = 0; // any success resets the breaker counter
+        }
       } catch (e) {
         const err = e instanceof JevProviderError ? e : wrapUnknown(e);
-        errors.push({ index, error: err });
-        if (isFatalError(err)) {
-          consecutiveFatal++;
-          if (opts.failFast) {
-            // The original error propagates out of Promise.all immediately.
-            // In-flight workers are NOT cancelled: they finish their current item
-            // (results discarded — nobody observes them) and dispatch nothing new.
-            stopped = true;
-            throw err;
-          }
-          if (consecutiveFatal >= threshold) {
-            // Breaker tripped: in-flight items finish (they were attempted, so they
-            // never count as unprocessed); only undispatched items do.
-            aborted = true;
-            stopped = true;
+        if (!rejected) {
+          errors.push({ index, error: err });
+          if (isFatalError(err)) {
+            consecutiveFatal++;
+            if (opts.failFast) {
+              // The original error propagates out of Promise.all immediately.
+              // In-flight workers are NOT cancelled: they finish their current item
+              // (results discarded — nobody observes them) and dispatch nothing new.
+              // `rejected` guards the settlement tail so a late in-flight settlement
+              // cannot mutate results/errors/consecutiveFatal, refire onProgress, or
+              // throw again (a second throw after Promise.all settled would surface
+              // as an unhandled rejection).
+              stopped = true;
+              rejected = true;
+              throw err;
+            }
+            if (consecutiveFatal >= threshold) {
+              // Breaker tripped: in-flight items finish (they were attempted, so they
+              // never count as unprocessed); only undispatched items do.
+              aborted = true;
+              stopped = true;
+            }
           }
         }
       }
-      opts.onProgress?.(++done, total);
+      if (!rejected) opts.onProgress?.(++done, total);
     }
   };
 
