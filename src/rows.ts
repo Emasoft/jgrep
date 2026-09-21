@@ -92,7 +92,7 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
   const worker = async () => {
     while (next < batches.length) {
       const b = batches[next++];
-      const res = await postSystemOne(buildRowsRequest(b.map((i) => rows[i]), questions), o.apiKey, f);
+      const res = await postSystemOne(buildRowsRequest(b.map((i) => rows[i]), questions), o.apiKey, { fetchImpl: f });
       tokens += res.usage?.input_tokens ?? 0;
       b.forEach((ri, j) => {
         const a: Record<string, Answer> = {};

@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { postSystemOne } from "./providers";
 
 export const ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 export const MODEL = "jev-latest";
@@ -127,25 +128,13 @@ export function buildRequest(question: string, chunks: Chunk[], kind: Kind = "co
 
 export type Fetch = typeof fetch;
 
-/** POST one System One request with retries on 429/5xx. */
-export async function postSystemOne(body: unknown, apiKey: string, f: Fetch = fetch): Promise<{ answers: Record<string, any>; usage?: { input_tokens: number } }> {
-  const json = JSON.stringify(body);
-  for (let attempt = 0; ; attempt++) {
-    const res = await f(ENDPOINT, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: json,
-      signal: AbortSignal.timeout(30_000),
-    });
-    if (res.ok) return (await res.json()) as any;
-    if ((res.status === 429 || res.status >= 500) && attempt < 3) { await new Promise((r) => setTimeout(r, 500 * 2 ** attempt)); continue; }
-    if (res.status === 401) throw new Error("TypeSafe API rejected the key (401). Check TYPESAFE_API_KEY.");
-    throw new Error(`TypeSafe API ${res.status}: ${(await res.text()).slice(0, 300)}`);
-  }
-}
+// postSystemOne moved to ./providers — the retry engine now has per-attempt abort
+// timeouts, a batch deadline that includes retries, Retry-After-aware full-jitter
+// backoff and typed JevProviderErrors. Re-exported so ./rows keeps importing it from here.
+export { postSystemOne };
 
 async function ask(question: string, chunks: Chunk[], kind: Kind, apiKey: string, f: Fetch): Promise<{ ps: number[]; tokens: number }> {
-  const json = await postSystemOne(buildRequest(question, chunks, kind), apiKey, f);
+  const json = await postSystemOne(buildRequest(question, chunks, kind), apiKey, { fetchImpl: f });
   return { ps: chunks.map((_, i) => json.answers[`c${i}`]?.noul ?? NaN), tokens: json.usage?.input_tokens ?? 0 };
 }
 
