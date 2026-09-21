@@ -328,6 +328,34 @@ bun test src/     # unit tests, no network
 bun run build     # dist/jgrep.js, plain node, deps bundled
 ```
 
+### install-dev.sh (dev only)
+
+`install-dev.sh` is strictly a development installer for this checkout — it sets
+up a working dev environment (deps, build, tests, the global bin, the agent
+skill). **End users should not use it: install via npm (`npm i -g jevgrep`).**
+It is never shipped in the npm package.
+
+```text
+1) Full dev setup: deps + build + tests + global jgrep bin + agent skill
+2) Install dependencies + build
+3) Run tests
+4) Install the jgrep bin globally from this checkout (npm i -g .)
+5) Remove the globally installed jgrep bin (npm -g uninstall jevgrep)
+6) Install the agent skill into your AI harnesses (vercel skills installer)
+7) Validate the agent skill (skills-ref)
+q) Quit
+```
+
+Run it with no arguments for the interactive menu, or pass `--choice N` to run
+one action fully unattended — no reads, no prompts, everything auto-confirmed —
+for headless dev boxes and CI-style provisioning:
+
+```sh
+./install-dev.sh --choice 1   # full setup, zero prompts
+```
+
+The menu numbers are a stable contract: they will never be renumbered.
+
 If jgrep saved you a file-hunting session, a ⭐ on GitHub is the best thanks.
 
 MIT
