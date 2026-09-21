@@ -2,13 +2,29 @@
 // breaker, failFast, cache persistence on partial failure, cost passthrough,
 // rate limiting — exercised through jgrep()/scoreRows() with the repo's
 // fake-fetch DI pattern. Every run passes an explicit apiKey so the lazy key
-// resolver never touches the filesystem or env.
+// resolver never touches the filesystem or env. The rows CLI-surface tests at
+// the end run the real entrypoint as a subprocess: exit codes and --out file
+// writing live in rowsMain, which is not exported.
 // @ts-expect-error — no bun-types in this zero-dep repo; Bun provides bun:test at runtime
 import { test, expect } from "bun:test";
+// @ts-expect-error — no @types/node in this zero-dep Bun-only repo; the surface used is trivial
+import * as fs from "node:fs";
+// @ts-expect-error — no @types/node in this zero-dep Bun-only repo
+import * as os from "node:os";
+// @ts-expect-error — no @types/node in this zero-dep Bun-only repo
+import * as path from "node:path";
 import { JevProviderError } from "./errors";
 import type { Fetch } from "./providers";
 import { jgrep, type Chunk } from "./jgrep";
-import { scoreRows, type Questions, type Row } from "./rows";
+import { flattenAnswers, scoreRows, type Questions, type Row } from "./rows";
+
+declare const Bun: {
+  spawnSync(cmd: string[], opts?: { env?: Record<string, string | undefined> }): {
+    exitCode: number | null;
+    stdout: { toString(): string };
+    stderr: { toString(): string };
+  };
+};
 
 // ---- fakes -------------------------------------------------------------------
 
@@ -240,8 +256,8 @@ test("rows: a failed pack yields RowErrors; other rows still answered and cached
   expect(r.errors.every((e) => e.kind === "server_unreachable")).toBe(true);
   expect(r.answers[0]?.match?.noul).toBe(0.9);
   expect(r.answers[1]?.match?.noul).toBe(0.9);
-  expect(r.answers[2]).toBeUndefined(); // errored rows are not answered
-  expect(r.answers[3]).toBeUndefined();
+  expect(r.answers[2]).toBeNull(); // errored rows are not answered (null, never a hole)
+  expect(r.answers[3]).toBeNull();
   expect(Object.keys(cache)).toHaveLength(2); // complete rows cached, errored rows not
 });
 
@@ -258,3 +274,68 @@ test("rows back-compat: a clean run reports errors: [] with unchanged answers", 
   expect(r.answers[0]?.match?.noul).toBe(0.9);
   expect(r.answers[1]?.match?.noul).toBe(0.9);
 });
+
+// ---- rows: dense answers on partial failure ------------------------------------
+// `answers` used to be a holey array (errored rows unset), so rowsMain's
+// `r.answers.map(flatten)` skipped the holes and `Number(flat[i].match)` threw a
+// TypeError on the desynced index. Errored rows are null now — dense, aligned.
+
+test("rows: a partial failure leaves a DENSE answers array; flattenAnswers maps without throwing", async () => {
+  const rows: Row[] = [{ handle: "@a" }, { handle: "@b" }, { handle: "@c" }, { handle: "@d" }];
+  const questions: Questions = { match: { type: "noul", instructions: "q" } };
+  const fetchImpl = (async (_url: unknown, init: { body: string }) => {
+    const body = JSON.parse(init.body);
+    // The second pack carries row @c (row ids are pack-local: r0..rN).
+    if (body.state.rows.some((r: any) => r.handle === "@c")) return new Response("boom", { status: 500 });
+    const answers: Record<string, unknown> = {};
+    for (const r of body.state.rows) answers[`${r.id}.match`] = { type: "noul", noul: 0.9 };
+    return new Response(JSON.stringify({ answers, usage: { input_tokens: 5 } }), { status: 200 });
+  }) as unknown as Fetch;
+  const r = await scoreRows(rows, questions, { batch: 2, concurrency: 2, maxRetries: 0, apiKey: "k", fetchImpl, cache: {} });
+
+  expect(r.errors.map((e) => e.row).sort((a, b) => a - b)).toEqual([2, 3]);
+  // dense, not holey: Object.keys() counts every index once each index is owned
+  expect(r.answers.length).toBe(4);
+  expect(Object.keys(r.answers).length).toBe(4);
+
+  // rowsMain-equivalent flatten mapping: total, position-aligned, never throws
+  const flat = flattenAnswers(r);
+  expect(flat.length).toBe(4);
+  expect(Object.keys(flat).length).toBe(4);
+  expect(flat[0]).toEqual({ match: 0.9 });
+  expect(flat[1]).toEqual({ match: 0.9 });
+  expect(flat[2]).toBeNull();
+  expect(flat[3]).toBeNull();
+  // the single-description mapping that used to crash on holes (`Number(flat[i].match)`
+  // with flat[i] undefined) is safe now: errored rows map to NaN and get skipped
+  const ps = rows.map((_, i) => Number(flat[i]?.match ?? NaN));
+  expect(ps.filter(Number.isFinite)).toEqual([0.9, 0.9]);
+});
+
+// ---- rows CLI surface (subprocess): exit code + --out truthfulness ---------------
+// rowsMain is not exported, so exit-code and --out behavior run the real entrypoint.
+// The gateway URL points at an unroutable loopback port: connection-refused is
+// instant, needs no server and no network, and every row errors — exercising the
+// partial-failure exit path (2, same rule as code mode) and the --json --out write.
+
+test("cli main rows: --json --out writes the file and an errored run exits 2", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-rows-"));
+  try {
+    const csv = path.join(dir, "rows.csv");
+    fs.writeFileSync(csv, "handle\n@a\n@b\n@c\n@d\n");
+    const out = path.join(dir, "out.json");
+    const p = Bun.spawnSync(
+      ["bun", "src/cli.ts", "--rows", csv, "beauty?", "--api", "gateway", "--retries", "0", "--timeout", "1", "--no-cache", "--json", "--out", out],
+      { env: { ...process.env, JGREP_NO_MAIN: "", JEV_GATEWAY_URL: "http://127.0.0.1:1/v1/systemone", JEV_GATEWAY_API_KEY: "test-key" } },
+    );
+    expect(p.exitCode).toBe(2); // any row errored -> 2 (used to fall through to 0)
+    expect(p.stderr.toString()).toContain("server_unreachable");
+    expect(p.stderr.toString()).toContain(`wrote ${out}`); // written for real, not just claimed
+    const parsed = JSON.parse(fs.readFileSync(out, "utf8"));
+    expect(parsed.answers).toEqual([]); // no row survived, none is shown
+    expect(parsed.errors).toHaveLength(4);
+    expect(parsed.errors.every((e: { kind: string }) => e.kind === "server_unreachable")).toBe(true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}, 15_000);

@@ -88,7 +88,9 @@ export interface RowsOptions {
 }
 
 export interface RowError { row: number; kind: JevErrorKind; message: string }
-export interface RowsResult { answers: Record<string, Answer>[]; tokens: number; cached: number; requests: number; errors: RowError[]; cost?: number }
+/** answers is position-aligned with the input rows and DENSE: an errored row maps to null,
+ *  never a hole (a holey array would desync `map` consumers from the row indices). */
+export interface RowsResult { answers: (Record<string, Answer> | null)[]; tokens: number; cached: number; requests: number; errors: RowError[]; cost?: number }
 
 /** One request-pack's outcome; runPool results are completion-ordered, so the pack
  *  index rides along and `answers` is re-associated after the pool settles. */
@@ -104,7 +106,7 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
   // once at the first request so fully-cached runs and tests never touch the filesystem.
   let apiKey = o.apiKey;
   const apiKeyOf = (): string => { apiKey ??= resolveApiKey(backend); return apiKey; };
-  const answers: Record<string, Answer>[] = new Array(rows.length); // errored rows stay unset
+  const answers: (Record<string, Answer> | null)[] = new Array(rows.length).fill(null); // errored rows stay null — dense, never holes
   const todo: number[] = [];
   rows.forEach((r, i) => { const hit = cache[key(model, qJson, r)]; if (hit) answers[i] = hit; else todo.push(i); });
   const per = Math.max(1, Math.min(o.batch, Math.floor(MAX_QUESTIONS_PER_REQUEST / Object.keys(questions).length)));
@@ -194,6 +196,13 @@ export function flatten(a: Record<string, Answer>): Record<string, string | numb
   return out;
 }
 const round = (n: unknown) => (typeof n === "number" ? Math.round(n * 100) / 100 : "");
+
+/** flatten() across a whole RowsResult, position-aligned with the input rows: an errored
+ *  row has no answer record and maps to null. The output is DENSE (no holes), so the
+ *  rowsMain-style mapping `Number(flat[i]?.match)` can never hit a skipped index. */
+export function flattenAnswers(result: RowsResult): (Record<string, string | number> | null)[] {
+  return result.answers.map((a) => (a ? flatten(a) : null));
+}
 
 export function toCsv(columns: string[], rows: Record<string, unknown>[]): string {
   const esc = (v: unknown) => { const s = v == null ? "" : String(v); return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };

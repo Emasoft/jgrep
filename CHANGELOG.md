@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **BREAKING**: `--json` is an object now — `{"hits":[…],"errors":[…]}` (rows mode: `{"answers":[…],"errors":[…]}`); it was a bare array.
 - Cache keys are model-scoped: queries against a different model (openrouter's `~typesafe/jev-latest`, any `--model` override) get their own entries and re-bill once on the first run.
-- Rows and agent-skill docs updated; the bundled `skill/SKILL.md` is rewritten around the v0.4 flags with the full `--help` screen embedded.
+- Rows and agent-skill docs updated; the bundled `skills/jgrep/SKILL.md` is rewritten around the v0.4 flags with the full `--help` screen embedded.
 
 ### Fixed
 

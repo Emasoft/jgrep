@@ -2,7 +2,7 @@
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo; the surface used is trivial
 import fs from "node:fs";
 import { chunkPaths, diffChunks, gitDiff, jgrep, loadCache, saveCache, type Hit, type Kind } from "./jgrep";
-import { readRows, loadQuestions, scoreRows, flatten, toCsv } from "./rows";
+import { readRows, loadQuestions, scoreRows, flattenAnswers, toCsv } from "./rows";
 import { resolveApiKey, resolvePricePerMtok, resolveProvider, verifyApiKey, type Backend } from "./providers";
 import { JevProviderError } from "./errors";
 
@@ -228,26 +228,29 @@ async function rowsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
     });
     if (process.stderr.isTTY) process.stderr.write("\r\x1b[K");
 
-    const flat = r.answers.map(flatten);
+    const flat = flattenAnswers(r); // dense: errored rows are null, never holes
     let hits = rows.length;
+    // --out truthfulness: `wrote` only when a file actually landed (a --json --out run
+    // used to print `wrote <out>` while the JSON only ever reached stdout).
+    let wrote = false;
+    const writeOut = (text: string) => { if (o.out) { fs.writeFileSync(o.out, text); wrote = true; } else console.log(text); };
     // Breaking (documented): rows --json is an object now, symmetric with code mode.
     const jsonErrors = r.errors.map((e) => ({ row: e.row, kind: e.kind, message: e.message }));
     if (o.questions) {
-      const qCols = [...new Set(flat.flatMap((f) => Object.keys(f)))];
-      const table = rows.map((row, i) => ({ ...row, ...flat[i] }));
-      if (o.json) {
-        const text = JSON.stringify({ answers: table, errors: jsonErrors }, null, 2);
-        if (o.out) fs.writeFileSync(o.out, text); else console.log(text);
-      }
-      else if (o.out) fs.writeFileSync(o.out, toCsv([...columns, ...qCols], table));
+      const qCols = [...new Set(flat.flatMap((f) => Object.keys(f ?? {})))];
+      const table = rows.map((row, i) => ({ ...row, ...(flat[i] ?? {}) }));
+      if (o.json) writeOut(JSON.stringify({ answers: table, errors: jsonErrors }, null, 2));
+      else if (o.out) { fs.writeFileSync(o.out, toCsv([...columns, ...qCols], table)); wrote = true; }
       else process.stdout.write(toCsv([...columns, ...qCols], table));
     } else {
       // single description: grep-style hits, like the code mode
-      const scored = rows.map((row, i) => ({ row, i, p: Number(flat[i].match) }));
+      const scored = rows
+        .map((row, i) => ({ row, i, p: Number(flat[i]?.match ?? NaN) }))
+        .filter((s) => Number.isFinite(s.p)); // errored rows carry no usable match: skipped, never a TypeError
       const shown = o.all ? [...scored].sort((a, b) => b.p - a.p) : scored.filter((s) => s.p >= o.threshold);
       hits = scored.filter((s) => s.p >= o.threshold).length;
-      if (o.json) console.log(JSON.stringify({ answers: shown.map((s) => ({ row: s.i + 2, p: s.p, ...s.row })), errors: jsonErrors }, null, 2));
-      else for (const s of shown) {
+      if (o.json) writeOut(JSON.stringify({ answers: shown.map((s) => ({ row: s.i + 2, p: s.p, ...s.row })), errors: jsonErrors }, null, 2));
+      if (!o.json || o.out) for (const s of shown) { // with --json --out the JSON went to the file; stdout keeps the pretty hits
         const preview = Object.values(s.row).filter(Boolean).join(" | ").slice(0, 90);
         const pcol = s.p >= o.threshold ? "32" : "90";
         console.log(`${c("35", o.rows)}${c("36", ":")}${c("32", String(s.i + 2))}  ${c(pcol, `p=${s.p.toFixed(2)}`)}  ${preview}`);
@@ -257,8 +260,9 @@ async function rowsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
     const summary = `${o.questions ? Object.keys(questions).length + " questions x " : hits + " hits / "}${rows.length} rows (${r.cached} cached) · ${r.requests} requests · ${r.tokens} tokens · $${cost.toFixed(4)} · ${((Date.now() - t0) / 1000).toFixed(1)}s`;
     console.error(c("90", r.errors.length ? summary + erroredSuffix(r.errors) : summary));
     printExamples(r.errors.map((e) => `  ${e.kind}: row ${e.row} ${e.message.slice(0, 120)}`));
-    if (o.out) console.error(c("90", `wrote ${o.out}`));
-    process.exitCode = o.questions || hits ? 0 : 1;
+    if (wrote) console.error(c("90", `wrote ${o.out}`));
+    // grep semantics when clean; 2 when any row errored (partial failure) — same rule as code mode.
+    process.exitCode = r.errors.length > 0 ? 2 : (o.questions || hits ? 0 : 1);
   } finally {
     // Same rule as code mode: save on success, partial failure, breaker abort and
     // --fail-fast throw; --no-cache still skips.

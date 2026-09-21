@@ -3,3 +3,4 @@ dist/
 .env
 *.tgz
 bench/results/
+.DS_Store
