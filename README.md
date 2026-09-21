@@ -50,6 +50,16 @@ via the vercel `skills` installer). Get a key at
 [console.typesafe.ai](https://console.typesafe.ai) or
 [openrouter.ai/keys](https://openrouter.ai/keys).
 
+Install this fork from source:
+
+```sh
+git clone https://github.com/Emasoft/jgrep && cd jgrep
+bun install && bun run build
+npm i -g .        # installs the `jgrep` bin from this folder, no npm release needed
+```
+
+the published `jevgrep` package on npm belongs to the upstream project — installing from source avoids any version collision with it.
+
 <details>
 <summary>Prefer not to run init?</summary>
 
