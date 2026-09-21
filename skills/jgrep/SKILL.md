@@ -82,7 +82,8 @@ Do not use it for exact identifiers, strings, or paths. `rg` is free and instant
 jgrep "description" src/                 # hits with p >= 0.7, file order
 jgrep -t 0.85 "description" src/         # fewer, higher-precision hits
 jgrep -C "description" src/              # print the matching chunk bodies
-jgrep --json "description" src/          # {"hits":[...],"errors":[...]}
+jgrep --json "description" src/          # hits as a JSON array: [{file,start,end,p,text}]
+jgrep --json-errors "description" src/   # object instead: {hits:[...], errors:[...]}
 jgrep -a -t 0 "description" src/ | head  # everything, best first (when 0 hits)
 jgrep --diff --staged "rule"             # lint your staged change
 jgrep --diff origin/main "rule"          # lint the branch against main
@@ -105,10 +106,12 @@ usage: jgrep init                       interactive setup (API key, agent skills
   -t, --threshold <p>   print chunks with probability >= p (default 0.7)
   -C, --show            print the matching chunk body under each hit
   -a, --all             print every chunk with its probability, best first
-      --json            machine-readable output: {"hits":[...],"errors":[...]}
-                        rows mode: {"answers":[...],"errors":[...]}
-                        (v0.4 breaking change: was a bare array; errors carry
-                        {file,start,end,kind,message} / rows {row,kind,message})
+      --json            machine-readable output: hits as a JSON array
+                        (v0.3.0-compatible: [{file,start,end,p,text}]; rows:
+                        [flattened answer objects, null for errored rows])
+      --json-errors     with --json: a JSON object instead — code mode
+                        {hits:[...], errors:[{file,start,end,kind,message}]};
+                        rows mode {answers:[...], errors:[{row,kind,message}]}
       --diff [ref]      grep git diff hunks instead of files
                         (working tree by default, or against <ref>)
       --staged          with --diff: staged changes only
@@ -116,7 +119,7 @@ usage: jgrep init                       interactive setup (API key, agent skills
       --questions <f>   with --rows: JSON of Jev questions (noul/choice/score)
                         asked of every row; prints the table with answer columns
       --out <file>      with --questions: write the CSV here instead of stdout
-                        (with --json: the JSON object goes to the file)
+                        (with --json: the JSON output goes to the file)
   -b, --batch <n>       chunks per request (default 16)
   -c, --concurrency <n> parallel requests (default 16)
       --api <name>      provider: typesafe | openrouter | gateway
@@ -187,9 +190,9 @@ jgrep --diff --staged "adds an endpoint or handler with no input validation"
 `jgrep --rows data.csv "<description>"` treats every row as a chunk and prints
 matching rows. With `--questions q.json` (a JSON object of Jev questions:
 `{name: {type: noul|choice|score, instructions, criteria?}}`) it writes the
-table back with one answer column per question (`--out scored.csv` or
-`--json`). Use it to label, triage or filter a list of records instead of
-reading them one by one.
+table back with one answer column per question (`--out scored.csv`, or
+`--json` for the flattened answer array). Use it to label, triage or filter a
+list of records instead of reading them one by one.
 
 ## Examples
 
@@ -279,7 +282,8 @@ list of ranges instead of whole files. On a 115 KB module the agent read
 
 ```bash
 jgrep init                   # installs this skill into your AI agents (every harness)
-jgrep --json "spawns a child process" src/ | jq '.hits[].file'
+jgrep --json "spawns a child process" src/ | jq '.[].file'             # bare array (v0.3.0 shape)
+jgrep --json-errors "spawns a child process" src/ | jq '.hits[].file'  # opt-in object, errors included
 ```
 
 `jgrep init` installs this skill via the vercel `skills` installer into every
@@ -295,7 +299,7 @@ jgrep -t 0.9 "locks a mutex but may return without releasing it" src/   # subtle
 jgrep -C "reads an env var and falls back to a default" bin/            # chunk bodies under each hit
 jgrep --diff origin/main "introduces an N+1 query in a loop" backend/   # review a whole branch
 jgrep --rows users.csv "account is likely a bot" --out bots.csv         # score rows into a file
-jgrep --json "uses eval on user input" . | jq '.hits[0].file'           # first hit, machine-readable
+jgrep --json "uses eval on user input" . | jq '.[0].file'               # first hit, machine-readable
 jgrep -a -t 0.3 "handles timezone conversions" lib/ | head -20          # wide net, best first
 ```
 
@@ -311,8 +315,9 @@ jgrep -a -t 0.3 "handles timezone conversions" lib/ | head -20          # wide n
    Answers are cached by `(model, question, chunk)` in `~/.cache/jgrep/` —
    model-scoped keys (a different model re-judges), so a re-run is free.
 
-A failed batch is retried, then reported in `errors[]` while the run continues:
-partial results still print; the stderr summary gains `· K errored (kinds)`.
+A failed batch is retried, then reported on stderr (and in `errors[]` under
+`--json-errors`) while the run continues: partial results still print; the
+stderr summary gains `· K errored (kinds)`.
 
 ## Requirements
 

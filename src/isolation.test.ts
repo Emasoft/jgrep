@@ -316,23 +316,24 @@ test("rows: a partial failure leaves a DENSE answers array; flattenAnswers maps 
 // rowsMain is not exported, so exit-code and --out behavior run the real entrypoint.
 // The gateway URL points at an unroutable loopback port: connection-refused is
 // instant, needs no server and no network, and every row errors — exercising the
-// partial-failure exit path (2, same rule as code mode) and the --json --out write.
+// partial-failure exit path (2, same rule as code mode) and the --json-errors --out
+// write (the opt-in object shape; --json alone writes the bare array).
 
-test("cli main rows: --json --out writes the file and an errored run exits 2", () => {
+test("cli main rows: --json-errors --out writes the file and an errored run exits 2", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-rows-"));
   try {
     const csv = path.join(dir, "rows.csv");
     fs.writeFileSync(csv, "handle\n@a\n@b\n@c\n@d\n");
     const out = path.join(dir, "out.json");
     const p = Bun.spawnSync(
-      ["bun", "src/cli.ts", "--rows", csv, "beauty?", "--api", "gateway", "--retries", "0", "--timeout", "1", "--no-cache", "--json", "--out", out],
+      ["bun", "src/cli.ts", "--rows", csv, "beauty?", "--api", "gateway", "--retries", "0", "--timeout", "1", "--no-cache", "--json-errors", "--out", out],
       { env: { ...process.env, JGREP_NO_MAIN: "", JEV_GATEWAY_URL: "http://127.0.0.1:1/v1/systemone", JEV_GATEWAY_API_KEY: "test-key" } },
     );
     expect(p.exitCode).toBe(2); // any row errored -> 2 (used to fall through to 0)
     expect(p.stderr.toString()).toContain("server_unreachable");
     expect(p.stderr.toString()).toContain(`wrote ${out}`); // written for real, not just claimed
     const parsed = JSON.parse(fs.readFileSync(out, "utf8"));
-    expect(parsed.answers).toEqual([]); // no row survived, none is shown
+    expect(parsed.answers).toEqual([null, null, null, null]); // position-aligned: every row errored -> null entries
     expect(parsed.errors).toHaveLength(4);
     expect(parsed.errors.every((e: { kind: string }) => e.kind === "server_unreachable")).toBe(true);
   } finally {

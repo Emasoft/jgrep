@@ -30,10 +30,12 @@ usage: jgrep init                       interactive setup (API key, agent skills
   -t, --threshold <p>   print chunks with probability >= p (default 0.7)
   -C, --show            print the matching chunk body under each hit
   -a, --all             print every chunk with its probability, best first
-      --json            machine-readable output: {"hits":[...],"errors":[...]}
-                        rows mode: {"answers":[...],"errors":[...]}
-                        (v0.4 breaking change: was a bare array; errors carry
-                        {file,start,end,kind,message} / rows {row,kind,message})
+      --json            machine-readable output: hits as a JSON array
+                        (v0.3.0-compatible: [{file,start,end,p,text}]; rows:
+                        [flattened answer objects, null for errored rows])
+      --json-errors     with --json: a JSON object instead — code mode
+                        {hits:[...], errors:[{file,start,end,kind,message}]};
+                        rows mode {answers:[...], errors:[{row,kind,message}]}
       --diff [ref]      grep git diff hunks instead of files
                         (working tree by default, or against <ref>)
       --staged          with --diff: staged changes only
@@ -41,7 +43,7 @@ usage: jgrep init                       interactive setup (API key, agent skills
       --questions <f>   with --rows: JSON of Jev questions (noul/choice/score)
                         asked of every row; prints the table with answer columns
       --out <file>      with --questions: write the CSV here instead of stdout
-                        (with --json: the JSON object goes to the file)
+                        (with --json: the JSON output goes to the file)
   -b, --batch <n>       chunks per request (default 16)
   -c, --concurrency <n> parallel requests (default 16)
       --api <name>      provider: typesafe | openrouter | gateway
@@ -75,7 +77,7 @@ const c = (code: string, s: string) => (tty ? `\x1b[${code}m${s}\x1b[0m` : s);
 
 export function parse(argv: string[]) {
   const o = {
-    threshold: 0.7, batch: 16, concurrency: 16, all: false, show: false, json: false, cache: true,
+    threshold: 0.7, batch: 16, concurrency: 16, all: false, show: false, json: false, jsonErrors: false, cache: true,
     diff: null as string[] | null, rows: "", questions: "", out: "",
     api: "", model: "", timeout: 15, requestTimeout: 30, retries: 4, rate: 0, failFast: false, noProbe: false,
   };
@@ -89,6 +91,7 @@ export function parse(argv: string[]) {
     else if (a === "-a" || a === "--all") o.all = true;
     else if (a === "-C" || a === "--show") o.show = true;
     else if (a === "--json") o.json = true;
+    else if (a === "--json-errors") { o.jsonErrors = true; o.json = true; } // implies --json
     else if (a === "--no-cache") o.cache = false;
     else if (a === "--api") o.api = argv[++i] ?? "";
     else if (a === "--model") o.model = argv[++i] ?? "";
@@ -188,11 +191,15 @@ async function main() {
 
     const rows: Hit[] = o.all ? [...r.all].sort((a, b) => b.p - a.p) : r.hits;
     if (o.json) {
-      // Breaking (documented): --json is an object now so chunk errors fit next to the hits.
-      console.log(JSON.stringify({
-        hits: rows.map((h) => ({ file: h.file, start: h.start, end: h.end, p: h.p, text: h.text })),
-        errors: r.errors.map((e) => ({ file: e.file, start: e.start, end: e.end, kind: e.kind, message: e.message })),
-      }, null, 2));
+      // Backward-compatible (the upstream v0.3.0 contract): --json is the bare hit
+      // array, byte-for-byte the old shape. Errored chunks never enter it (they
+      // never enter all/hits) and surface via the stderr summary + exit 2;
+      // --json-errors opts into the object so chunk errors sit next to the hits.
+      const hits = rows.map((h) => ({ file: h.file, start: h.start, end: h.end, p: h.p, text: h.text }));
+      const payload = o.jsonErrors
+        ? { hits, errors: r.errors.map((e) => ({ file: e.file, start: e.start, end: e.end, kind: e.kind, message: e.message })) }
+        : hits;
+      console.log(JSON.stringify(payload, null, 2));
     } else {
       for (const h of rows) {
         const head = h.text.split("\n").find((l) => l.trim() && !l.startsWith("@@"))?.trim().slice(0, 90) ?? "";
@@ -234,12 +241,18 @@ async function rowsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
     // used to print `wrote <out>` while the JSON only ever reached stdout).
     let wrote = false;
     const writeOut = (text: string) => { if (o.out) { fs.writeFileSync(o.out, text); wrote = true; } else console.log(text); };
-    // Breaking (documented): rows --json is an object now, symmetric with code mode.
     const jsonErrors = r.errors.map((e) => ({ row: e.row, kind: e.kind, message: e.message }));
+    // Backward-compatible (v0.3.0 contract) rows output: --json is the bare,
+    // position-aligned array of flattened rows — an errored row is a null entry,
+    // never a hole (honest and position-stable); --json-errors opts into the
+    // object with the row errors alongside.
+    const payload = o.jsonErrors
+      ? { answers: flat, errors: jsonErrors }
+      : flat;
     if (o.questions) {
       const qCols = [...new Set(flat.flatMap((f) => Object.keys(f ?? {})))];
       const table = rows.map((row, i) => ({ ...row, ...(flat[i] ?? {}) }));
-      if (o.json) writeOut(JSON.stringify({ answers: table, errors: jsonErrors }, null, 2));
+      if (o.json) writeOut(JSON.stringify(payload, null, 2));
       else if (o.out) { fs.writeFileSync(o.out, toCsv([...columns, ...qCols], table)); wrote = true; }
       else process.stdout.write(toCsv([...columns, ...qCols], table));
     } else {
@@ -249,7 +262,7 @@ async function rowsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
         .filter((s) => Number.isFinite(s.p)); // errored rows carry no usable match: skipped, never a TypeError
       const shown = o.all ? [...scored].sort((a, b) => b.p - a.p) : scored.filter((s) => s.p >= o.threshold);
       hits = scored.filter((s) => s.p >= o.threshold).length;
-      if (o.json) writeOut(JSON.stringify({ answers: shown.map((s) => ({ row: s.i + 2, p: s.p, ...s.row })), errors: jsonErrors }, null, 2));
+      if (o.json) writeOut(JSON.stringify(payload, null, 2));
       if (!o.json || o.out) for (const s of shown) { // with --json --out the JSON went to the file; stdout keeps the pretty hits
         const preview = Object.values(s.row).filter(Boolean).join(" | ").slice(0, 90);
         const pcol = s.p >= o.threshold ? "32" : "90";

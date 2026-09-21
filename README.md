@@ -167,7 +167,8 @@ list of ranges instead of whole files. On a 115 KB module the agent read
 
 ```bash
 jgrep init                   # offers installing the skill into your AI agents
-jgrep --json "spawns a child process" src/ | jq '.hits[].file'
+jgrep --json "spawns a child process" src/ | jq '.[].file'             # bare array (v0.3.0 shape)
+jgrep --json-errors "spawns a child process" src/ | jq '.hits[].file'  # opt-in object, errors included
 ```
 
 `jgrep init` installs the skill into every agent-skills harness (Claude Code,
@@ -219,9 +220,15 @@ carries a typed kind with a hint on stderr:
 | `timeout`              | raise `--timeout` or `--request-timeout` |
 | `circuit_breaker_open` | provider failing consistently — the chunk was never attempted |
 
-**Breaking in 0.4.0:** `--json` is an object now —
-`{"hits":[…],"errors":[{file,start,end,kind,message}]}` (rows mode:
-`{"answers":[…],"errors":[{row,kind,message}]}`); it was a bare array.
+**`--json` is backward-compatible** (same contract as 0.3.0): it emits the bare
+array — code mode `[{file,start,end,p,text}]`, rows mode `[flattened answer
+objects]` with `null` for an errored row (position-aligned, so index `i` is
+always input row `i`). Errored chunks/rows are not in the array; they surface
+through the stderr summary and exit 2. New in 0.4.0: **`--json-errors`**
+(implies `--json`) opts into the object shape — code mode
+`{"hits":[…],"errors":[{file,start,end,kind,message}]}`, rows mode
+`{"answers":[…],"errors":[{row,kind,message}]}`. `--out` writes whichever
+shape was selected.
 
 Two cache notes. Keys now include the resolved model id, so entries for another
 provider's model — openrouter's `~typesafe/jev-latest`, any `--model` override —
@@ -243,10 +250,12 @@ jgrep [options] --rows <file> --questions <q.json> [--out scored.csv]
   -t, --threshold <p>   print chunks with probability >= p (default 0.7)
   -C, --show            print the matching chunk body under each hit
   -a, --all             print every chunk with its probability, best first
-      --json            machine-readable output: {"hits":[...],"errors":[...]}
-                        rows mode: {"answers":[...],"errors":[...]}
-                        (v0.4 breaking change: was a bare array; errors carry
-                        {file,start,end,kind,message} / rows {row,kind,message})
+      --json            machine-readable output: hits as a JSON array
+                        (v0.3.0-compatible: [{file,start,end,p,text}]; rows:
+                        [flattened answer objects, null for errored rows])
+      --json-errors     with --json: a JSON object instead — code mode
+                        {hits:[...], errors:[{file,start,end,kind,message}]};
+                        rows mode {answers:[...], errors:[{row,kind,message}]}
       --diff [ref]      grep git diff hunks instead of files
                         (working tree by default, or against <ref>)
       --staged          with --diff: staged changes only
@@ -254,7 +263,7 @@ jgrep [options] --rows <file> --questions <q.json> [--out scored.csv]
       --questions <f>   with --rows: JSON of Jev questions (noul/choice/score)
                         asked of every row; prints the table with answer columns
       --out <file>      with --questions: write the CSV here instead of stdout
-                        (with --json: the JSON object goes to the file)
+                        (with --json: the JSON output goes to the file)
   -b, --batch <n>       chunks per request (default 16)
   -c, --concurrency <n> parallel requests (default 16)
       --api <name>      provider: typesafe | openrouter | gateway

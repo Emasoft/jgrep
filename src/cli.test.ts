@@ -14,6 +14,15 @@ declare const Bun: {
     stdout: { toString(): string };
     stderr: { toString(): string };
   };
+  spawn(cmd: string[], opts?: {
+    env?: Record<string, string | undefined>;
+    stdout?: string;
+    stderr?: string;
+  }): { stdout: ReadableStream<Uint8Array>; stderr: ReadableStream<Uint8Array>; exited: Promise<number> };
+  serve(opts: { port?: number; fetch(req: Request): Response | Promise<Response> }): {
+    port: number;
+    stop(closeActiveConnections?: boolean): void;
+  };
 };
 
 process.env.JGREP_NO_MAIN = "1";
@@ -67,6 +76,14 @@ test("cli: JGREP_NO_MAIN import pattern still works (parse importable, main not 
   expect(typeof parse).toBe("function");
 });
 
+test("cli parse: --json-errors implies --json; --json alone keeps the array shape", () => {
+  expect(parse(["q"])).toMatchObject({ json: false, jsonErrors: false });
+  expect(parse(["--json", "q"])).toMatchObject({ json: true, jsonErrors: false });
+  expect(parse(["--json-errors", "q"])).toMatchObject({ json: true, jsonErrors: true });
+  expect(parse(["--json", "--json-errors", "q"])).toMatchObject({ json: true, jsonErrors: true });
+  expect(parse(["--json-errors", "--diff", "--staged", "q"])).toMatchObject({ json: true, jsonErrors: true, diff: ["--staged"] });
+});
+
 // ---- main() via the real entrypoint: hermetic subprocess checks -----------------
 // JGREP_NO_MAIN leaks into child env from this process (bun test shares one), so it
 // is cleared explicitly; JEV_GATEWAY_URL too, so the gateway scenario is deterministic.
@@ -100,3 +117,123 @@ test("cli main: a non-numeric numeric flag exits 2 with the plain untyped render
   expect(err).toContain("numeric option expected");
   expect(err).not.toContain("bad_request:"); // plain Error keeps today's rendering (no kind prefix)
 });
+
+// ---- main() end-to-end over a local fake gateway: the --json output shapes -------
+// The 0.4 contract: --json stays the v0.3.0 bare array (upstream requires it),
+// --json-errors opts into the object. The shapes are proven through the REAL
+// entrypoint: a localhost-only Bun.serve fake speaks the Jev System One protocol
+// for chunks and rows, so no network and no key files are touched; --no-cache
+// keeps ~/.cache/jgrep out of it.
+
+const HIT_KEYS = ["end", "file", "p", "start", "text"]; // the exact v0.3.0 hit-object keys
+
+/** Jev System One fake: answers every chunk and every row's `match` question with p=0.9. */
+const startFakeGateway = () =>
+  Bun.serve({
+    port: 0,
+    fetch: async (req: Request) => {
+      const body: { state: { chunks?: { id: string }[]; rows?: { id: string }[] } } = await req.json();
+      const answers: Record<string, unknown> = {};
+      for (const c of body.state.chunks ?? []) answers[c.id] = { type: "noul", noul: 0.9 };
+      for (const r of body.state.rows ?? []) answers[`${r.id}.match`] = { type: "noul", noul: 0.9 };
+      return new Response(JSON.stringify({ answers, usage: { input_tokens: 10 } }), { status: 200 });
+    },
+  });
+
+const gatewayEnv = (port: number) => ({
+  ...process.env, JGREP_NO_MAIN: "",
+  JEV_GATEWAY_URL: `http://127.0.0.1:${port}/v1/systemone`, JEV_GATEWAY_API_KEY: "test-key",
+});
+
+/** Async spawn: Bun.spawnSync BLOCKS this process's event loop, which would
+ *  deadlock the in-process fake gateway (the child's requests would sit
+ *  unaccepted until its batch deadline). Bun.spawn keeps the loop running. */
+const spawn = async (args: string[], env: Record<string, string | undefined>) => {
+  const proc = Bun.spawn(args, { env, stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+  return { exitCode: await proc.exited, stdout, stderr };
+};
+
+test("cli main code: --json emits the bare v0.3.0 hit array ({file,start,end,p,text}); --json-errors wraps it with errors", async () => {
+  const server = startFakeGateway();
+  try {
+    const p = await spawn(
+      ["bun", "src/cli.ts", "--json", "--no-cache", "--api", "gateway", "swallows errors", "src/cli.ts"],
+      gatewayEnv(server.port),
+    );
+    expect(p.exitCode).toBe(0);
+    const parsed = JSON.parse(p.stdout);
+    expect(Array.isArray(parsed)).toBe(true); // v0.3.0 contract: bare array, NO wrapper, NO errors field
+    expect(parsed.length).toBeGreaterThan(0);
+    for (const h of parsed) expect(Object.keys(h).sort()).toEqual(HIT_KEYS);
+
+    const p2 = await spawn(
+      ["bun", "src/cli.ts", "--json-errors", "--no-cache", "--api", "gateway", "swallows errors", "src/cli.ts"],
+      gatewayEnv(server.port),
+    );
+    expect(p2.exitCode).toBe(0);
+    const obj = JSON.parse(p2.stdout);
+    expect(Array.isArray(obj)).toBe(false); // opt-in object
+    expect(Object.keys(obj).sort()).toEqual(["errors", "hits"]);
+    for (const h of obj.hits) expect(Object.keys(h).sort()).toEqual(HIT_KEYS);
+    expect(obj.errors).toEqual([]); // clean run: same hits, empty errors
+  } finally {
+    server.stop(true);
+  }
+}, 20_000);
+
+test("cli main rows: --json emits the position-aligned flattened array; --json-errors wraps it; --out follows the flag", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const server = startFakeGateway();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-json-"));
+  try {
+    const csv = path.join(dir, "rows.csv");
+    fs.writeFileSync(csv, "handle\n@a\n@b\n");
+    const run = (extra: string[]) =>
+      spawn(["bun", "src/cli.ts", "--rows", csv, "beauty?", "--api", "gateway", "--no-cache", ...extra], gatewayEnv(server.port));
+
+    const bare = await run(["--json"]);
+    expect(bare.exitCode).toBe(0);
+    expect(JSON.parse(bare.stdout)).toEqual([{ match: 0.9 }, { match: 0.9 }]); // bare array, position-aligned
+
+    const obj = JSON.parse((await run(["--json-errors"])).stdout);
+    expect(obj).toEqual({ answers: [{ match: 0.9 }, { match: 0.9 }], errors: [] }); // same array under `answers`
+
+    const out = path.join(dir, "out.json");
+    expect((await run(["--json", "--out", out])).exitCode).toBe(0);
+    expect(JSON.parse(fs.readFileSync(out, "utf8"))).toEqual([{ match: 0.9 }, { match: 0.9 }]); // the FILE gets the array
+  } finally {
+    server.stop(true);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}, 20_000);
+
+test("cli main: errored chunks/rows never enter the --json array (empty array / null entries) and exit 2", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-err-"));
+  try {
+    // Unroutable loopback port: connection-refused is instant, every chunk/row errors.
+    const dead = { ...process.env, JGREP_NO_MAIN: "", JEV_GATEWAY_URL: "http://127.0.0.1:1/v1/systemone", JEV_GATEWAY_API_KEY: "test-key" };
+    const csv = path.join(dir, "rows.csv");
+    fs.writeFileSync(csv, "handle\n@a\n@b\n");
+    const p = await spawn(
+      ["bun", "src/cli.ts", "--json", "--no-cache", "--api", "gateway", "--retries", "0", "--timeout", "1", "swallows errors", "src/cli.ts"],
+      dead,
+    );
+    expect(p.exitCode).toBe(2); // partial failure surfaced via the exit code, not the payload
+    expect(JSON.parse(p.stdout)).toEqual([]); // no hits: the bare array is just empty
+
+    const p2 = await spawn(
+      ["bun", "src/cli.ts", "--rows", csv, "beauty?", "--api", "gateway", "--retries", "0", "--timeout", "1", "--no-cache", "--json"],
+      dead,
+    );
+    expect(p2.exitCode).toBe(2);
+    expect(JSON.parse(p2.stdout)).toEqual([null, null]); // errored rows: null entries, position-stable
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}, 20_000);
