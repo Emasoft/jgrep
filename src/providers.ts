@@ -82,7 +82,7 @@ const SNIPPET_MAX = 300;
 export interface PostOpts {
   fetchImpl?: Fetch;                     // DI seam (same as the old jgrep.ts option)
   requestTimeoutMs?: number;             // per attempt, default 30_000
-  deadlineMs?: number;                   // absolute epoch ms — batch deadline INCLUDING all retries
+  deadlineMs?: number;                   // absolute epoch ms — batch deadline INCLUDING all retries (compared on the monotonic clock internally)
   maxRetries?: number;                   // default 4 (=> 5 total attempts)
   sleep?: (ms: number) => Promise<void>; // DI for tests
   limiter?: RateLimiter;                 // shared token bucket
@@ -166,11 +166,15 @@ export async function postSystemOne(
   const requestTimeoutMs = opts.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
   const sleep = opts.sleep ?? defaultSleep;
   const json = JSON.stringify(body);
+  // The epoch deadline is converted to a MONOTONIC deadline once, at entry: the wall
+  // clock can jump (NTP, manual adjust) but performance.now() cannot — same clock the
+  // token bucket runs on. Identical behavior on a normal clock.
+  const deadline = opts.deadlineMs === undefined ? undefined : monotonicMs() + (opts.deadlineMs - Date.now());
 
   for (let attempt = 0; ; attempt++) {
     await opts.limiter?.acquire(); // pacing before EVERY attempt, retries included (§1.7)
 
-    if (opts.deadlineMs !== undefined && opts.deadlineMs - Date.now() <= 0) {
+    if (deadline !== undefined && deadline - monotonicMs() <= 0) {
       throw new JevProviderError(
         "timeout",
         `the provider deadline exceeded before attempt ${attempt + 1} (the batch deadline includes retries)`,
@@ -178,9 +182,9 @@ export async function postSystemOne(
       );
     }
 
-    const perAttemptMs = opts.deadlineMs === undefined
+    const perAttemptMs = deadline === undefined
       ? requestTimeoutMs
-      : Math.min(requestTimeoutMs, opts.deadlineMs - Date.now());
+      : Math.min(requestTimeoutMs, deadline - monotonicMs());
     const signal = AbortSignal.timeout(perAttemptMs);
 
     // What failed THIS attempt (a retryable status or a retryable transport error).
@@ -257,7 +261,7 @@ export async function postSystemOne(
     const delay = jitteredDelayMs(attempt); // full jitter, base 500ms, cap 30s
     const retryAfterMs = parseRetryAfter(retryAfterRaw); // transport errors have no header -> null
     let wait = Math.min(Math.max(delay, retryAfterMs ?? 0), RETRY_AFTER_MAX_MS);
-    if (opts.deadlineMs !== undefined) wait = Math.max(0, Math.min(wait, opts.deadlineMs - Date.now()));
+    if (deadline !== undefined) wait = Math.max(0, Math.min(wait, deadline - monotonicMs()));
     await sleep(wait);
   }
 }

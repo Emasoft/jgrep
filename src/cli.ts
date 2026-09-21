@@ -97,6 +97,9 @@ export function parse(argv: string[]) {
   }
   if (![o.threshold, o.batch, o.concurrency, o.timeout, o.requestTimeout, o.retries, o.rate].every((n) => Number.isFinite(n) && n >= 0))
     throw new Error("numeric option expected");
+  // batch < 1 spins the batching loop forever (+= 0) and a fraction overlaps batches;
+  // 0 stays legal for timeout/rate/retries, but never for batch.
+  if (!Number.isInteger(o.batch) || o.batch < 1) throw new Error("batch must be a positive integer");
   return { ...o, question: rest[0], paths: rest.slice(1) };
 }
 
@@ -225,9 +228,10 @@ async function rowsMain(o: ReturnType<typeof parse>) {
     let hits = rows.length;
     let wrote = false;
     if (o.questions) {
-      const qCols = [...new Set(flat.flatMap((f) => Object.keys(f ?? {})))];
+      const qCols = [...new Set(flat.flatMap((f) => (f ? Object.keys(f) : [])))]; // errored rows contribute no answer columns
       const table = rows.map((row, i) => ({ ...row, ...(flat[i] ?? {}) }));
-      if (o.json) wrote = writeOut(o.out, JSON.stringify(flat, null, 2)); // position-aligned array, null for errored rows
+      // v0.3.0 contract: the JSON is the merged table rows (row fields + answer columns).
+      if (o.json) wrote = writeOut(o.out, JSON.stringify(table, null, 2));
       else if (o.out) { fs.writeFileSync(o.out, toCsv([...columns, ...qCols], table)); wrote = true; }
       else process.stdout.write(toCsv([...columns, ...qCols], table));
     } else {
@@ -237,7 +241,10 @@ async function rowsMain(o: ReturnType<typeof parse>) {
         .filter((s) => Number.isFinite(s.p)); // errored rows carry no usable match: skipped, never a TypeError
       const shown = o.all ? [...scored].sort((a, b) => b.p - a.p) : scored.filter((s) => s.p >= o.threshold);
       hits = scored.filter((s) => s.p >= o.threshold).length;
-      if (o.json) wrote = writeOut(o.out, JSON.stringify(flat, null, 2));
+      // v0.3.0 contract: the JSON is the SHOWN hits — the source row number (header + 1-based
+      // = i + 2), the probability, then the row's own fields. Errored rows never enter
+      // `scored`, so they can never appear here.
+      if (o.json) wrote = writeOut(o.out, JSON.stringify(shown.map((s) => ({ row: s.i + 2, p: s.p, ...s.row })), null, 2));
       if (!o.json || o.out) for (const s of shown) { // with --json --out the JSON went to the file; stdout keeps the pretty hits
         const preview = Object.values(s.row).filter(Boolean).join(" | ").slice(0, 90);
         const pcol = s.p >= o.threshold ? "32" : "90";

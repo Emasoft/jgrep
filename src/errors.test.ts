@@ -35,6 +35,19 @@ test("classifyStatus: model-not-found body takes precedence, even over 5xx", () 
   expect(MODEL_NOT_FOUND_RE.test("No Endpoints Found")).toBe(true);
 });
 
+test("drift: every status in RETRYABLE/NON_RETRYABLE_STATUSES classifies with the matching retryable flag", () => {
+  // Guards the SETS against drifting away from classifyStatus: a status listed as
+  // retryable must classify retryable, a non-retryable one must not.
+  for (const s of RETRYABLE_STATUSES) {
+    expect(classifyStatus(s, "").retryable).toBe(true);
+    expect(NON_RETRYABLE_STATUSES.has(s)).toBe(false); // a status belongs to exactly one set
+  }
+  for (const s of NON_RETRYABLE_STATUSES) {
+    expect(classifyStatus(s, "").retryable).toBe(false);
+    expect(RETRYABLE_STATUSES.has(s)).toBe(false);
+  }
+});
+
 test("classifyTransport: abort/timeout, network codes, TLS, wrapped cause, fallback", () => {
   expect(classifyTransport({ name: "AbortError" })).toEqual({ kind: "timeout", retryable: true });
   expect(classifyTransport({ name: "TimeoutError" })).toEqual({ kind: "timeout", retryable: true });

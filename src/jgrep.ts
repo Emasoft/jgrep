@@ -164,8 +164,11 @@ export interface ChunkError { file: string; start: number; end: number; kind: Je
 export interface Result { hits: Hit[]; all: Hit[]; chunks: number; tokens: number; cached: number; errors: ChunkError[] }
 
 /** What one batch worker hands back; runPool results are completion-ordered, so the
- *  batch index rides along and `all` is re-associated after the pool settles. */
-interface BatchOutcome { index: number; entries: { chunkIndex: number; p: number }[] }
+ *  batch index rides along and `all` is re-associated after the pool settles. A
+ *  partial 200 (the provider answered some chunks but not others) is NOT a hit:
+ *  unanswered chunk indices come back in `malformed` and the caller records them as
+ *  malformed_response ChunkErrors — otherwise they would surface as p:NaN entries. */
+interface BatchOutcome { index: number; entries: { chunkIndex: number; p: number }[]; malformed: number[] }
 
 /** Appended to an invalid_api_key hint when at least one batch succeeded earlier in the
  *  SAME run: a 401/403 then means the key expired/was revoked, not that the user handed
@@ -183,8 +186,11 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
     if (hit !== undefined) all[i] = { ...c, p: hit }; else todo.push(i);
   });
   const cached = chunks.length - todo.length;
+  // Defensive normalization: a 0/fractional batch would spin the loop forever (+= 0)
+  // or overlap batches. parse() rejects those; library callers get clamped instead.
+  const batch = Math.max(1, Math.floor(o.batch));
   const batches: number[][] = [];
-  for (let i = 0; i < todo.length; i += o.batch) batches.push(todo.slice(i, i + o.batch));
+  for (let i = 0; i < todo.length; i += batch) batches.push(todo.slice(i, i + batch));
   // One resolution of the retry/deadline options for the whole run (the worker only reads these).
   const timeoutMs = (o.timeoutSec ?? DEFAULT_TIMEOUT_SEC) * 1000;
   const post: PostOpts = {
@@ -204,14 +210,20 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
     });
     tokens += res.usage?.input_tokens ?? 0;
     // Finite p-values go straight into the in-memory cache object: cli.ts persists it in
-    // a finally, so answers paid for survive even when other batches fail.
-    const entries = b.map((ci, j) => {
-      const p = res.answers[`c${j}`]?.noul ?? NaN;
-      if (Number.isFinite(p)) cache[key(question, kind, chunks[ci])] = p;
-      return { chunkIndex: ci, p };
+    // a finally, so answers paid for survive even when other batches fail. A chunk the
+    // provider did not answer (missing or non-finite p on a 200) is skipped here and
+    // reported as malformed_response — never a p:NaN entry in all/hits.
+    const entries: { chunkIndex: number; p: number }[] = [];
+    const malformed: number[] = [];
+    b.forEach((ci, j) => {
+      const p = res.answers[`c${j}`]?.noul;
+      if (Number.isFinite(p)) {
+        cache[key(question, kind, chunks[ci])] = p;
+        entries.push({ chunkIndex: ci, p });
+      } else malformed.push(ci);
     });
     hadSuccess = true; // this batch's request succeeded — set before returning
-    return { index, entries };
+    return { index, entries, malformed };
   };
   let pool: PoolResult<BatchOutcome>;
   try {
@@ -240,6 +252,11 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
   }
   const errors: ChunkError[] = pool.errors.flatMap((e) =>
     batches[e.index].map((ci) => ({ file: chunks[ci].file, start: chunks[ci].start, end: chunks[ci].end, kind: e.error.kind, message: e.error.message })));
+  // A 200 that answered only some chunks of a batch: the unanswered chunks are
+  // recorded per chunk here (the batch itself succeeded, so the pool saw no error).
+  for (const r of pool.results)
+    for (const ci of r.malformed)
+      errors.push({ file: chunks[ci].file, start: chunks[ci].start, end: chunks[ci].end, kind: "malformed_response", message: "provider returned no usable answer for this chunk" });
   if (pool.aborted) {
     // Batches that were dispatched all reported (success or their own error); whatever
     // was never attempted is reported as a breaker error. No cache entries, no hits.

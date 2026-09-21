@@ -202,7 +202,7 @@ for are kept in the cache.
 Exit status: `0` hits, `1` none, `2` on error or when any chunk/row errored —
 partial failures still report their hits, the summary line carries the error
 breakdown (` · 4 errored (3 timeout, 1 rate_limited)`), and up to 5 examples
-with hints go to stderr. Every failure carries a typed kind:
+go to stderr. Every failure carries a typed kind:
 
 | kind                   | meaning                                                        |
 | ---------------------- | -------------------------------------------------------------- |
@@ -218,9 +218,10 @@ with hints go to stderr. Every failure carries a typed kind:
 | `circuit_breaker_open` | never attempted — the breaker stopped new dispatches           |
 
 **`--json` is unchanged** (same contract as 0.3.0): the bare array — code mode
-`[{file,start,end,p,text}]`, rows mode the position-aligned flattened answers
-with `null` for an errored row. Errors never enter the array; they surface
-through the stderr summary and exit 2.
+`[{file,start,end,p,text}]`, rows questions mode the scored table rows (your row
+fields plus the answer columns), rows single-description mode the shown hits
+`[{row, p, ...row fields}]` with `row` the CSV line number. Errored rows never
+enter the array; errors surface through the stderr summary and exit 2.
 
 ## How it works
 

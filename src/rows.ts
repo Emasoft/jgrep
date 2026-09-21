@@ -105,7 +105,10 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
   const answers: (Record<string, Answer> | null)[] = new Array(rows.length).fill(null); // errored rows stay null — dense, never holes
   const todo: number[] = [];
   rows.forEach((r, i) => { const hit = cache[key(qJson, r)]; if (hit) answers[i] = hit; else todo.push(i); });
-  const per = Math.max(1, Math.min(o.batch, Math.floor(MAX_QUESTIONS_PER_REQUEST / Object.keys(questions).length)));
+  // Defensive normalization (same rule as jgrep()): a 0/fractional batch would spin
+  // the loop forever (+= 0) or overlap packs. parse() rejects those; library callers
+  // get floored and clamped at 1 instead.
+  const per = Math.max(1, Math.floor(Math.min(o.batch, Math.floor(MAX_QUESTIONS_PER_REQUEST / Object.keys(questions).length))));
   const batches: number[][] = [];
   for (let i = 0; i < todo.length; i += per) batches.push(todo.slice(i, i + per));
   // Same defaults and PostOpts wiring as jgrep() — resolved once, read-only in the worker.
@@ -174,7 +177,9 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
       for (const row of batches[bi]) errors.push({ row, kind: "circuit_breaker_open", message: "not attempted: provider failing consistently (circuit breaker open)" });
     }
   }
-  return { answers, tokens, cached: rows.length - todo.length, requests: batches.length, errors };
+  // `requests` counts only packs the breaker actually attempted; packs it never
+  // dispatched are not requests.
+  return { answers, tokens, cached: rows.length - todo.length, requests: batches.length - (pool.aborted ? pool.unprocessed : 0), errors };
 }
 
 // ---- output -----------------------------------------------------------------

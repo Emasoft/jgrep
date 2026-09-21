@@ -81,6 +81,52 @@ test("partial isolation: failing batch yields hits + server_unreachable ChunkErr
   expect(r.all.map((h) => h.file)).toEqual(["f0.ts", "f1.ts"]); // errored chunks are absent from `all`
 });
 
+// ---- jgrep: batch guard ---------------------------------------------------------
+
+test("batch guard: jgrep(batch: 0) terminates (normalized to 1 chunk per request)", async () => {
+  // batch 0 would spin the batching loop forever (+= 0); the library clamps to 1.
+  const { calls, fetchImpl } = okFetch();
+  const r = await jgrep("q", nChunks(3), { threshold: 0.7, batch: 0, concurrency: 4, apiKey: "k", fetchImpl, cache: {} });
+  expect(calls).toHaveLength(3);
+  expect(calls.every((c) => c.state.chunks.length === 1)).toBe(true);
+  expect(r.errors).toEqual([]);
+  expect(r.hits).toHaveLength(3);
+});
+
+test("batch guard: a fractional batch is floored (no overlapping batches)", async () => {
+  // 5 chunks with batch 2.5: floor -> 2 per request -> batches of 2, 2, 1.
+  const { calls, fetchImpl } = okFetch();
+  const r = await jgrep("q", nChunks(5), { threshold: 0.7, batch: 2.5, concurrency: 4, apiKey: "k", fetchImpl, cache: {} });
+  expect(calls.map((c) => c.state.chunks.length).sort()).toEqual([1, 2, 2]);
+  expect(r.errors).toEqual([]);
+  expect(r.hits).toHaveLength(5);
+});
+
+// ---- jgrep: partial 200 answers are typed errors --------------------------------
+
+test("partial 200: a chunk the provider does not answer becomes malformed_response, absent from all/hits", async () => {
+  const calls: Record<string, any>[] = [];
+  const fetchImpl = (async (_url: unknown, init: { body: string }) => {
+    const body = JSON.parse(init.body);
+    calls.push(body);
+    // A 200 that answers every chunk EXCEPT f2.ts (batch ids are request-local c0..cN).
+    const answers: Record<string, unknown> = {};
+    for (const c of body.state.chunks) if (c.file !== "f2.ts") answers[c.id] = { type: "noul", noul: 0.9 };
+    return new Response(JSON.stringify({ answers, usage: { input_tokens: 10 } }), { status: 200 });
+  }) as unknown as Fetch;
+  const cache: Record<string, number> = {};
+  const r = await jgrep("q", nChunks(4), { threshold: 0.7, batch: 2, concurrency: 2, apiKey: "k", fetchImpl, cache });
+
+  expect(r.errors).toHaveLength(1);
+  expect(r.errors[0].kind).toBe("malformed_response");
+  expect(r.errors[0].message).toContain("no usable answer");
+  expect(r.errors[0].file).toBe("f2.ts");
+  expect(r.all.map((h) => h.file)).toEqual(["f0.ts", "f1.ts", "f3.ts"]); // f2 absent, no p:NaN entry
+  expect(r.hits.map((h) => h.file)).toEqual(["f0.ts", "f1.ts", "f3.ts"]);
+  expect(r.chunks).toBe(4);
+  expect(Object.keys(cache)).toHaveLength(3); // the unanswered chunk is not cached
+});
+
 // ---- jgrep: batch deadlines ----------------------------------------------------
 
 test("deadline: timeoutSec 0 is already expired -> immediate kind timeout errors, zero fetch calls", async () => {
@@ -224,6 +270,17 @@ test("rows: a failed pack yields RowErrors; other rows still answered and cached
   expect(Object.keys(cache)).toHaveLength(2); // complete rows cached, errored rows not
 });
 
+test("rows batch guard: a fractional batch is floored (no overlapping packs)", async () => {
+  // 3 rows with batch 1.5: floor -> 1 row per pack (a raw 1.5 would put @b in two packs).
+  const rows: Row[] = [{ handle: "@a" }, { handle: "@b" }, { handle: "@c" }];
+  const { calls, fetchImpl } = okRowsFetch();
+  const r = await scoreRows(rows, { match: { type: "noul", instructions: "q" } }, { batch: 1.5, concurrency: 3, apiKey: "k", fetchImpl, cache: {} });
+  expect(calls.map((c) => c.state.rows.length).sort()).toEqual([1, 1, 1]);
+  expect(r.errors).toEqual([]);
+  expect(r.requests).toBe(3);
+  expect(r.answers.every((a) => a?.match?.noul === 0.9)).toBe(true);
+});
+
 test("rows back-compat: a clean run reports errors: [] with unchanged answers", async () => {
   const { fetchImpl } = okRowsFetch();
   const r = await scoreRows(
@@ -236,6 +293,27 @@ test("rows back-compat: a clean run reports errors: [] with unchanged answers", 
   expect(r.requests).toBe(1);
   expect(r.answers[0]?.match?.noul).toBe(0.9);
   expect(r.answers[1]?.match?.noul).toBe(0.9);
+});
+
+// ---- rows: circuit breaker ------------------------------------------------------
+
+test("circuit breaker (rows): requests counts only dispatched packs — unprocessed packs excluded", async () => {
+  // 12 rows -> 6 packs of 2; 3 consecutive fatal 402s (concurrency 1) trip the breaker,
+  // leaving 3 packs never attempted. `requests` must equal what was actually dispatched.
+  const rows: Row[] = Array.from({ length: 12 }, (_, i) => ({ handle: `@r${i}` }));
+  const questions: Questions = { match: { type: "noul", instructions: "q" } };
+  const calls: string[] = [];
+  const fetchImpl = (async (_url: unknown, init: { body: string }) => {
+    calls.push(init.body);
+    return new Response("out of credits", { status: 402 });
+  }) as unknown as Fetch;
+  const r = await scoreRows(rows, questions, { batch: 2, concurrency: 1, apiKey: "k", fetchImpl, cache: {} });
+
+  expect(calls).toHaveLength(3); // the breaker stopped dispatching after 3 consecutive fatals
+  expect(r.requests).toBe(3); // requests === dispatched (6 packs - 3 unprocessed)
+  expect(r.errors.filter((e) => e.kind === "insufficient_credits")).toHaveLength(6);
+  expect(r.errors.filter((e) => e.kind === "circuit_breaker_open")).toHaveLength(6);
+  expect(r.answers.every((a) => a === null)).toBe(true);
 });
 
 // ---- rows: dense answers on partial failure ------------------------------------

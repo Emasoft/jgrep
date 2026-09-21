@@ -118,6 +118,29 @@ test("failFast: the first fatal rejects with the exact original error; in-flight
   expect(completions).toBe(invocations - 1); // in-flight items still finished, nothing cancelled
 });
 
+test("failFast: late in-flight settlements mutate nothing, never rethrow, never refire onProgress", async () => {
+  // 4 workers, all dispatched before the first fatal settles. Item 0 rejects fast;
+  // item 1 rejects LATER with a second fatal, items 2 and 3 succeed later. After the
+  // rejection none of that may be observable: no results/errors mutations, no
+  // onProgress, and no second throw (an unhandled rejection after Promise.all settled).
+  const items = Array.from({ length: 12 }, (_, i) => i);
+  const boom = fatal("insufficient_credits", "out of credits");
+  const lateBoom = fatal("invalid_api_key", "late fatal from an in-flight item");
+  const progress: number[] = [];
+  let caught: unknown;
+  try {
+    await runPool(items, { concurrency: 4, failFast: true, onProgress: (done) => progress.push(done) }, async (n) => {
+      if (n === 0) throw boom; // the fast fatal: rejects the run immediately
+      if (n === 1) { await new Promise((res) => setTimeout(res, 30)); throw lateBoom; } // late in-flight fatal
+      if (n === 2 || n === 3) await new Promise((res) => setTimeout(res, 30)); // late in-flight successes
+      return "ok";
+    });
+  } catch (e) { caught = e; }
+  expect(caught).toBe(boom); // the first fatal is the rejection; the late one was swallowed
+  await new Promise((res) => setTimeout(res, 60)); // drain every in-flight settlement
+  expect(progress).toEqual([]); // onProgress never fired: the fatal threw before it, late settlements are guarded
+});
+
 test("failFast with a non-fatal first error: records it and keeps going", async () => {
   const items = [0, 1, 2, 3, 4, 5];
   let invocations = 0;

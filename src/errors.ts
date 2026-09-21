@@ -56,14 +56,16 @@ const TLS_CODES = new Set([
   "ERR_TLS_CERT_ALTNAME_INVALID", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "SELF_SIGNED_CERT_IN_CHAIN",
   "DEPTH_ZERO_SELF_SIGNED_CERT", "CERT_HAS_EXPIRED", "ERR_SSL_WRONG_VERSION_NUMBER",
 ]);
-const UNREACHABLE_CODES = new Set([
-  "ECONNRESET", "ETIMEDOUT", "ECONNREFUSED", "EAI_AGAIN", "EPIPE", "ECONNABORTED", "ENOTFOUND",
-]);
 const ABORT_NAMES = new Set(["AbortError", "TimeoutError"]);
 const TLS_MESSAGE_RE = /certificate|TLS|SSL/i;
 type ErrLayer = { name?: unknown; code?: unknown; message?: unknown; cause?: unknown };
 
-/** Inspect a transport error (and undici/Bun wrap causes) for kind/retryable. */
+/**
+ * Inspect a transport error (and undici/Bun wrap causes) for kind/retryable.
+ * Abort-shaped errors are timeouts; TLS-shaped ones are fatal; EVERYTHING else —
+ * connection resets, refusals, DNS failures, unknown junk — is a retryable
+ * server_unreachable, so a per-code table would only duplicate the fallthrough.
+ */
 export function classifyTransport(err: unknown): { kind: JevErrorKind; retryable: boolean } {
   const layers: ErrLayer[] = [];
   let cur: unknown = err;
@@ -78,7 +80,6 @@ export function classifyTransport(err: unknown): { kind: JevErrorKind; retryable
   if (layers.some((l) => TLS_CODES.has(str(l.code)) || TLS_MESSAGE_RE.test(str(l.message)))) {
     return { kind: "tls_error", retryable: false };
   }
-  if (layers.some((l) => UNREACHABLE_CODES.has(str(l.code)))) return { kind: "server_unreachable", retryable: true };
   return { kind: "server_unreachable", retryable: true };
 }
 

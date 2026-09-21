@@ -48,6 +48,16 @@ test("cli parse: numeric validation covers the new numerics (timeout/request-tim
   expect(() => parse(["--timeout", "0", "--request-timeout", "0", "--retries", "0", "--rate", "0", "q"])).not.toThrow(); // 0 is legal
 });
 
+test("cli parse: batch must be a positive integer (0 and fractions rejected)", () => {
+  // batch < 1 spins the batching loop forever (+= 0); a fraction overlaps batches.
+  expect(() => parse(["-b", "0", "q"])).toThrow(/batch must be a positive integer/);
+  expect(() => parse(["--batch", "1.5", "q"])).toThrow(/batch must be a positive integer/);
+  expect(() => parse(["-b", "1", "q"])).not.toThrow();
+  expect(() => parse(["-b", "16", "q"])).not.toThrow();
+  // the other numerics still allow 0 — only batch is guarded
+  expect(() => parse(["--timeout", "0", "--rate", "0", "--retries", "0", "q"])).not.toThrow();
+});
+
 test("cli parse: old and new flags coexist (--diff positional heuristic untouched)", () => {
   const o = parse(["--diff", "--json", "--fail-fast", "--staged", "q"]);
   expect(o).toMatchObject({ json: true, failFast: true, diff: ["--staged"], question: "q" });
@@ -120,30 +130,100 @@ test("cli main code: --json emits the bare v0.3.0 hit array with exactly {file,s
   }
 });
 
-test("cli main rows: --json emits the position-aligned flattened answer array", () => {
-  const q = "rows json contract probe be41";
-  const questions = { match: { type: "noul", instructions: q } };
+// ---- rows --json: the restored v0.3.0 contract -----------------------------------
+// questions mode -> the merged table rows (row fields + answer columns);
+// single description -> the SHOWN hits [{row, p, ...row fields}] (row = csv line).
+
+const rowsContractProbe = "rows json contract probe be41";
+/** The rows cache key for a one-question `match` probe (must match rows.ts `key`). */
+const rowKeyOf = (handle: string, qJson: string) =>
+  createHash("sha1").update(`${MODEL}\0rows\0${qJson}\0${JSON.stringify({ handle })}`).digest("hex");
+
+test("cli main rows --questions: --json emits the merged table rows (row fields + answer columns)", () => {
+  const questions = { match: { type: "noul", instructions: rowsContractProbe } };
   const qJson = JSON.stringify(questions);
-  const rowKey = (handle: string) =>
-    createHash("sha1").update(`${MODEL}\0rows\0${qJson}\0${JSON.stringify({ handle })}`).digest("hex");
   // Both rows cached: the run is a pure cache hit (zero requests, zero network).
   const { dir, home } = seedHome({
-    [rowKey("@a")]: { match: { type: "noul", noul: 0.9 } },
-    [rowKey("@b")]: { match: { type: "noul", noul: 0.9 } },
+    [rowKeyOf("@a", qJson)]: { match: { type: "noul", noul: 0.9 } },
+    [rowKeyOf("@b", qJson)]: { match: { type: "noul", noul: 0.9 } },
   });
   try {
     fs.writeFileSync(path.join(dir, "rows.csv"), "handle\n@a\n@b\n");
-    const p = runCli(["--rows", "rows.csv", "--json", q], dir, home);
+    fs.writeFileSync(path.join(dir, "q.json"), qJson);
+    const p = runCli(["--rows", "rows.csv", "--questions", "q.json", "--json"], dir, home);
     expect(p.exitCode).toBe(0);
     const parsed = JSON.parse(p.stdout.toString());
-    expect(Array.isArray(parsed)).toBe(true); // bare flattened array, position-aligned
-    expect(parsed).toHaveLength(2);
-    expect(Object.keys(parsed).length).toBe(2); // dense: no skipped index
-    expect(parsed).toEqual([{ match: 0.9 }, { match: 0.9 }]);
-    // and without --json the pretty line still names row 2 (csv line numbers)
-    const p2 = runCli(["--rows", "rows.csv", q], dir, home);
+    expect(Array.isArray(parsed)).toBe(true); // bare array — the scored table, not answers alone
+    expect(parsed).toEqual([
+      { handle: "@a", match: 0.9 },
+      { handle: "@b", match: 0.9 },
+    ]);
+    // and without --json the scored CSV table still lands on stdout
+    const p2 = runCli(["--rows", "rows.csv", "--questions", "q.json"], dir, home);
     expect(p2.exitCode).toBe(0);
-    expect(p2.stdout.toString()).toContain("rows.csv:2");
+    expect(p2.stdout.toString()).toContain("handle,match");
+    expect(p2.stdout.toString()).toContain("@a,0.9");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cli main rows single: --json emits the SHOWN hits {row, p, ...row fields} like 0.3.0", () => {
+  const questions = { match: { type: "noul", instructions: rowsContractProbe } };
+  const qJson = JSON.stringify(questions);
+  const { dir, home } = seedHome({
+    [rowKeyOf("@a", qJson)]: { match: { type: "noul", noul: 0.9 } },
+    [rowKeyOf("@b", qJson)]: { match: { type: "noul", noul: 0.1 } },
+  });
+  try {
+    fs.writeFileSync(path.join(dir, "rows.csv"), "handle\n@a\n@b\n");
+    const p = runCli(["--rows", "rows.csv", "--json", rowsContractProbe], dir, home);
+    expect(p.exitCode).toBe(0);
+    expect(JSON.parse(p.stdout.toString())).toEqual([{ row: 2, p: 0.9, handle: "@a" }]); // @b is below threshold
+    // --all shows every scored row, best first, same hit shape
+    const p2 = runCli(["--rows", "rows.csv", "--json", "--all", rowsContractProbe], dir, home);
+    expect(JSON.parse(p2.stdout.toString())).toEqual([
+      { row: 2, p: 0.9, handle: "@a" },
+      { row: 3, p: 0.1, handle: "@b" },
+    ]);
+    // and without --json the pretty line still names row 2
+    const p3 = runCli(["--rows", "rows.csv", rowsContractProbe], dir, home);
+    expect(p3.exitCode).toBe(0);
+    expect(p3.stdout.toString()).toContain("rows.csv:2");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cli main rows: partial failure keeps the v0.3.0 shapes — errored rows never crash nor appear", () => {
+  // @a/@b are cached; @c is not, and its pack runs with an already-expired deadline
+  // (--timeout 0: the deadline is checked before any fetch, so the failure is
+  // deterministic and hermetic — zero network). The run is a partial failure:
+  // exit 2, and the errored row is absent from the JSON payloads in both modes.
+  const questions = { match: { type: "noul", instructions: rowsContractProbe } };
+  const qJson = JSON.stringify(questions);
+  const { dir, home } = seedHome({
+    [rowKeyOf("@a", qJson)]: { match: { type: "noul", noul: 0.9 } },
+    [rowKeyOf("@b", qJson)]: { match: { type: "noul", noul: 0.9 } },
+  });
+  try {
+    fs.writeFileSync(path.join(dir, "rows.csv"), "handle\n@a\n@b\n@c\n");
+    // single description: errored @c (row 4) cannot be shown — absent, no TypeError
+    const p = runCli(["--rows", "rows.csv", "--json", "--timeout", "0", rowsContractProbe], dir, home);
+    expect(p.exitCode).toBe(2); // partial failure
+    expect(JSON.parse(p.stdout.toString())).toEqual([
+      { row: 2, p: 0.9, handle: "@a" },
+      { row: 3, p: 0.9, handle: "@b" },
+    ]);
+    // questions mode: the errored row keeps its row fields but gains no answer columns
+    fs.writeFileSync(path.join(dir, "q.json"), qJson);
+    const p2 = runCli(["--rows", "rows.csv", "--questions", "q.json", "--json", "--timeout", "0"], dir, home);
+    expect(p2.exitCode).toBe(2);
+    expect(JSON.parse(p2.stdout.toString())).toEqual([
+      { handle: "@a", match: 0.9 },
+      { handle: "@b", match: 0.9 },
+      { handle: "@c" }, // merged non-null fields only: no NaN, no crash, no null entry
+    ]);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
