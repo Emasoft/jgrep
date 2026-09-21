@@ -32,6 +32,17 @@
 # kyu1204/jgrep), and options 1/2 verify this checkout's package.json name.
 # Mismatches refuse loudly (exit 1, no override).
 #
+# Agent skill: options 1/2/3 also refresh the agent skill from
+# skills/jgrep/SKILL.md (it embeds a verbatim copy of `jgrep --help`, so a
+# stale skill means wrong flags for AI agents). Step A runs the vercel `skills`
+# universal installer (`npx -y skills add ./skills -g -y` — every detected
+# harness); Step B falls back to copying it into the standard dir
+# ~/.agents/skills/jgrep only when missing or different. Best-effort: a failed
+# refresh warns but NEVER fails the install (exit code stays the install's).
+# Option 4 (upstream) skips it — that tree has no skills/jgrep — and [5]/[6]/[7]
+# never touch it. Only standard skill dirs are written; harness-private paths
+# are never modified.
+#
 # Exit codes: 0 success · 2 usage error · 3 user-declined/aborted · 1 everything else.
 # `--dry-run` always exits 0 (unless the usage itself is invalid).
 #
@@ -1581,6 +1592,65 @@ verify_install() {
 }
 
 # ---------------------------------------------------------------------------
+# agent-skill refresh (options 1/2/3) — best-effort, never fails the install
+# ---------------------------------------------------------------------------
+refresh_agent_skill() {
+	# After a local install the agent skill (skills/jgrep/SKILL.md) goes stale
+	# whenever the CLI help changed: the skill embeds a verbatim copy of the
+	# `jgrep --help` screen, so AI harnesses would keep quoting wrong flags.
+	# Step A runs the vercel `skills` universal installer (every detected
+	# harness); Step B falls back to the standard dir ~/.agents/skills/jgrep.
+	# Only standard dirs are ever written — never a harness-private path.
+	if [ ! -f "skills/jgrep/SKILL.md" ]; then
+		log "==> agent skill: not present in this source (skipped)"
+		return 0
+	fi
+	if [ "$OPT_DRY_RUN" -eq 1 ]; then
+		log "DRY-RUN: would refresh the agent skill via 'npx -y skills add ./skills -g -y' (vercel skills installer -> every detected harness)"
+		log "DRY-RUN: fallback if the installer fails or is offline: copy skills/jgrep/SKILL.md to $HOME/.agents/skills/jgrep/SKILL.md (only when missing or different)"
+		return 0
+	fi
+	if have npx; then
+		# Step A — universal installer (cwd is the repo; installs the skill
+		# into every detected harness's standard skill dir)
+		if npx -y skills add ./skills -g -y; then
+			log "==> agent skill refreshed via the vercel skills installer (all detected harnesses)"
+			log "hint: harnesses managing skills outside the standard dirs need a manual re-sync (late cli reads ~/.agents/skills soon)"
+			return 0
+		fi
+		warn "$PROG: warning: 'npx -y skills add ./skills -g -y' failed — falling back to the ~/.agents/skills copy."
+	else
+		warn "$PROG: warning: npx not found — falling back to the ~/.agents/skills copy."
+	fi
+	# Step B — fallback: keep the standard-dir copy identical to the repo's
+	local dest="$HOME/.agents/skills/jgrep/SKILL.md"
+	if [ -f "$dest" ] && cmp -s "skills/jgrep/SKILL.md" "$dest"; then
+		log "==> agent skill already up to date (~/.agents/skills/jgrep)"
+		log "hint: harnesses managing skills outside the standard dirs need a manual re-sync (late cli reads ~/.agents/skills soon)"
+		return 0
+	fi
+	if mkdir -p "$HOME/.agents/skills/jgrep" && cp "skills/jgrep/SKILL.md" "$dest"; then
+		log "==> agent skill copied to ~/.agents/skills/jgrep (fallback)"
+		log "hint: harnesses managing skills outside the standard dirs need a manual re-sync (late cli reads ~/.agents/skills soon)"
+		return 0
+	fi
+	warn "$PROG: warning: could not update $dest — refresh it manually: npx skills add ./skills -g"
+	return 1
+}
+
+refresh_agent_skill_best_effort() {
+	# caller-facing wrapper: the refresh is best-effort and must never fail the
+	# install — a failure only warns; the option's exit code stays the
+	# install's. Identical behavior interactive vs --choice; the result is
+	# always reported.
+	if refresh_agent_skill; then
+		return 0
+	fi
+	warn "$PROG: warning: the agent-skill refresh failed — the install itself succeeded (best-effort refresh, never fails the install)."
+	return 0
+}
+
+# ---------------------------------------------------------------------------
 # options
 # ---------------------------------------------------------------------------
 opt_local_symlink() {
@@ -1594,12 +1664,14 @@ opt_local_symlink() {
 			warn "DRY-RUN: no temp dir available — skipping the build emulation"
 			install_artifact link "$REPO/dist/jgrep.js" "" "$DEST_DIR" "$REPO/dist/jgrep.js"
 		fi
+		refresh_agent_skill_best_effort
 		log "==> dry-run complete (option 1) — nothing was mutated"
 		return 0
 	fi
 	build_local_real
 	install_artifact link "$REPO/dist/jgrep.js" "$REPO/dist/jgrep.js" "$DEST_DIR" "$REPO/dist/jgrep.js"
 	verify_install "$DEST_DIR"
+	refresh_agent_skill_best_effort
 	return 0
 }
 
@@ -1614,12 +1686,14 @@ opt_local_copy() {
 			warn "DRY-RUN: no temp dir available — skipping the build emulation"
 			install_artifact copy "" "" "$DEST_DIR" "$REPO/dist/jgrep.js"
 		fi
+		refresh_agent_skill_best_effort
 		log "==> dry-run complete (option 2) — nothing was mutated"
 		return 0
 	fi
 	build_local_real
 	install_artifact copy "$REPO/dist/jgrep.js" "$REPO/dist/jgrep.js" "$DEST_DIR" "$REPO/dist/jgrep.js"
 	verify_install "$DEST_DIR"
+	refresh_agent_skill_best_effort
 	return 0
 }
 
@@ -1640,6 +1714,11 @@ opt_remote_copy() {
 			optno="3"
 		fi
 		build_from_remote_dry "$remote"
+		# [3] refreshes the agent skill too; [4] (upstream main) never does —
+		# the upstream tree has no skills/jgrep to refresh from
+		if [ "$remote" = "origin" ]; then
+			refresh_agent_skill_best_effort
+		fi
 		log "==> dry-run complete (option $optno) — nothing was mutated"
 		return 0
 	fi
@@ -1649,6 +1728,11 @@ opt_remote_copy() {
 	log "==> built SHA: $BUILD_SHA"
 	install_artifact copy "$BUILD_OUTPUT" "$BUILD_OUTPUT" "$DEST_DIR" "$BUILD_OUTPUT"
 	verify_install "$DEST_DIR"
+	# [3] refreshes the agent skill too; [4] (upstream main) never does —
+	# the upstream tree has no skills/jgrep to refresh from
+	if [ "$remote" = "origin" ]; then
+		refresh_agent_skill_best_effort
+	fi
 	return 0
 }
 
