@@ -130,9 +130,9 @@ test("outroLine: mentions the model in play via the chosen provider", () => {
 // ---- universal skills installer (vercel-labs/skills) --------------------------
 
 test("skillsInstallCommand: exact installer argv, path with spaces stays one argv element", () => {
-  expect(skillsInstallCommand("/repo/skill"))
-    .toEqual(["npx", "-y", "skills", "add", "/repo/skill", "-g", "-y"]);
-  const spaced = "/Users/me/My Code/jgrep/skill";
+  expect(skillsInstallCommand("/repo/skills"))
+    .toEqual(["npx", "-y", "skills", "add", "/repo/skills", "-g", "-y"]);
+  const spaced = "/Users/me/My Code/jgrep/skills";
   expect(skillsInstallCommand(spaced)).toEqual(["npx", "-y", "skills", "add", spaced, "-g", "-y"]);
   expect(skillsInstallCommand(spaced)[4]).toBe(spaced); // never re-split: spawned with shell:false
 });

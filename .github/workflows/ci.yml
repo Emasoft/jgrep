@@ -19,3 +19,5 @@ jobs:
       - run: bun test src/
       - run: bun run build
       - run: node dist/jgrep.js --help
+      - name: Validate agent skill
+        run: npx -y skills-ref@latest validate skills/jgrep

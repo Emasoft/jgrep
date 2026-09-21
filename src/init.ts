@@ -29,7 +29,7 @@ import {
 declare const process: { platform: string; exit(code: number): never };
 
 export const REPO_URL = "https://github.com/Emasoft/jgrep";
-const SKILL_SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "skill", "SKILL.md");
+const SKILL_SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "skills", "jgrep", "SKILL.md");
 
 // ---- wizard data + pure helpers (tested in init.test.ts) ----------------------
 
@@ -263,19 +263,21 @@ export async function init() {
   // If it can't run (npx missing, offline, non-zero exit), fall back to copying the
   // bundled SKILL.md into the canonical ~/.agents/skills/jgrep standard folder.
   if (fs.existsSync(SKILL_SRC)) {
-    const skillDir = path.dirname(SKILL_SRC); // the dir IS the skill
+    // SKILL.md sits at <pkg>/skills/jgrep/SKILL.md: one dirname up is the skill dir,
+    // two is the skills root the `skills` installer accepts as a collection.
+    const skillsRoot = path.dirname(path.dirname(SKILL_SRC));
     const install = guard<boolean>(await p.confirm({
       message: "Install the jgrep skill into your AI agents? (via the vercel `skills` installer — Claude Code, Codex, OpenCode, Cursor, +75 more)",
       initialValue: true,
     }));
     if (install) {
-      const [cmd, ...args] = skillsInstallCommand(skillDir);
+      const [cmd, ...args] = skillsInstallCommand(skillsRoot);
       const r = spawnSync(cmd, args, { stdio: "inherit", shell: false });
       if (!r.error && r.status === 0) {
         p.log.success("Skill installed to all detected agents (manage later with `npx skills list`).");
       } else {
         installToAgentsDir(SKILL_SRC, os.homedir());
-        p.log.warn(`fallback: copied the skill to ~/.agents/skills/jgrep (supported by late cli; run 'npx skills add ${skillDir} -g' to target specific agents)`);
+        p.log.warn(`fallback: copied the skill to ~/.agents/skills/jgrep (supported by late cli; run 'npx skills add ${skillsRoot} -g' to target specific agents)`);
       }
     }
     if (legacySkillCopies(os.homedir()).length) {

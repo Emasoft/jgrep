@@ -173,7 +173,7 @@ jgrep --json "spawns a child process" src/ | jq '.hits[].file'
 `jgrep init` installs the skill into every agent-skills harness (Claude Code,
 Codex, OpenCode, Cursor, +75 more) via the vercel `skills` installer, falling
 back to the standard `~/.agents/skills/jgrep` folder. Manually:
-`npx skills add <pkg-root>/skill -g` (from a repo checkout: `npx skills add ./skill -g`).
+`npx skills add <pkg-root>/skills -g` (from a repo checkout: `npx skills add ./skills -g`).
 
 The skill also has the agent run a few `--diff --staged` rules on its own
 change before committing: a second model checking the first one's work, for
