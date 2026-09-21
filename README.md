@@ -337,6 +337,20 @@ bun test src/     # unit tests, no network
 bun run build     # dist/jgrep.js, plain node, deps bundled
 ```
 
+### Live e2e (opt-in)
+
+`src/e2e.live.test.ts` exercises the real OpenRouter path: 4 live calls — a
+behavioral code query, a rows classification, the invalid-key error taxonomy,
+and the key probe — costing about **$0.005** per full run.
+
+```bash
+JGREP_E2E_LIVE=1 bun test src/e2e.live.test.ts   # needs OPENROUTER_API_KEY
+```
+
+It never runs in CI: the suite is double-gated on the opt-in `JGREP_E2E_LIVE=1`
+env var AND on `CI` being unset (GitHub Actions always sets `CI`), so no CI run
+can trigger spend. Without the flag, `bun test` reports these tests as skipped.
+
 ### install-dev.sh (dev only)
 
 `install-dev.sh` is strictly a development installer for this checkout —
