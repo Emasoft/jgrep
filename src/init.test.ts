@@ -13,8 +13,9 @@ declare const process: { env: Record<string, string | undefined>; platform: stri
 
 import { BACKENDS, keyFilePath, readKeyFile, resolveApiKey, writeKeyFile } from "./providers";
 import {
-  PROVIDER_CHOICES, existingKeyMessage, gatewayBackend, keyPromptMessage, mergeLegacyEnv,
-  outroLine, rejectionHint, storageLine, storageOptions, verifyHost,
+  PROVIDER_CHOICES, agentsSkillDir, existingKeyMessage, gatewayBackend, installToAgentsDir,
+  keyPromptMessage, legacySkillCopies, mergeLegacyEnv, outroLine, rejectionHint,
+  skillsInstallCommand, storageLine, storageOptions, verifyHost,
 } from "./init";
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-i-"));
@@ -124,4 +125,53 @@ test("outroLine: mentions the model in play via the chosen provider", () => {
   expect(outroLine(BACKENDS.typesafe)).toBe("Ready (jev-latest via typesafe).");
   expect(outroLine(BACKENDS.openrouter, "~typesafe/jev-1.13")).toBe("Ready (~typesafe/jev-1.13 via openrouter).");
   expect(outroLine(gatewayBackend("https://gw.example.com/v1"), "jev-latest")).toBe("Ready (jev-latest via gateway).");
+});
+
+// ---- universal skills installer (vercel-labs/skills) --------------------------
+
+test("skillsInstallCommand: exact installer argv, path with spaces stays one argv element", () => {
+  expect(skillsInstallCommand("/repo/skill"))
+    .toEqual(["npx", "-y", "skills", "add", "/repo/skill", "-g", "-y"]);
+  const spaced = "/Users/me/My Code/jgrep/skill";
+  expect(skillsInstallCommand(spaced)).toEqual(["npx", "-y", "skills", "add", spaced, "-g", "-y"]);
+  expect(skillsInstallCommand(spaced)[4]).toBe(spaced); // never re-split: spawned with shell:false
+});
+
+test("agentsSkillDir: ~/.agents/skills/jgrep under the given home", () => {
+  expect(agentsSkillDir("/home/u")).toBe(path.join("/home/u", ".agents", "skills", "jgrep"));
+  expect(agentsSkillDir("/")).toBe(path.join("/", ".agents", "skills", "jgrep"));
+});
+
+test("installToAgentsDir: mkdir-p + copies SKILL.md into a temp home, content equal", () => {
+  const home = tmp(), src = path.join(tmp(), "SKILL.md");
+  fs.writeFileSync(src, "---\nname: jgrep\n---\nbody");
+  expect(installToAgentsDir(src, home)).toBeUndefined(); // void per contract
+  const dest = path.join(home, ".agents", "skills", "jgrep", "SKILL.md");
+  expect(fs.readFileSync(dest, "utf8")).toBe("---\nname: jgrep\n---\nbody");
+  expect(agentsSkillDir(home)).toBe(path.dirname(dest)); // helper agreement
+});
+
+test("installToAgentsDir: overwrites an older copy with the new content", () => {
+  const home = tmp(), src = path.join(tmp(), "SKILL.md");
+  fs.writeFileSync(src, "old");
+  installToAgentsDir(src, home);
+  fs.writeFileSync(src, "new");
+  installToAgentsDir(src, home);
+  expect(fs.readFileSync(path.join(agentsSkillDir(home), "SKILL.md"), "utf8")).toBe("new");
+});
+
+test("legacySkillCopies: lists pre-0.4 claude/codex copies that exist, ignores the rest", () => {
+  const home = tmp();
+  expect(legacySkillCopies(home)).toEqual([]); // nothing installed
+  fs.mkdirSync(path.join(home, ".claude", "skills", "jgrep"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".claude", "skills", "jgrep", "SKILL.md"), "old");
+  expect(legacySkillCopies(home)).toEqual([path.join(home, ".claude", "skills", "jgrep", "SKILL.md")]);
+  fs.mkdirSync(path.join(home, ".codex", "skills", "jgrep"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".codex", "skills", "jgrep", "SKILL.md"), "old");
+  expect(legacySkillCopies(home)).toEqual([
+    path.join(home, ".claude", "skills", "jgrep", "SKILL.md"),
+    path.join(home, ".codex", "skills", "jgrep", "SKILL.md"),
+  ]);
+  fs.mkdirSync(path.join(home, ".cursor"), { recursive: true }); // unknown agent home: not legacy
+  expect(legacySkillCopies(home)).not.toContain(path.join(home, ".cursor", "skills", "jgrep", "SKILL.md"));
 });

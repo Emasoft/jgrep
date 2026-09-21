@@ -1,6 +1,7 @@
 // `jgrep init`: interactive setup. Provider -> gateway URL (gateway only) -> key
-// (keep-existing or paste+verify) -> where to store -> agent skills (opt-in) ->
-// star prompt. Every step is skippable with ctrl-c.
+// (keep-existing or paste+verify) -> where to store -> agent skills via the vercel
+// `skills` universal installer (opt-in) -> star prompt. Every step is skippable
+// with ctrl-c.
 //
 // Step 8: per-provider key setup. The wizard provisions any of the three backends
 // (typesafe / openrouter / gateway) instead of assuming TypeSafe. The interactive
@@ -16,9 +17,8 @@ import path from "node:path";
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo
 import { fileURLToPath } from "node:url";
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo
-import { execFile } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import * as p from "@clack/prompts";
-import { installSkills } from "./jgrep";
 import {
   BACKENDS, PROVIDER_URLS, keyFilePath, legacyEnvFile, resolveApiKey, verifyApiKey,
   writeKeyFile, type Backend,
@@ -119,6 +119,39 @@ export function mergeLegacyEnv(existing: string | null, keyEnv: string, key: str
   });
   while (kept.length > 0 && kept[kept.length - 1].trim() === "") kept.pop(); // no blank-line pile-up
   return [...kept, `${keyEnv}=${key}`].join("\n") + "\n";
+}
+
+/** Argv for the vercel `skills` universal installer (github.com/vercel-labs/skills):
+ *  `-g` installs to user scope (`~/<agent>/skills/`, all detected agent harnesses —
+ *  Claude Code, Codex, OpenCode, Cursor, +75 more), `-y` skips every prompt. Returned
+ *  as an argv array and spawned with shell:false, so a skill path containing spaces is
+ *  passed through verbatim instead of being re-interpreted by a shell. */
+export function skillsInstallCommand(skillDir: string): string[] {
+  return ["npx", "-y", "skills", "add", skillDir, "-g", "-y"];
+}
+
+/** Canonical standard skills folder (`~/.agents/skills/jgrep`) — where harnesses
+ *  without a dedicated directory (and the late cli, soon) look for skills. */
+export function agentsSkillDir(home: string): string {
+  return path.join(home, ".agents", "skills", "jgrep");
+}
+
+/** Fallback for when the universal installer can't run (no npx, offline, non-zero
+ *  exit): copy the bundled SKILL.md into ~/.agents/skills/jgrep — the same mkdir-p +
+ *  copy the old per-harness installSkills did, into the one standard location. */
+export function installToAgentsDir(skillSrc: string, home: string): void {
+  const dir = agentsSkillDir(home);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.copyFileSync(skillSrc, path.join(dir, "SKILL.md"));
+}
+
+/** Pre-0.4 per-harness copies the old wizard wrote (~/.claude, ~/.codex); the wizard
+ *  mentions them once so users can prune stale duplicates now that the universal
+ *  installer manages installs. Only SKILL.md files that actually exist are listed. */
+export function legacySkillCopies(home: string): string[] {
+  return ["claude", "codex"]
+    .map((a) => path.join(home, `.${a}`, "skills", "jgrep", "SKILL.md"))
+    .filter((f) => fs.existsSync(f));
 }
 
 // ---- wizard plumbing ----------------------------------------------------------
@@ -224,19 +257,29 @@ export async function init() {
     }
   }
 
-  // 4. agent skills (opt-in)
-  const agents = [
-    { value: "claude", label: "Claude Code", hint: "~/.claude/skills/jgrep" },
-    { value: "codex", label: "Codex", hint: "~/.codex/skills/jgrep" },
-  ].filter((a) => fs.existsSync(path.join(os.homedir(), `.${a.value}`)));
-  if (agents.length && fs.existsSync(SKILL_SRC)) {
-    const picked = guard<string[]>(await p.multiselect({
-      message: "Teach your coding agents to use jgrep? (space to toggle, enter to continue)",
-      options: agents,
-      required: false,
+  // 4. agent skills (opt-in): the vercel `skills` installer auto-detects every
+  // agent-skills harness (Claude Code, Codex, OpenCode, Cursor, +75 more) and has
+  // its own interactive UI — spawn with stdio:"inherit", never a clack spinner.
+  // If it can't run (npx missing, offline, non-zero exit), fall back to copying the
+  // bundled SKILL.md into the canonical ~/.agents/skills/jgrep standard folder.
+  if (fs.existsSync(SKILL_SRC)) {
+    const skillDir = path.dirname(SKILL_SRC); // the dir IS the skill
+    const install = guard<boolean>(await p.confirm({
+      message: "Install the jgrep skill into your AI agents? (via the vercel `skills` installer — Claude Code, Codex, OpenCode, Cursor, +75 more)",
+      initialValue: true,
     }));
-    if (picked.length) {
-      for (const dir of installSkills(SKILL_SRC, os.homedir(), picked)) p.log.success(`Skill installed: ${dir}`);
+    if (install) {
+      const [cmd, ...args] = skillsInstallCommand(skillDir);
+      const r = spawnSync(cmd, args, { stdio: "inherit", shell: false });
+      if (!r.error && r.status === 0) {
+        p.log.success("Skill installed to all detected agents (manage later with `npx skills list`).");
+      } else {
+        installToAgentsDir(SKILL_SRC, os.homedir());
+        p.log.warn(`fallback: copied the skill to ~/.agents/skills/jgrep (supported by late cli; run 'npx skills add ${skillDir} -g' to target specific agents)`);
+      }
+    }
+    if (legacySkillCopies(os.homedir()).length) {
+      p.log.message("note: a pre-0.4 skill copy exists in ~/.claude|~/.codex/skills/jgrep — the skills installer now manages installs; remove stale copies at will");
     }
   }
 

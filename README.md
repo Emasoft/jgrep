@@ -45,7 +45,8 @@ jgrep init           # pick a provider, paste your key, pick where to keep it, d
 
 `jgrep init` first asks **which provider** — TypeSafe, OpenRouter, or a
 self-hosted gateway — verifies the key against it, stores it with `chmod 600`,
-and optionally teaches Claude Code / Codex to use jgrep. Get a key at
+and optionally installs the jgrep skill into your AI agents (every harness,
+via the vercel `skills` installer). Get a key at
 [console.typesafe.ai](https://console.typesafe.ai) or
 [openrouter.ai/keys](https://openrouter.ai/keys).
 
@@ -155,9 +156,14 @@ list of ranges instead of whole files. On a 115 KB module the agent read
 6 KB of matching chunks instead of everything.
 
 ```bash
-jgrep init                   # tick "Claude Code" / "Codex" to install the skill
+jgrep init                   # offers installing the skill into your AI agents
 jgrep --json "spawns a child process" src/ | jq '.hits[].file'
 ```
+
+`jgrep init` installs the skill into every agent-skills harness (Claude Code,
+Codex, OpenCode, Cursor, +75 more) via the vercel `skills` installer, falling
+back to the standard `~/.agents/skills/jgrep` folder. Manually:
+`npx skills add <pkg-root>/skill -g` (from a repo checkout: `npx skills add ./skill -g`).
 
 The skill also has the agent run a few `--diff --staged` rules on its own
 change before committing: a second model checking the first one's work, for

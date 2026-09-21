@@ -29,8 +29,9 @@ jgrep init           # pick a provider, paste your key, pick where to keep it
 
 `jgrep init` asks **which provider** first (typesafe | openrouter | gateway),
 verifies the key against it, stores it with `chmod 600` in
-`~/.config/jgrep/<provider>.key` by default, and optionally teaches Claude Code
-/ Codex to use jgrep. Key env var already exported? Skip init.
+`~/.config/jgrep/<provider>.key` by default, and optionally installs this skill
+into your agents via the vercel `skills` installer (every harness; fallback
+`~/.agents/skills/jgrep`). Key env var already exported? Skip init.
 
 Running from a local checkout instead of npm:
 
@@ -275,12 +276,13 @@ list of ranges instead of whole files. On a 115 KB module the agent read
 6 KB of matching chunks instead of everything.
 
 ```bash
-jgrep init                   # installs the skill into Claude Code / Codex
+jgrep init                   # installs this skill into your AI agents (every harness)
 jgrep --json "spawns a child process" src/ | jq '.hits[].file'
 ```
 
-`jgrep init` installs this skill to `~/.claude/skills/jgrep` and
-`~/.codex/skills/jgrep`. The skill also has the agent run a few
+`jgrep init` installs this skill via the vercel `skills` installer into every
+agent-skills harness (fallback: `~/.agents/skills/jgrep`; manual:
+`npx skills add <pkg-root>/skill -g`). The skill also has the agent run a few
 `--diff --staged` rules on its own change before committing: a second model
 checking the first one's work, for a fraction of a cent.
 
