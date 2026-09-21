@@ -284,7 +284,10 @@ jgrep [options] --rows <file> --questions <q.json> [--out scored.csv]
 1. **Files** come from `git ls-files` (untracked included, ignored excluded),
    or a directory walk. Binaries and files over 1 MB are skipped.
 2. **Chunks**: each file is split at column-0 line starts into 5 to 60 line
-   pieces. With `--diff`, each hunk is a chunk and keeps its `+`/`-` markers.
+   pieces. Markdown files (`.md`/`.mdx`) are split at their headings instead,
+   each chunk carrying its section trail (`jgrep > Help`) as context, and fenced
+   code blocks are never split. With `--diff`, each hunk is a chunk and keeps
+   its `+`/`-` markers.
 3. **One request, 16 chunks, 16 questions**: `state.chunks[]` plus a Noul
    question per chunk, *"look only at chunk c3, does it match: …"*.
 4. **Threshold**: probabilities at or above `-t` are printed in file order.
@@ -407,6 +410,15 @@ Fool-proofing, by design:
 - **Idempotent** — installing the same build again is a no-op ("already up to
   date"), and uninstalling with nothing installed prints "jgrep is not
   installed — nothing to do" and exits 0.
+- **Agent-skill auto-refresh** — after a local install ([1]/[2]/[3]) the agent
+  skill (`skills/jgrep/SKILL.md`) is refreshed too: the vercel `skills`
+  installer (`npx -y skills add ./skills -g -y`) updates every detected
+  harness, falling back to `~/.agents/skills/jgrep` when the installer fails
+  or is offline. Without this a dev-folder install would leave AI harnesses
+  quoting stale flags (the skill embeds a verbatim copy of `jgrep --help`).
+  Upstream-source installs ([4]) skip the refresh (no skill in that tree), and
+  the refresh is best-effort — it never fails the install. The manual
+  alternative is unchanged: `npx skills add ./skills -g`.
 
 The menu numbers are a stable contract: they will never be renumbered.
 

@@ -308,7 +308,10 @@ jgrep -a -t 0.3 "handles timezone conversions" lib/ | head -20          # wide n
 1. **Files** come from `git ls-files` (untracked included, ignored excluded),
    or a directory walk. Binaries and files over 1 MB are skipped.
 2. **Chunks**: each file is split at column-0 line starts into 5 to 60 line
-   pieces. With `--diff`, each hunk is a chunk and keeps its `+`/`-` markers.
+   pieces. Markdown files are split at their headings instead, each chunk
+   carrying its section trail (like `jgrep > Help`) as context, and fenced code
+   blocks are never split. With `--diff`, each hunk is a chunk and keeps its
+   `+`/`-` markers.
 3. **One request, 16 chunks, 16 questions**: `state.chunks[]` plus a Noul
    question per chunk, *"look only at chunk c3, does it match: …"*.
 4. **Threshold**: probabilities at or above `-t` are printed in file order.

@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- markdown-aware chunking: .md/.mdx files split at headings with section-trail context; fenced code blocks never split — sub-section extraction via -C/--json start-end
+
 ## [0.4.0] - 2026-09-20 — providers, reliability, isolation, benchmarks (issue #1: WI-1, WI-8, WI-11, WI-12)
 
 ### Added
@@ -20,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Agent-skill install** via the vercel `skills` universal installer (`npx skills add`, every agent harness), falling back to `~/.agents/skills/jgrep`.
 - **Benchmark harness**: `bench/accuracy.ts` (SMS spam + AG News) and `bench/code_selection.ts`, with fixtures committed so runs are reproducible; executed on demand by the `workflow_dispatch` Bench workflow.
 - **Published accuracy numbers** (OpenRouter, `~typesafe/jev-latest`): SMS 0.95, AG News 0.84, code selection 1.00.
-- install-dev.sh: dev-only interactive setup script; --choice N runs menu actions unattended for headless dev boxes (not shipped in the npm package); detects installed type/path ([CURRENT] markers), full uninstall (npm/symlink/copy/brew-aware, identity-verified, idempotent), npm/GitHub identity pinning (jevgrep ↔ kyu1204/jgrep)
+- install-dev.sh: dev-only interactive setup script; --choice N runs menu actions unattended for headless dev boxes (not shipped in the npm package); detects installed type/path ([CURRENT] markers), full uninstall (npm/symlink/copy/brew-aware, identity-verified, idempotent), npm/GitHub identity pinning (jevgrep ↔ kyu1204/jgrep); auto-refreshes the agent skill after local installs
 
 ### Changed
 
