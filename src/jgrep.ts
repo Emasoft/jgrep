@@ -6,7 +6,9 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { postSystemOne } from "./providers";
+import { postSystemOne, RateLimiter, type PostOpts } from "./providers";
+import { runPool, type PoolResult } from "./pool";
+import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
 
 export const ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 export const MODEL = "jev-latest";
@@ -15,6 +17,7 @@ export const USD_PER_M_INPUT = 0.042;
 export interface Chunk { file: string; start: number; end: number; text: string }
 export interface Hit extends Chunk { p: number }
 export type Kind = "code" | "diff";
+export type Fetch = typeof fetch;
 
 // ---- chunking ---------------------------------------------------------------
 // ponytail: language-agnostic heuristic (column-0 line starts a new block).
@@ -126,18 +129,6 @@ export function buildRequest(question: string, chunks: Chunk[], kind: Kind = "co
   return { model: MODEL, state, questions };
 }
 
-export type Fetch = typeof fetch;
-
-// postSystemOne moved to ./providers — the retry engine now has per-attempt abort
-// timeouts, a batch deadline that includes retries, Retry-After-aware full-jitter
-// backoff and typed JevProviderErrors. Re-exported so ./rows keeps importing it from here.
-export { postSystemOne };
-
-async function ask(question: string, chunks: Chunk[], kind: Kind, apiKey: string, f: Fetch): Promise<{ ps: number[]; tokens: number }> {
-  const json = await postSystemOne(buildRequest(question, chunks, kind), apiKey, { fetchImpl: f });
-  return { ps: chunks.map((_, i) => json.answers[`c${i}`]?.noul ?? NaN), tokens: json.usage?.input_tokens ?? 0 };
-}
-
 // ---- cache ------------------------------------------------------------------
 // ponytail: one JSON file; move to sqlite if it passes a few MB.
 const CACHE_FILE = path.join(os.homedir(), ".cache", "jgrep", "cache.json");
@@ -154,17 +145,38 @@ export function saveCache(c: Cache) {
 const key = (q: string, kind: Kind, c: Chunk) => createHash("sha1").update(`${MODEL}\0${kind}\0${q}\0${c.text}`).digest("hex");
 
 // ---- core -------------------------------------------------------------------
+// Retry/deadline defaults live in ONE place (here); jgrep()/scoreRows() resolve
+// them once per run and the pool workers only read the resolved values.
+export const DEFAULT_TIMEOUT_SEC = 15;         // per-batch deadline INCLUDING retries
+export const DEFAULT_REQUEST_TIMEOUT_SEC = 30; // per attempt
+export const DEFAULT_MAX_RETRIES = 4;          // => 5 total attempts
+
 export interface Options {
   threshold: number; batch: number; concurrency: number; apiKey: string; kind?: Kind;
+  timeoutSec?: number;         // per-batch deadline, retries included
+  requestTimeoutSec?: number;  // per attempt
+  maxRetries?: number;         // failed attempts tolerated before the final error
+  ratePerSec?: number;         // token-bucket pacing across all requests; 0/undefined = unlimited
+  failFast?: boolean;          // rethrow the first fatal error instead of isolating it
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
-export interface Result { hits: Hit[]; all: Hit[]; chunks: number; tokens: number; cached: number }
+export interface ChunkError { file: string; start: number; end: number; kind: JevErrorKind; message: string }
+export interface Result { hits: Hit[]; all: Hit[]; chunks: number; tokens: number; cached: number; errors: ChunkError[] }
+
+/** What one batch worker hands back; runPool results are completion-ordered, so the
+ *  batch index rides along and `all` is re-associated after the pool settles. */
+interface BatchOutcome { index: number; entries: { chunkIndex: number; p: number }[] }
+
+/** Appended to an invalid_api_key hint when at least one batch succeeded earlier in the
+ *  SAME run: a 401/403 then means the key expired/was revoked, not that the user handed
+ *  over the wrong key. */
+export const KEY_WORKED_EARLIER_HINT = "the key worked earlier this run — it may have been expired or revoked";
 
 export async function jgrep(question: string, chunks: Chunk[], o: Options): Promise<Result> {
   const kind = o.kind ?? "code";
   const cache = o.cache ?? {};
   const f = o.fetchImpl ?? fetch;
-  const all: Hit[] = new Array(chunks.length);
+  const all: (Hit | undefined)[] = new Array(chunks.length); // errored chunks stay unset
   const todo: number[] = [];
   chunks.forEach((c, i) => {
     const hit = cache[key(question, kind, c)];
@@ -173,22 +185,76 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
   const cached = chunks.length - todo.length;
   const batches: number[][] = [];
   for (let i = 0; i < todo.length; i += o.batch) batches.push(todo.slice(i, i + o.batch));
-  let tokens = 0, done = 0, next = 0;
-  const worker = async () => {
-    while (next < batches.length) {
-      const b = batches[next++];
-      const { ps, tokens: t } = await ask(question, b.map((i) => chunks[i]), kind, o.apiKey, f);
-      tokens += t;
-      b.forEach((ci, j) => {
-        all[ci] = { ...chunks[ci], p: ps[j] };
-        if (Number.isFinite(ps[j])) cache[key(question, kind, chunks[ci])] = ps[j];
-      });
-      o.onProgress?.(++done, batches.length);
-    }
+  // One resolution of the retry/deadline options for the whole run (the worker only reads these).
+  const timeoutMs = (o.timeoutSec ?? DEFAULT_TIMEOUT_SEC) * 1000;
+  const post: PostOpts = {
+    fetchImpl: f,
+    requestTimeoutMs: (o.requestTimeoutSec ?? DEFAULT_REQUEST_TIMEOUT_SEC) * 1000,
+    maxRetries: o.maxRetries ?? DEFAULT_MAX_RETRIES,
+    limiter: o.ratePerSec && o.ratePerSec > 0 ? new RateLimiter(o.ratePerSec, Math.max(1, o.concurrency)) : undefined,
   };
-  await Promise.all(Array.from({ length: Math.min(o.concurrency, batches.length) }, worker));
-  const hits = all.filter((h) => h.p >= o.threshold);
-  return { hits, all, chunks: chunks.length, tokens, cached };
+  let tokens = 0;
+  // Run-level success flag: drives the invalid_api_key expired-vs-wrong-key hint.
+  // Tracked HERE (not PoolResult) because failFast throws the pool result away.
+  let hadSuccess = false;
+  const worker = async (b: number[], index: number): Promise<BatchOutcome> => {
+    const res = await postSystemOne(buildRequest(question, b.map((i) => chunks[i]), kind), o.apiKey, {
+      ...post,
+      deadlineMs: Date.now() + timeoutMs, // per-batch deadline, retries included
+    });
+    tokens += res.usage?.input_tokens ?? 0;
+    // Finite p-values go straight into the in-memory cache object: cli.ts persists it in
+    // a finally, so answers paid for survive even when other batches fail.
+    const entries = b.map((ci, j) => {
+      const p = res.answers[`c${j}`]?.noul ?? NaN;
+      if (Number.isFinite(p)) cache[key(question, kind, chunks[ci])] = p;
+      return { chunkIndex: ci, p };
+    });
+    hadSuccess = true; // this batch's request succeeded — set before returning
+    return { index, entries };
+  };
+  let pool: PoolResult<BatchOutcome>;
+  try {
+    pool = await runPool(batches, {
+      concurrency: o.concurrency,
+      failFast: o.failFast,
+      onProgress: o.onProgress,
+    }, worker);
+  } catch (e) {
+    // failFast: runPool rethrows the first fatal error and PoolResult.hadSuccess is lost
+    // with it, so the run-level flag above is the only remaining evidence that the key
+    // worked earlier this run. Amend the hint; otherwise rethrow untouched.
+    if (e instanceof JevProviderError && isFatalError(e) && e.kind === "invalid_api_key" && hadSuccess)
+      e.hint = [e.hint, KEY_WORKED_EARLIER_HINT].filter(Boolean).join(" ");
+    throw e;
+  }
+  for (const r of pool.results) for (const e of r.entries) all[e.chunkIndex] = { ...chunks[e.chunkIndex], p: e.p };
+  // Not failFast: recorded 401/403s get the same expired-vs-wrong-key distinction. One
+  // clean place — mutate the JevProviderError's hint in pool.errors BEFORE mapping onto
+  // chunks (ChunkError carries only kind+message; the hint stays on the provider error
+  // that pool-level consumers see).
+  if (pool.hadSuccess) {
+    for (const e of pool.errors) {
+      if (e.error.kind === "invalid_api_key") e.error.hint = [e.error.hint, KEY_WORKED_EARLIER_HINT].filter(Boolean).join(" ");
+    }
+  }
+  const errors: ChunkError[] = pool.errors.flatMap((e) =>
+    batches[e.index].map((ci) => ({ file: chunks[ci].file, start: chunks[ci].start, end: chunks[ci].end, kind: e.error.kind, message: e.error.message })));
+  if (pool.aborted) {
+    // Batches that were dispatched all reported (success or their own error); whatever
+    // was never attempted is reported as a breaker error. No cache entries, no hits.
+    const settled = new Set<number>(pool.results.map((r) => r.index).concat(pool.errors.map((e) => e.index)));
+    for (let bi = 0; bi < batches.length; bi++) {
+      if (settled.has(bi)) continue;
+      for (const ci of batches[bi]) {
+        errors.push({ file: chunks[ci].file, start: chunks[ci].start, end: chunks[ci].end, kind: "circuit_breaker_open", message: "not attempted: provider failing consistently (circuit breaker open)" });
+      }
+    }
+  }
+  const hits: Hit[] = [];
+  const ordered: Hit[] = [];
+  for (const h of all) if (h) { ordered.push(h); if (h.p >= o.threshold) hits.push(h); }
+  return { hits, all: ordered, chunks: chunks.length, tokens, cached, errors };
 }
 
 // ---- config -----------------------------------------------------------------
