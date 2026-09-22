@@ -106,9 +106,11 @@ usage: jgrep init                       interactive setup (provider, key, agent 
   -t, --threshold <p>   print chunks with probability >= p (default 0.7)
   -C, --show            print the matching chunk body under each hit
   -a, --all             print every chunk with its probability, best first
+      --group           one verdict per whitespace-signature group; --json adds "groups"
+      --votes <n>       judge every chunk N times (1-5, default 1); the median probability wins
+      --verify          strict re-ask of every hit; the hit stands only at p >= 0.6 × threshold
       --json            machine-readable output: hits as a JSON array
-                        (v0.3.0-compatible: [{file,start,end,p,text}]; rows:
-                        [flattened answer objects, null for errored rows])
+                        (v0.3.0-compatible: [{file,start,end,p,text}]; rows: flattened objects)
       --json-errors     with --json: a JSON object instead — code mode
                         {hits:[...], errors:[{file,start,end,kind,message}]};
                         rows mode {answers:[...], errors:[{row,kind,message}]}
@@ -136,8 +138,7 @@ usage: jgrep init                       interactive setup (provider, key, agent 
 
 exit status: 0 when something matched, 1 when nothing did, 2 on error or when any
 chunk errored (partial failure: hits and errors are both reported; every failed
-chunk carries a typed kind — timeout, rate_limited, insufficient_credits, ... —
-with an actionable hint on stderr).
+chunk carries a typed kind — timeout, rate_limited, insufficient_credits, ... — with a hint).
 CI lint:    ! jgrep --diff origin/main "adds an endpoint without an auth check"
 
 examples:

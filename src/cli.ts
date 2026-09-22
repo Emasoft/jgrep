@@ -32,9 +32,11 @@ usage: jgrep init                       interactive setup (provider, key, agent 
   -t, --threshold <p>   print chunks with probability >= p (default 0.7)
   -C, --show            print the matching chunk body under each hit
   -a, --all             print every chunk with its probability, best first
+      --group           one verdict per whitespace-signature group; --json adds "groups"
+      --votes <n>       judge every chunk N times (1-5, default 1); the median probability wins
+      --verify          strict re-ask of every hit; the hit stands only at p >= 0.6 × threshold
       --json            machine-readable output: hits as a JSON array
-                        (v0.3.0-compatible: [{file,start,end,p,text}]; rows:
-                        [flattened answer objects, null for errored rows])
+                        (v0.3.0-compatible: [{file,start,end,p,text}]; rows: flattened objects)
       --json-errors     with --json: a JSON object instead — code mode
                         {hits:[...], errors:[{file,start,end,kind,message}]};
                         rows mode {answers:[...], errors:[{row,kind,message}]}
@@ -62,8 +64,7 @@ usage: jgrep init                       interactive setup (provider, key, agent 
 
 exit status: 0 when something matched, 1 when nothing did, 2 on error or when any
 chunk errored (partial failure: hits and errors are both reported; every failed
-chunk carries a typed kind — timeout, rate_limited, insufficient_credits, ... —
-with an actionable hint on stderr).
+chunk carries a typed kind — timeout, rate_limited, insufficient_credits, ... — with a hint).
 CI lint:    ! jgrep --diff origin/main "adds an endpoint without an auth check"
 
 examples:
@@ -79,7 +80,7 @@ const c = (code: string, s: string) => (tty ? `\x1b[${code}m${s}\x1b[0m` : s);
 
 export function parse(argv: string[]) {
   const o = {
-    threshold: 0.7, batch: 16, concurrency: 16, all: false, show: false, json: false, jsonErrors: false, cache: true,
+    threshold: 0.7, batch: 16, concurrency: 16, all: false, show: false, group: false, votes: 1, verify: false, json: false, jsonErrors: false, cache: true,
     diff: null as string[] | null, rows: "", questions: "", out: "",
     api: "", model: "", timeout: 15, requestTimeout: 30, retries: 4, rate: 0, failFast: false, noProbe: false,
   };
@@ -92,6 +93,9 @@ export function parse(argv: string[]) {
     else if (a === "-c" || a === "--concurrency") o.concurrency = Number(argv[++i]);
     else if (a === "-a" || a === "--all") o.all = true;
     else if (a === "-C" || a === "--show") o.show = true;
+    else if (a === "--group") o.group = true;
+    else if (a === "--votes") o.votes = Number(argv[++i]);
+    else if (a === "--verify") o.verify = true;
     else if (a === "--json") o.json = true;
     else if (a === "--json-errors") { o.jsonErrors = true; o.json = true; } // implies --json
     else if (a === "--no-cache") o.cache = false;
@@ -123,6 +127,10 @@ export function parse(argv: string[]) {
   // batch < 1 spins the batching loop forever (+= 0) and a fraction overlaps batches;
   // 0 stays legal for timeout/rate/retries, but never for batch.
   if (!Number.isInteger(o.batch) || o.batch < 1) throw new Error("batch must be a positive integer");
+  // --votes: 1..5 — every extra vote is another question per chunk, and past 5 the
+  // re-asks stop adding signal (rejected before anything is sent or cached).
+  if (!Number.isInteger(o.votes) || o.votes < 1 || o.votes > 5)
+    throw new Error("votes must be an integer between 1 and 5");
   return { ...o, question: rest[0], paths: rest.slice(1) };
 }
 
@@ -210,11 +218,28 @@ async function main() {
       // array, byte-for-byte the old shape. Errored chunks never enter it (they
       // never enter all/hits) and surface via the stderr summary + exit 2;
       // --json-errors opts into the object so chunk errors sit next to the hits.
+      // --group opts into an object too: groups[] rides next to the hits (with
+      // --json-errors also the errors — key order hits, groups, errors keeps the
+      // documented shape prefix-stable).
       const hits = rows.map((h) => ({ file: h.file, start: h.start, end: h.end, p: h.p, text: h.text }));
-      const payload = o.jsonErrors
-        ? { hits, errors: r.errors.map((e) => ({ file: e.file, start: e.start, end: e.end, kind: e.kind, message: e.message, ...(e.hint !== undefined ? { hint: e.hint } : {}) })) }
+      const payload = o.jsonErrors || o.group
+        ? {
+            hits,
+            ...(r.groups !== undefined ? { groups: r.groups } : {}),
+            ...(o.jsonErrors ? { errors: r.errors.map((e) => ({ file: e.file, start: e.start, end: e.end, kind: e.kind, message: e.message, ...(e.hint !== undefined ? { hint: e.hint } : {}) })) } : {}),
+          }
         : hits;
       console.log(JSON.stringify(payload, null, 2));
+    } else if (o.group && r.groups) {
+      // --group text rendering: one block per signature (p desc), sites indented
+      // under the header — the siblings are the same code at other sites, so the
+      // representative range is the one to open first.
+      for (const g of r.groups) {
+        const pcol = g.p >= o.threshold ? "32" : "90";
+        console.log(`${c("90", g.sig.slice(0, 7))} ${c("36", `×${g.count}`)}  ${c(pcol, `p=${g.p.toFixed(2)}`)}`);
+        for (const s of g.sites)
+          console.log(`    ${c("35", s.file)}${c("36", ":")}${c("32", `${s.start}-${s.end}`)}`);
+      }
     } else {
       for (const h of rows) {
         const head = h.text.split("\n").find((l) => l.trim() && !l.startsWith("@@"))?.trim().slice(0, 90) ?? "";

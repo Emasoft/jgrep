@@ -199,16 +199,21 @@ export function chunkPaths(paths: string[]): Chunk[] {
 }
 
 // ---- Jev --------------------------------------------------------------------
-export function buildRequest(question: string, chunks: Chunk[], kind: Kind = "code", model = "jev-latest") {
+export function buildRequest(question: string, chunks: Chunk[], kind: Kind = "code", model = "jev-latest", votes = 1) {
   const state = { chunks: chunks.map((c, i) => ({ id: `c${i}`, file: c.file, lines: `${c.start}-${c.end}`, [kind]: c.text })) };
   const what = kind === "diff"
     ? "Does that diff hunk (lines starting with + were added, - removed) match this description"
     : "Does that code match this description";
+  const n = Math.max(1, Math.floor(votes)); // --votes (WI-2): N questions per chunk
   const questions: Record<string, unknown> = {};
   chunks.forEach((c, i) => {
     // Markdown chunks carry their heading trail so the question can name the sub-section.
     const ctx = c.context ? `[Section context: ${c.context}] ` : "";
-    questions[`c${i}`] = { type: "noul", instructions: `Look only at the chunk with id "c${i}". ${ctx}${what}: ${question}` };
+    for (let v = 0; v < n; v++) {
+      // votes=1 keeps the byte-identical `c{i}` id; N > 1 names each vote `c{i}#v{v}`
+      // (the chunk id inside the instruction stays `c{i}` — the state has one chunk entry).
+      questions[n > 1 ? `c${i}#v${v}` : `c${i}`] = { type: "noul", instructions: `Look only at the chunk with id "c${i}". ${ctx}${what}: ${question}` };
+    }
   });
   return { model, state, questions };
 }
@@ -226,12 +231,37 @@ export function saveCache(c: Cache) {
     fs.writeFileSync(CACHE_FILE, JSON.stringify(c));
   } catch { /* cache is best-effort */ }
 }
+// Normalized signature: whitespace-insensitive chunk identity. Chunks sharing
+// a signature are near-identical boilerplate — judge one, siblings inherit.
+export function chunkSignature(text: string): string {
+	return text.split("\n").map(l => l.trim()).filter(l => l.length > 0).join("\n");
+}
+
+// Intra-run signature key (WI-3): sha1 over (kind, question, normalized text).
+// Deliberately NOT the plain-text cache key above (which stays byte-exact per
+// chunk) — the signature only dedups identical chunks WITHIN a single run.
+const sigKey = (kind: Kind, q: string, c: Chunk) =>
+  createHash("sha1").update(`${kind}\0${q}\0${chunkSignature(c.text)}`).digest("hex");
+
 // Markdown chunks fold their context trail into the key; chunks without context
 // keep the exact pre-markdown key string (no trailing \0), so old cache entries stay valid.
 const key = (model: string, kind: Kind, q: string, c: Chunk) =>
   createHash("sha1")
     .update(c.context ? `${model}\0${kind}\0${q}\0${c.text}\0${c.context}` : `${model}\0${kind}\0${q}\0${c.text}`)
     .digest("hex");
+
+// ---- votes & verify (WI-2) ----------------------------------------------------
+/** Median of N probabilities; an even count averages the two middle values. */
+export function median(ps: number[]): number {
+  const s = [...ps].sort((a, b) => a - b);
+  const mid = s.length >> 1;
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+/** --verify: the pass-2 question is this strict prefix + the original instruction. */
+export const VERIFY_PREFIX = "Verify strictly — answer only if clearly matching: ";
+/** --verify hysteresis (documented): a hit stands when its re-ask p >= threshold * VERIFY_GATE. */
+export const VERIFY_GATE = 0.6;
 
 // ---- core -------------------------------------------------------------------
 // Retry/deadline defaults live in ONE place (here); jgrep()/scoreRows() resolve
@@ -248,10 +278,17 @@ export interface Options {
   maxRetries?: number;         // failed attempts tolerated before the final error
   ratePerSec?: number;         // token-bucket pacing across all requests; 0/undefined = unlimited
   failFast?: boolean;          // rethrow the first fatal error instead of isolating it
+  group?: boolean;             // --group: fill result.groups[] (the intra-run signature dedup is always on)
+  votes?: number;              // --votes: judge every chunk N times (1-5); the MEDIAN probability wins
+  verify?: boolean;            // --verify: strict re-ask of every hit; the hit stands only at p >= threshold * 0.6
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
 export interface ChunkError { file: string; start: number; end: number; kind: JevErrorKind; message: string; hint?: string }
-export interface Result { hits: Hit[]; all: Hit[]; chunks: number; tokens: number; cached: number; errors: ChunkError[]; cost?: number }
+/** One signature cluster (WI-3 --group): hits sharing a whitespace-normalized signature.
+ *  `p` is the group's best probability, `sites` are the hit sites in hit (file) order and
+ *  `representative` is the first hit's chunk body. */
+export interface Group { sig: string; p: number; count: number; sites: { file: string; start: number; end: number }[]; representative: string }
+export interface Result { hits: Hit[]; all: Hit[]; chunks: number; tokens: number; cached: number; errors: ChunkError[]; cost?: number; groups?: Group[] }
 
 /** What one batch worker hands back; runPool results are completion-ordered, so the
  *  batch index rides along and `all` is re-associated after the pool settles. A
@@ -259,6 +296,9 @@ export interface Result { hits: Hit[]; all: Hit[]; chunks: number; tokens: numbe
  *  unanswered chunk indices come back in `malformed` and the caller records them as
  *  malformed_response ChunkErrors — otherwise they would surface as p:NaN entries. */
 interface BatchOutcome { index: number; entries: { chunkIndex: number; p: number }[]; malformed: number[] }
+
+/** What one --verify batch worker hands back (same shape idea as BatchOutcome). */
+interface VerifyOutcome { index: number; got: { hit: Hit; p: number }[]; missing: Hit[] }
 
 /** Appended to an invalid_api_key hint when at least one batch succeeded earlier in the
  *  SAME run (plan §1.5): a 401/403 then means the key expired/was revoked, not that the
@@ -276,12 +316,41 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
   let apiKey = o.apiKey;
   const apiKeyOf = (): string => { apiKey ??= resolveApiKey(backend); return apiKey; };
   const all: (Hit | undefined)[] = new Array(chunks.length); // errored chunks stay unset
-  const todo: number[] = [];
+  // Signature clustering (WI-3): chunks sharing a whitespace-normalized signature are
+  // near-identical boilerplate — the FIRST cache-missing chunk of a signature (the head)
+  // enters the batch todo, siblings inherit the head's verdict once the pool settles.
+  // The plain-text cache stays byte-exact per chunk (keys unchanged); `cached` counts
+  // only genuinely cache-served chunks — an inheriting sibling is deduped, not cached.
+  const heads = new Map<string, number>();        // signature key -> head chunk index
+  const siblingsOf = new Map<string, number[]>(); // signature key -> chunk indices that inherit the verdict
+  let cached = 0;
+  // --votes (WI-2): parse() validates 1..5; library callers get clamped. N > 1 moves
+  // reads/writes to per-vote cache keys `${key}#v{i}` (every vote cached individually, so
+  // a re-run replays the same median for free) and the verdict to the MEDIAN of the N
+  // answers. votes=1 keeps the byte-exact legacy single-question request and plain keys.
+  const votes = Math.max(1, Math.min(5, Math.floor(o.votes ?? 1)));
+  const keyOf = (ci: number): string => key(model, kind, question, chunks[ci]);
+  const qid = (j: number, v: number): string => (votes > 1 ? `c${j}#v${v}` : `c${j}`);
   chunks.forEach((c, i) => {
-    const hit = cache[key(model, kind, question, c)];
-    if (hit !== undefined) all[i] = { ...c, p: hit }; else todo.push(i);
+    const k = keyOf(i);
+    if (votes > 1) {
+      const ps: number[] = [];
+      let complete = true;
+      for (let v = 0; v < votes; v++) {
+        const p = cache[`${k}#v${v}`];
+        if (typeof p === "number" && Number.isFinite(p)) ps.push(p);
+        else { complete = false; break; }
+      }
+      if (complete) { all[i] = { ...c, p: median(ps) }; cached++; return; }
+    } else {
+      const hit = cache[k];
+      if (hit !== undefined) { all[i] = { ...c, p: hit }; cached++; return; }
+    }
+    const sk = sigKey(kind, question, c);
+    if (heads.has(sk)) siblingsOf.get(sk)!.push(i);
+    else { heads.set(sk, i); siblingsOf.set(sk, []); }
   });
-  const cached = chunks.length - todo.length;
+  const todo: number[] = [...heads.values()];
   // Defensive normalization: a 0/fractional batch would spin the loop forever (+= 0)
   // or overlap batches. parse() rejects those; library callers get clamped instead.
   const batch = Math.max(1, Math.floor(o.batch));
@@ -301,7 +370,7 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
   // hint. Tracked HERE (not PoolResult) because failFast throws the pool result away.
   let hadSuccess = false;
   const worker = async (b: number[], index: number): Promise<BatchOutcome> => {
-    const res = await postSystemOne(buildRequest(question, b.map((i) => chunks[i]), kind, model), backend, apiKeyOf(), {
+    const res = await postSystemOne(buildRequest(question, b.map((i) => chunks[i]), kind, model, votes), backend, apiKeyOf(), {
       ...post,
       deadlineMs: Date.now() + timeoutMs, // per-batch deadline, retries included (§1.6.1)
     });
@@ -314,11 +383,21 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
     const entries: { chunkIndex: number; p: number }[] = [];
     const malformed: number[] = [];
     b.forEach((ci, j) => {
-      const p = res.answers[`c${j}`]?.noul;
-      if (Number.isFinite(p)) {
-        cache[key(model, kind, question, chunks[ci])] = p;
-        entries.push({ chunkIndex: ci, p });
-      } else malformed.push(ci);
+      // --votes: the verdict needs ALL N votes finite (returned ones are still cached as
+      // they arrive); an incomplete set is malformed_response — never a partial median.
+      const ps: number[] = [];
+      let complete = true;
+      for (let v = 0; v < votes; v++) {
+        const p = res.answers[qid(j, v)]?.noul;
+        if (Number.isFinite(p)) {
+          ps.push(p);
+          if (votes > 1) cache[`${keyOf(ci)}#v${v}`] = p;
+        } else complete = false;
+      }
+      if (!complete) { malformed.push(ci); return; }
+      const p = votes > 1 ? median(ps) : ps[0];
+      if (votes === 1) cache[keyOf(ci)] = p;
+      entries.push({ chunkIndex: ci, p });
     });
     hadSuccess = true; // this batch's request succeeded — set before returning (plan §1.5)
     return { index, entries, malformed };
@@ -347,20 +426,24 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
       if (e.error.kind === "invalid_api_key") e.error.hint = [e.error.hint, KEY_WORKED_EARLIER_HINT].filter(Boolean).join(" ");
     }
   }
-  const errors: ChunkError[] = pool.errors.flatMap((e) =>
-    batches[e.index].map((ci) => ({
-      file: chunks[ci].file, start: chunks[ci].start, end: chunks[ci].end,
-      kind: e.error.kind, message: e.error.message,
-      // The provider error's actionable hint rides along (cli.ts prints it under the
-      // error line and --json-errors includes it) — incl. the KEY_WORKED_EARLIER_HINT
-      // amended above.
-      ...(e.error.hint !== undefined ? { hint: e.error.hint } : {}),
-    })));
+  // Chunk-index -> ChunkError (insertion-ordered exactly like the old flatMap/push
+  // chain), so signature siblings below can look up and inherit their head's error.
+  const errByChunk = new Map<number, ChunkError>();
+  for (const e of pool.errors)
+    for (const ci of batches[e.index])
+      errByChunk.set(ci, {
+        file: chunks[ci].file, start: chunks[ci].start, end: chunks[ci].end,
+        kind: e.error.kind, message: e.error.message,
+        // The provider error's actionable hint rides along (cli.ts prints it under the
+        // error line and --json-errors includes it) — incl. the KEY_WORKED_EARLIER_HINT
+        // amended above.
+        ...(e.error.hint !== undefined ? { hint: e.error.hint } : {}),
+      });
   // A 200 that answered only some chunks of a batch: the unanswered chunks are
   // recorded per chunk here (the batch itself succeeded, so the pool saw no error).
   for (const r of pool.results)
     for (const ci of r.malformed)
-      errors.push({ file: chunks[ci].file, start: chunks[ci].start, end: chunks[ci].end, kind: "malformed_response", message: "provider returned no usable answer for this chunk" });
+      errByChunk.set(ci, { file: chunks[ci].file, start: chunks[ci].start, end: chunks[ci].end, kind: "malformed_response", message: "provider returned no usable answer for this chunk" });
   if (pool.aborted) {
     // Batches that were dispatched all reported (success or their own error); whatever
     // was never attempted is reported as a breaker error. No cache entries, no hits.
@@ -368,14 +451,125 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
     for (let bi = 0; bi < batches.length; bi++) {
       if (settled.has(bi)) continue;
       for (const ci of batches[bi]) {
-        errors.push({ file: chunks[ci].file, start: chunks[ci].start, end: chunks[ci].end, kind: "circuit_breaker_open", message: "not attempted: provider failing consistently (circuit breaker open)" });
+        errByChunk.set(ci, { file: chunks[ci].file, start: chunks[ci].start, end: chunks[ci].end, kind: "circuit_breaker_open", message: "not attempted: provider failing consistently (circuit breaker open)" });
       }
     }
   }
-  const hits: Hit[] = [];
+  const errors: ChunkError[] = [...errByChunk.values()];
+  // Signature siblings (WI-3): inherit the head's verdict — or, when the head ended up
+  // with no answer, the head's error mapped onto the sibling's own site (no silent
+  // vanish; every batch settles as a result, an error, or a breaker skip, so a verdict-
+  // less head always carries an error to inherit). Each inheriting sibling still writes
+  // its OWN plain-text cache entry, so a later run serves it without re-judging. (With
+  // --votes the sibling's per-vote values are unknown — only the median is — so the
+  // entry lands under the legacy key: a votes=1 re-run serves it; a votes>1 re-run
+  // re-judges rather than fabricate votes.)
+  for (const [sk, sibs] of siblingsOf) {
+    if (!sibs.length) continue;
+    const headIdx = heads.get(sk)!;
+    const verdict = all[headIdx];
+    if (verdict !== undefined) {
+      for (const si of sibs) {
+        cache[key(model, kind, question, chunks[si])] = verdict.p;
+        all[si] = { ...chunks[si], p: verdict.p };
+      }
+    } else {
+      const headErr = errByChunk.get(headIdx);
+      if (headErr !== undefined)
+        for (const si of sibs)
+          errors.push({ ...headErr, file: chunks[si].file, start: chunks[si].start, end: chunks[si].end });
+    }
+  }
+  let hits: Hit[] = [];
   const ordered: Hit[] = [];
   for (const h of all) if (h) { ordered.push(h); if (h.p >= o.threshold) hits.push(h); }
-  return { hits, all: ordered, chunks: chunks.length, tokens, cached, errors, ...(cost !== undefined ? { cost } : {}) };
+  // --verify (WI-2): every hit is re-asked ONCE with a strict instruction (the prefix +
+  // the original question, one question per chunk — the median already happened); the
+  // hit stands only when the re-ask p >= threshold * 0.6 (documented hysteresis: a
+  // strict rephrase naturally scores lower, so the gate is deliberately forgiving).
+  // Dropped hits leave `hits` but stay in `all` with their main-pass p. Verification
+  // verdicts cache under `${chunkKey}#verify`, so a re-run pays nothing for either pass.
+  if (o.verify && hits.length > 0) {
+    const gate = o.threshold * VERIFY_GATE;
+    const verdictOf = new Map<Hit, number>(); // hit -> pass-2 p; an ABSENT verdict failed -> fail open
+    const pending: { hit: Hit; cacheKey: string }[] = [];
+    for (const h of hits) {
+      const ck = `${key(model, kind, question, h)}#verify`;
+      const v = cache[ck];
+      if (typeof v === "number" && Number.isFinite(v)) verdictOf.set(h, v);
+      else pending.push({ hit: h, cacheKey: ck });
+    }
+    if (pending.length > 0) {
+      const vBatches: (typeof pending)[] = [];
+      for (let i = 0; i < pending.length; i += batch) vBatches.push(pending.slice(i, i + batch));
+      const vWorker = async (bp: typeof pending, index: number): Promise<VerifyOutcome> => {
+        const req = buildRequest(question, bp.map(({ hit }) => hit), kind, model);
+        for (const id of Object.keys(req.questions))
+          req.questions[id] = { type: "noul", instructions: VERIFY_PREFIX + (req.questions[id] as { instructions: string }).instructions };
+        const res = await postSystemOne(req, backend, apiKeyOf(), { ...post, deadlineMs: Date.now() + timeoutMs });
+        tokens += res.usage?.input_tokens ?? 0;
+        if (res.cost !== undefined) cost = (cost ?? 0) + res.cost;
+        const got: { hit: Hit; p: number }[] = [];
+        const missing: Hit[] = [];
+        bp.forEach(({ hit, cacheKey }, j) => {
+          const p = res.answers[`c${j}`]?.noul;
+          if (Number.isFinite(p)) { cache[cacheKey] = p; got.push({ hit, p }); }
+          else missing.push(hit);
+        });
+        return { index, got, missing };
+      };
+      let vPool: PoolResult<VerifyOutcome>;
+      try {
+        // No onProgress: the main pass already drove the CLI's d/N counter; the verify
+        // pass is a short second sweep.
+        vPool = await runPool(vBatches, { concurrency: o.concurrency, failFast: o.failFast }, vWorker);
+      } catch (e) {
+        // failFast: the main pass succeeded (there were hits), so the key worked earlier.
+        if (e instanceof JevProviderError && isFatalError(e) && e.kind === "invalid_api_key")
+          e.hint = [e.hint, KEY_WORKED_EARLIER_HINT].filter(Boolean).join(" ");
+        throw e;
+      }
+      for (const r of vPool.results) for (const g of r.got) verdictOf.set(g.hit, g.p);
+      for (const e of vPool.errors) {
+        if (e.error.kind === "invalid_api_key")
+          e.error.hint = [e.error.hint, KEY_WORKED_EARLIER_HINT].filter(Boolean).join(" ");
+        for (const { hit } of vBatches[e.index])
+          errors.push({
+            file: hit.file, start: hit.start, end: hit.end,
+            kind: e.error.kind, message: e.error.message,
+            ...(e.error.hint !== undefined ? { hint: e.error.hint } : {}),
+          });
+      }
+      // A 200 with no usable verification answer: FAIL-OPEN (the main-pass hit stands)
+      // and reported, so the user can see verification could not finish for that chunk.
+      for (const r of vPool.results)
+        for (const hit of r.missing)
+          errors.push({ file: hit.file, start: hit.start, end: hit.end, kind: "malformed_response", message: "provider returned no usable verification answer — the main-pass hit stands" });
+    }
+    // The hysteresis gate: a hit with no verify verdict (request failed, fail-open) falls
+    // back to its main-pass p — which cleared `threshold`, so it stands.
+    hits = hits.filter((h) => (verdictOf.get(h) ?? h.p) >= gate);
+  }
+  // --group (WI-3): one Group per signature present in the hits, sorted p desc (stable
+  // for ties: first-site order). Sites keep hit (file) order; representative is the
+  // first hit's chunk body. Sites judged this run share the head's p; cache-served
+  // members can carry an older p, so the group reports the best one.
+  let groups: Group[] | undefined;
+  if (o.group) {
+    const bySig = new Map<string, Group>();
+    for (const h of hits) {
+      const sk = sigKey(kind, question, h);
+      const g = bySig.get(sk);
+      if (g) {
+        g.count++;
+        g.sites.push({ file: h.file, start: h.start, end: h.end });
+        if (h.p > g.p) g.p = h.p;
+      } else
+        bySig.set(sk, { sig: sk, p: h.p, count: 1, sites: [{ file: h.file, start: h.start, end: h.end }], representative: h.text });
+    }
+    groups = [...bySig.values()].sort((a, b) => b.p - a.p);
+  }
+  return { hits, all: ordered, chunks: chunks.length, tokens, cached, errors, ...(cost !== undefined ? { cost } : {}), ...(groups !== undefined ? { groups } : {}) };
 }
 
 // ---- config -----------------------------------------------------------------
