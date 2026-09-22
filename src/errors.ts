@@ -100,7 +100,9 @@ export function parseRetryAfter(value: string | null | undefined): number | null
   return Math.min(RETRY_AFTER_MAX_MS, Math.max(0, at - Date.now()));
 }
 
-/** Full jitter: rand() * min(cap, base * 2^attempt), attempt 0-based. */
+/** Full jitter: rand() * min(cap, base * 2^attempt), attempt 0-based. Returns a FLOAT by
+ *  design (rand scaling) — flooring is owned by the call site (postSystemOne), the single
+ *  place a delay crosses into a timer, so the integer contract has exactly one owner. */
 export function jitteredDelayMs(attempt: number, base = 500, cap = 30_000, rand: () => number = Math.random): number {
   return rand() * Math.min(cap, base * 2 ** Math.max(0, attempt));
 }

@@ -41,6 +41,36 @@ const sleepRecorder = () => {
   return { sleeps, sleep: async (ms: number): Promise<void> => { sleeps.push(ms); } };
 };
 
+// ---- integer-timer contract helpers (Node RangeError regression guard) ----
+
+/** AbortSignal.timeout CONTRACT RECORDER — Node throws `RangeError: The value of "delay"
+ *  is out of range. It must be an integer.` on fractional delays while Bun silently
+ *  accepts them, so bun test cannot observe a float leaking into an abort signal (the
+ *  installed-bin outage bug). This patch is a call-through recorder: behavior is
+ *  unchanged, and every delay it sees must be a positive integer (>= 1). The original
+ *  static is restored in finally; bun runs tests in a file sequentially, so the patch
+ *  never bleeds into a neighboring test. */
+async function withTimeoutRecorder(run: (recorded: number[]) => Promise<void>): Promise<void> {
+  const original = AbortSignal.timeout;
+  const recorded: number[] = [];
+  AbortSignal.timeout = (ms: number): AbortSignal => { recorded.push(ms); return original(ms); };
+  try {
+    await run(recorded);
+  } finally {
+    AbortSignal.timeout = original;
+  }
+}
+
+/** Abort delays (AbortSignal.timeout): Node requires integers >= 1. */
+const expectPositiveIntegers = (values: number[]): void => {
+  for (const v of values) expect(Number.isInteger(v) && v > 0).toBe(true);
+};
+
+/** Timer sleeps (backoff/deadline capping): integers, 0 allowed once floored. */
+const expectNonNegativeIntegers = (values: number[]): void => {
+  for (const v of values) expect(Number.isInteger(v) && v >= 0).toBe(true);
+};
+
 // ---- postSystemOne: retries, backoff, classification ----
 
 test("timeout-then-success: one retry with jittered backoff, headers on every attempt", async () => {
@@ -54,7 +84,8 @@ test("timeout-then-success: one retry with jittered backoff, headers on every at
   expect(r.usage?.input_tokens).toBe(10);
   expect(calls.length).toBe(2);
   expect(sleeps.length).toBe(1);
-  expect(sleeps[0]).toBeGreaterThan(0); // full jitter for attempt 0
+  expect(Number.isInteger(sleeps[0])).toBe(true); // integer contract: timers never see float ms
+  expect(sleeps[0]).toBeGreaterThanOrEqual(0); // full jitter for attempt 0 — floored, so 0 is possible
   expect(sleeps[0]).toBeLessThanOrEqual(1000); // loose upper bound (exact cap is 500)
   for (const c of calls) {
     expect(c.init.headers).toMatchObject({ Authorization: "Bearer k", "Content-Type": "application/json" });
@@ -67,6 +98,7 @@ test("429 with Retry-After: 2 then success -> recorded sleep of at least 2000ms"
   await postSystemOne({}, "k", { fetchImpl, sleep });
   expect(calls.length).toBe(2);
   expect(sleeps.length).toBe(1);
+  expect(Number.isInteger(sleeps[0])).toBe(true);
   expect(sleeps[0]).toBeGreaterThanOrEqual(2000);
 });
 
@@ -124,6 +156,7 @@ test("retries exhausted: always-503 with maxRetries 2 -> 3 calls, attempt count 
   expect(e.message).toContain("after 3 attempts");
   expect(e.message).toContain("503");
   expect(sleeps.length).toBe(2);
+  expect(sleeps.every(Number.isInteger)).toBe(true);
 });
 
 test("jitter bounds for attempts 0..2 (no Retry-After header)", async () => {
@@ -132,6 +165,7 @@ test("jitter bounds for attempts 0..2 (no Retry-After header)", async () => {
   const e = await errOf(postSystemOne({}, "k", { fetchImpl, sleep, maxRetries: 3 }));
   expect(calls.length).toBe(4);
   expect(sleeps.length).toBe(3);
+  expect(sleeps.every(Number.isInteger)).toBe(true);
   [500, 1000, 2000].forEach((max, i) => { // min(30000, 500 * 2**attempt)
     expect(sleeps[i]).toBeGreaterThanOrEqual(0);
     expect(sleeps[i]).toBeLessThanOrEqual(max);
@@ -214,9 +248,47 @@ test("backoff is capped by the remaining deadline; an expired deadline aborts wi
   expect(calls.length).toBe(sleeps.length); // every fetch is followed by one capped sleep, then the check aborts
   expect(sleeps.length).toBeGreaterThanOrEqual(1);
   for (const s of sleeps) {
+    expect(Number.isInteger(s)).toBe(true);
     expect(s).toBeGreaterThanOrEqual(0);
     expect(s).toBeLessThanOrEqual(50); // never sleeps past the remaining deadline
   }
+});
+
+// ---- abort-delay + sleep integer contract (Node RangeError regression: WI-11) ----
+// The production bug: the monotonic deadline conversion produced fractional ms
+// (e.g. 14999.918084) and Node's AbortSignal.timeout threw RangeError — invisible
+// under bun test, which accepts floats. These tests pin the CONTRACT: every delay
+// crossing into an abort signal or a timer sleep is an integer.
+
+test("abort-delay contract: deadline-budget path (limiter + deadlineMs) records positive INTEGER timeouts", async () => {
+  const { calls, fetchImpl } = scriptedFetch((n) => {
+    if (n === 0) throw { name: "AbortError" }; // retryable transport timeout -> second attempt
+    return resp(200, GOOD);
+  });
+  const { sleeps, sleep } = sleepRecorder();
+  const l = new RateLimiter(10, 2); // burst 2: pacing itself never delays the two attempts
+  await withTimeoutRecorder(async (recorded) => {
+    const r = await postSystemOne({}, "k", {
+      fetchImpl, sleep, limiter: l, deadlineMs: Date.now() + 200,
+    });
+    expect(r.answers.c0.noul).toBe(0.9);
+    expect(recorded.length).toBe(2); // one abort signal per attempt, both off the deadline budget
+    expectPositiveIntegers(recorded); // would be fractional here without the floor
+    expectNonNegativeIntegers(sleeps);
+    expect(sleeps.length).toBe(1);
+  });
+  expect(calls.length).toBe(2);
+});
+
+test("abort-delay contract: plain no-deadline path and verifyApiKey record the literal 30s/15s INTEGER timeouts", async () => {
+  const ok = scriptedFetch(() => resp(200, GOOD));
+  const ping = scriptedFetch(() => resp(200, { model: "jev-latest", answers: {} }));
+  await withTimeoutRecorder(async (recorded) => {
+    await postSystemOne({}, "k", { fetchImpl: ok.fetchImpl });
+    const v = await verifyApiKey("k", ping.fetchImpl);
+    expect(v.ok).toBe(true);
+    expect(recorded).toEqual([30_000, 15_000]); // requestTimeoutMs then verifyApiKey's 15s
+  });
 });
 
 // ---- postSystemOne: request shape ----
@@ -335,7 +407,7 @@ test("postSystemOne + limiter: an expired batch deadline is thrown by the limite
   expect(Date.now() - t).toBeLessThan(50);
 });
 
-// ---- verifyApiKey (lives in jgrep.ts, upstream-verbatim) ----
+// ---- verifyApiKey (lives in jgrep.ts; its 15s abort delay is floored there for the Node integer contract) ----
 
 test("verifyApiKey: ok path parses the model and sends the ping payload", async () => {
   const { calls, fetchImpl } = scriptedFetch(() => resp(200, { model: "jev-latest", answers: {} }));

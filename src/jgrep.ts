@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { postSystemOne, RateLimiter, type PostOpts } from "./providers";
+import { abortDelayMs, postSystemOne, RateLimiter, type PostOpts } from "./providers";
 import { runPool, type PoolResult } from "./pool";
 import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
 
@@ -294,7 +294,7 @@ export async function verifyApiKey(apiKey: string, f: typeof fetch = fetch): Pro
     method: "POST",
     headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({ model: MODEL, state: "ping", questions: { ok: { type: "noul", instructions: "Is the state the word ping?" } } }),
-    signal: AbortSignal.timeout(15_000),
+    signal: AbortSignal.timeout(abortDelayMs(15_000)), // literal int — floored for uniformity (Node integer contract)
   });
   const model = res.ok ? ((await res.json()) as { model?: string }).model : undefined;
   return { ok: res.ok, status: res.status, model };
