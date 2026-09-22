@@ -205,17 +205,39 @@ const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => set
 /** DI seam for fetch — same shape as the export that still lives in jgrep.ts (until Step 4). */
 export type Fetch = typeof fetch;
 
+/** Rejection for a waiter whose batch deadline lapsed before or while it waited for a
+ *  pacing token: the request never started, so no token is spent. kind "timeout" stays
+ *  transient-class (no breaker trip) but retryable false — a retry cannot beat the clock.
+ *  The limiter is provider-agnostic; the caller names its backend via acquire opts. */
+const limiterTimeoutError = (provider?: string): JevProviderError =>
+  new JevProviderError(
+    "timeout",
+    "the provider deadline exceeded while waiting for a rate-limit token (the batch deadline includes retries)",
+    { provider: provider ?? "the provider", retryable: false, hint: "lower --batch or --concurrency — the deadline includes all retries" },
+  );
+
+/** A queued acquirer: resolved with a token, or rejected once its deadline lapses. */
+interface Waiter {
+  resolve: () => void;
+  reject: (err: unknown) => void;
+  deadlineMono?: number; // absolute monotonic ms — undefined waits forever
+  provider?: string;     // backend name for the timeout rejection, when the caller knows it
+}
+
 /** Classic token bucket: `burst` tokens up front, refilled lazily at `ratePerSec`/s from a
  *  monotonic clock (no intervals). `acquire()` resolves immediately while a token is free;
  *  otherwise the waiter joins a FIFO queue and a single setTimeout is armed for the queue
- *  head's wait time. ratePerSec <= 0 or non-finite means unlimited. The read-then-write
+ *  head's wait time. A waiter may carry a monotonic `deadlineMono`: one that has already
+ *  passed rejects before waiting, and one that lapses while queued is evicted at the next
+ *  refill or acquire — rejected WITHOUT consuming a token, so capacity goes to the next
+ *  live waiter. ratePerSec <= 0 or non-finite means unlimited. The read-then-write
  *  sections below are await-free — on a single-threaded loop that IS the lock (§1.7). */
 export class RateLimiter {
   private readonly rate: number;
   private readonly capacity: number;
   private tokens: number;
   private lastMs: number;
-  private queue: Array<() => void> = [];
+  private queue: Waiter[] = [];
   private timer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(ratePerSec: number, burst: number) {
@@ -238,25 +260,54 @@ export class RateLimiter {
     return Math.max(0, ((1 - this.tokens) / this.rate) * 1000);
   }
 
+  /** True when the waiter carries a deadline the monotonic clock has already passed. */
+  private expired(w: Waiter): boolean {
+    return w.deadlineMono !== undefined && w.deadlineMono - monotonicMs() <= 0;
+  }
+
+  /** Reject and drop every queued waiter whose deadline has lapsed — no token is
+   *  consumed, so the next refill goes to a live waiter (queue hygiene on arrival). */
+  private evictExpired(): void {
+    if (this.queue.length === 0) return;
+    const live: Waiter[] = [];
+    for (const w of this.queue) {
+      if (this.expired(w)) w.reject(limiterTimeoutError(w.provider));
+      else live.push(w);
+    }
+    this.queue = live;
+  }
+
   private pump(): void {
     this.timer = null;
     this.refill();
+    this.evictExpired(); // deadline hygiene for the whole queue, independent of tokens
     while (this.queue.length > 0 && this.tokens >= 1) {
+      const w = this.queue.shift()!;
+      if (this.expired(w)) { w.reject(limiterTimeoutError(w.provider)); continue; } // sub-ms race guard: a corpse never takes a token
       this.tokens -= 1;
-      this.queue.shift()!();
+      w.resolve();
     }
     if (this.queue.length > 0) this.timer = setTimeout(() => this.pump(), this.headWaitMs());
   }
 
-  acquire(): Promise<void> {
+  /** One pacing token. `opts.deadlineMono` (absolute monotonic ms) bounds the WAIT: an
+   *  already-passed deadline rejects immediately, and a waiter whose deadline lapses
+   *  while queued is evicted at the next refill or acquire — both without consuming
+   *  a token. `opts.provider` names the backend for the timeout rejection. The caller
+   *  keeps its own pre-attempt deadline check as the backstop. */
+  acquire(opts?: { deadlineMono?: number; provider?: string }): Promise<void> {
     if (!(this.rate > 0) || !Number.isFinite(this.rate)) return Promise.resolve(); // unlimited
     this.refill();
+    this.evictExpired(); // corpses leave here too, not only at refill time
+    if (opts?.deadlineMono !== undefined && opts.deadlineMono - monotonicMs() <= 0) {
+      return Promise.reject(limiterTimeoutError(opts?.provider)); // pre-wait: dead on arrival, no token
+    }
     if (this.queue.length === 0 && this.tokens >= 1) { // never leapfrog queued waiters
       this.tokens -= 1;
       return Promise.resolve();
     }
-    return new Promise<void>((resolve) => {
-      this.queue.push(resolve);
+    return new Promise<void>((resolve, reject) => {
+      this.queue.push({ resolve, reject, deadlineMono: opts?.deadlineMono, provider: opts?.provider });
       if (this.timer === null) this.timer = setTimeout(() => this.pump(), this.headWaitMs());
     });
   }
@@ -370,7 +421,10 @@ export async function postSystemOne(
   const deadline = opts.deadlineMs === undefined ? undefined : monotonicMs() + (opts.deadlineMs - Date.now());
 
   for (let attempt = 0; ; attempt++) {
-    await opts.limiter?.acquire(); // pacing before EVERY attempt, retries included (§1.7)
+    // Pacing before EVERY attempt, retries included (§1.7). The monotonic deadline rides
+    // along: the limiter rejects a waiter whose deadline lapses while queued — without
+    // consuming a token — and the pre-attempt check below stays as the backstop.
+    await opts.limiter?.acquire(deadline !== undefined ? { deadlineMono: deadline, provider: backend.name } : undefined);
 
     if (deadline !== undefined && deadline - monotonicMs() <= 0) {
       throw new JevProviderError(

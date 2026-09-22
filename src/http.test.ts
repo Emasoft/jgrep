@@ -3,6 +3,9 @@ import { test, expect } from "bun:test";
 import { BACKENDS, RateLimiter, postSystemOne, verifyApiKey, type Fetch } from "./providers";
 import { JevProviderError } from "./errors";
 
+/** Ambient monotonic clock — deadlineMono values must live on performance.now(), never Date.now(). */
+declare const performance: { now(): number };
+
 // ---- fakes: repo fake-fetch DI pattern (calls[] capture) + tiny sleep recorder ----
 
 interface Call {
@@ -299,6 +302,60 @@ test("RateLimiter: FIFO order across concurrent waiters", async () => {
   const ps = [1, 2, 3].map((i) => l.acquire().then(() => order.push(i)));
   await Promise.all(ps);
   expect(order).toEqual([1, 2, 3]);
+});
+
+test("RateLimiter: a queued waiter whose deadline lapses is evicted with kind timeout and the next live waiter gets the token", async () => {
+  const l = new RateLimiter(10, 1); // one 100ms slot
+  await l.acquire(); // empty the bucket
+  const head = l.acquire({ deadlineMono: performance.now() + 30 }).then(() => "granted" as const, (e: unknown) => e);
+  const next = l.acquire().then(() => "granted" as const, (e: unknown) => e);
+  const headErr = (await head) as JevProviderError;
+  expect(headErr).toBeInstanceOf(JevProviderError);
+  expect(headErr.kind).toBe("timeout");
+  expect(headErr.retryable).toBe(false);
+  expect(await next).toBe("granted"); // the corpse's slot went to the next live waiter
+  // the expired waiter never drained the bucket: pacing continues at the normal cadence
+  const t = Date.now();
+  await l.acquire();
+  expect(Date.now() - t).toBeLessThan(200); // one slot, not two
+});
+
+test("RateLimiter: a new acquire evicts an already-expired waiter instead of queueing behind it", async () => {
+  const l = new RateLimiter(1, 1); // 1s slots — the pump timer cannot fire during the test setup
+  await l.acquire(); // empty the bucket
+  const head = l.acquire({ deadlineMono: performance.now() + 30 }).then(() => "granted" as const, (e: unknown) => e);
+  await new Promise<void>((r) => setTimeout(r, 40)); // head's deadline lapses; the pump has not run
+  const t = Date.now();
+  const late = l.acquire(); // arrival must evict the dead head, not queue behind it
+  const headErr = (await head) as JevProviderError;
+  expect(Date.now() - t).toBeLessThan(50); // rejected on arrival, not held until the pump
+  expect(headErr).toBeInstanceOf(JevProviderError);
+  expect(headErr.kind).toBe("timeout");
+  expect(headErr.retryable).toBe(false);
+  await late; // the live waiter still paces normally to its own refill slot
+});
+
+test("RateLimiter: an already-expired deadline rejects before waiting and consumes no token", async () => {
+  const l = new RateLimiter(10, 2); // two tokens up front
+  const e = await errOf(l.acquire({ deadlineMono: performance.now() - 10 }));
+  expect(e).toBeInstanceOf(JevProviderError);
+  expect(e.kind).toBe("timeout");
+  expect(e.retryable).toBe(false);
+  const t = Date.now();
+  await Promise.all([l.acquire(), l.acquire()]); // both burst tokens still there -> no refill wait
+  expect(Date.now() - t).toBeLessThan(50);
+});
+
+test("postSystemOne + limiter: an expired batch deadline is thrown by the limiter before pacing — zero fetches, zero tokens drained", async () => {
+  const { calls, fetchImpl } = scriptedFetch(() => resp(200, GOOD));
+  const l = new RateLimiter(10, 2);
+  const e = await errOf(postSystemOne({}, BACKENDS.typesafe, "k", { fetchImpl, limiter: l, deadlineMs: Date.now() - 10 }));
+  expect(e.kind).toBe("timeout");
+  expect(e.retryable).toBe(false);
+  expect(calls.length).toBe(0);
+  const t = Date.now();
+  await Promise.all([l.acquire(), l.acquire()]); // the dead attempt consumed no token
+  expect(Date.now() - t).toBeLessThan(50);
 });
 
 // ---- verifyApiKey ----
