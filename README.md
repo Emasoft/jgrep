@@ -133,6 +133,30 @@ so CI negates it:
   env: { TYPESAFE_API_KEY: "${{ secrets.TYPESAFE_API_KEY }}" }
 ```
 
+### Run only the tests a change can affect
+
+```bash
+jgrep --tests origin/main | xargs bun test        # or vitest / pytest / go test
+jgrep --tests --staged -a                         # every test file with its probability
+```
+
+Three layers, cheapest first: tests named after a changed file (`foo.ts` → `foo.test.ts`)
+and tests that import a changed module are selected in code; the rest are asked of Jev
+with the compacted diff (source files only, changed lines only) and each test file's
+imports and test names, one Noul per file. Default threshold is 0.5 here because a
+missed test costs more than an extra one. Run the full suite afterwards; this is for the
+fast first signal.
+
+Measured on a 142-file TypeScript suite, 3 commits touching 12 source files (2026-09-21):
+
+| | files | test cases | wall time |
+| --- | ---: | ---: | ---: |
+| full suite | 142 | 1,420 | 18.9 s |
+| `jgrep --tests HEAD~3` | 47 (12 by name, 27 by import, 8 by Jev) | 536 | 12.6 s |
+
+Selection itself: 7 requests, 56k tokens, $0.0024, 1.0 s. The suite above is fast, so
+runner startup dominates; the ratio matters more on suites that take minutes.
+
 ### Score a table (CSV / JSONL), not just code
 
 Every row becomes one state. One description works like grep; a JSON file of
@@ -246,6 +270,7 @@ jgrep [options] "<description>" [path ...]
 jgrep [options] --diff [ref] "<description>"
 jgrep [options] --rows <file.csv|.jsonl> "<description>"
 jgrep [options] --rows <file> --questions <q.json> [--out scored.csv]
+jgrep [options] --tests [ref] [--staged] [path ...]
 
   -t, --threshold <p>   print chunks with probability >= p (default 0.7)
   -C, --show            print the matching chunk body under each hit
@@ -258,7 +283,10 @@ jgrep [options] --rows <file> --questions <q.json> [--out scored.csv]
                         rows mode {answers:[...], errors:[{row,kind,message}]}
       --diff [ref]      grep git diff hunks instead of files
                         (working tree by default, or against <ref>)
-      --staged          with --diff: staged changes only
+      --staged          with --diff / --tests: staged changes only
+      --tests [ref]     predictive test selection: print the test files a diff
+                        plausibly affects (working tree, or against <ref>);
+                        pipe into your runner:  bun test $(jgrep --tests origin/main)
       --rows <file>     grep rows of a CSV / JSONL file instead of code
       --questions <f>   with --rows: JSON of Jev questions (noul/choice/score)
                         asked of every row; prints the table with answer columns

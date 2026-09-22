@@ -66,7 +66,7 @@ test("chunkMarkdown: fenced blocks never leak headings — # lines inside a fenc
   expect(cs[0]).toMatchObject({ start: 1, end: 7, context: "Code" });
 });
 
-test("chunkMarkdown on the repo SKILL.md: the ## Help section is one chunk covering the fenced help block", () => {
+test("chunkMarkdown on the repo SKILL.md: the fenced help block is ONE chunk — the oversized Help section splits around it, fence never broken", () => {
   const HERE: string = (import.meta as { dir?: string }).dir ?? process.cwd();
   const text = fs.readFileSync(path.join(HERE, "..", "skills", "jgrep", "SKILL.md"), "utf8");
   const cs = chunkMarkdown("skills/jgrep/SKILL.md", text);
@@ -76,18 +76,23 @@ test("chunkMarkdown on the repo SKILL.md: the ## Help section is one chunk cover
   expect(cs[0].start).toBe(1);
   expect(cs[0].context).toBeUndefined();
   expect(cs[0].text).toBe(lines.slice(0, lines.indexOf("---", 1) + 1).join("\n"));
-  // the Help section: heading through the line before the next heading, ONE chunk, no force-split
+  // the Help section spans heading through the line before the next heading. The merged
+  // help (upstream's --tests lines included) outgrew the 60-line maxLines, so the section
+  // now splits at blank lines OUTSIDE the fence — but the fenced help block itself is a
+  // semantic unit and must ride in ONE chunk (fence open + close intact, never split).
   const help = cs.filter((c) => c.context === "jgrep > Help");
-  expect(help).toHaveLength(1);
+  expect(help.length).toBeGreaterThan(1); // oversized section: pieces, not one chunk
   expect(help[0].start).toBe(lines.indexOf("## Help") + 1);
-  expect(help[0].end).toBe(lines.indexOf("## Reading results")); // through the line before the next heading
-  expect(help[0].end - help[0].start + 1).toBeLessThanOrEqual(60);
-  expect(help[0].text).toBe(lines.slice(help[0].start - 1, help[0].end).join("\n"));
-  // the full fenced help block rides inside this one chunk, fence open + close intact
-  expect(help[0].text).toContain("jgrep --help` prints the full reference");
-  expect(help[0].text).toContain("exit status: 0 when something matched, 1 when nothing did");
-  expect(help[0].text).toContain('OPENROUTER_API_KEY=sk-or-... jgrep --api openrouter "swallows errors" src/');
-  expect(help[0].text.split("\n").filter((l) => /^\s*```/.test(l))).toEqual(["```", "```"]);
+  expect(help[help.length - 1].end).toBe(lines.indexOf("## Reading results")); // through the line before the next heading
+  expect(help.every((c, i) => i === 0 || help[i - 1].end < c.start)).toBe(true); // ordered, non-overlapping
+  expect(help.every((c) => c.end - c.start + 1 <= 60)).toBe(true); // every piece respects maxLines
+  const block = help.filter((c) => c.text.split("\n").some((l) => /^\s*```/.test(l)));
+  expect(block).toHaveLength(1); // the full fenced help block rides in this one chunk
+  expect(block[0].text).toContain("-t, --threshold <p>   print chunks with probability >= p (default 0.7)");
+  expect(block[0].text).toContain("exit status: 0 when something matched, 1 when nothing did");
+  expect(block[0].text).toContain('OPENROUTER_API_KEY=sk-or-... jgrep --api openrouter "swallows errors" src/');
+  expect(block[0].text).toContain("pipe into your runner:  bun test $(jgrep --tests origin/main)"); // upstream's --tests lines ride along
+  expect(block[0].text.split("\n").filter((l) => /^\s*```/.test(l))).toEqual(["```", "```"]); // fence open + close intact
 });
 
 test("buildRequest: markdown chunks prepend the section trail; code chunks stay byte-identical", () => {

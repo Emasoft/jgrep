@@ -87,6 +87,7 @@ jgrep --json-errors "description" src/   # object instead: {hits:[...], errors:[
 jgrep -a -t 0 "description" src/ | head  # everything, best first (when 0 hits)
 jgrep --diff --staged "rule"             # lint your staged change
 jgrep --diff origin/main "rule"          # lint the branch against main
+jgrep --tests origin/main | xargs bun test  # print the test files a diff plausibly affects
 jgrep --api openrouter "rule" src/       # pick a provider: typesafe | openrouter | gateway
 ```
 
@@ -102,6 +103,7 @@ usage: jgrep init                       interactive setup (provider, key, agent 
        jgrep [options] --diff [ref] "<description>"
        jgrep [options] --rows <file.csv|.jsonl> "<description>"
        jgrep [options] --rows <file> --questions <q.json> [--out scored.csv]
+       jgrep [options] --tests [ref] [--staged] [path ...]
 
   -t, --threshold <p>   print chunks with probability >= p (default 0.7)
   -C, --show            print the matching chunk body under each hit
@@ -114,7 +116,10 @@ usage: jgrep init                       interactive setup (provider, key, agent 
                         rows mode {answers:[...], errors:[{row,kind,message}]}
       --diff [ref]      grep git diff hunks instead of files
                         (working tree by default, or against <ref>)
-      --staged          with --diff: staged changes only
+      --staged          with --diff / --tests: staged changes only
+      --tests [ref]     predictive test selection: print the test files a diff
+                        plausibly affects (working tree, or against <ref>);
+                        pipe into your runner:  bun test $(jgrep --tests origin/main)
       --rows <file>     grep rows of a CSV / JSONL file instead of code
       --questions <f>   with --rows: JSON of Jev questions (noul/choice/score)
                         asked of every row; prints the table with answer columns
@@ -184,6 +189,12 @@ jgrep --diff --staged "leaves debug output such as console.log or print"
 jgrep --diff --staged "changes behavior without a corresponding test change"
 jgrep --diff --staged "adds an endpoint or handler with no input validation"
 ```
+
+## Which tests to run for a change
+
+`jgrep --tests [ref]` prints the test files a diff plausibly affects (by name, by
+import graph, then by Jev). Use it before running a large suite:
+`jgrep --tests origin/main | xargs <runner>`; run the full suite afterwards.
 
 ## Tables, not code
 
