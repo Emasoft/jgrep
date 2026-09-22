@@ -43,10 +43,12 @@
 # Identity: npm also hosts an UNRELATED `jgrep` package, and the jgrep/jevgrep
 # names collide across GitHub. Every npm touch is identity-pinned: installs
 # verify the REGISTRY entry of `jevgrep` (repository.url must contain
-# github.com/kyu1204/jgrep), uninstalls verify the LOCALLY installed manifest,
-# options 3/4 verify the origin/upstream git remotes (Emasoft/jgrep /
-# kyu1204/jgrep), and options 1/2 verify this checkout's package.json name.
-# Mismatches refuse loudly (exit 1, no override).
+# github.com/kyu1204/jgrep), uninstalls verify the LOCALLY installed manifest
+# (repository.url must point at upstream kyu1204/jgrep OR this fork
+# Emasoft/jgrep — same project; npm-link installs of the fork carry the fork's
+# manifest URL), options 3/4 verify the origin/upstream git remotes
+# (Emasoft/jgrep / kyu1204/jgrep), and options 1/2 verify this checkout's
+# package.json name. Mismatches refuse loudly (exit 1, no override).
 #
 # Agent skill: options 1/2/3/8 also refresh the agent skill from
 # skills/jgrep/SKILL.md (it embeds a verbatim copy of `jgrep --help`, so a
@@ -75,8 +77,10 @@ PROG="install-dev.sh"
 # (repository github.com/kyu1204/jgrep), while `jgrep` ("Recursive grep.",
 # maintainer mustafar) is an UNRELATED package. Many GitHub repos also share
 # the jgrep/jevgrep names. Every npm command below MUST go through
-# $NPM_PACKAGE, and every install/uninstall is identity-verified against
-# $EXPECTED_NPM_REPO before it touches anything (mismatch → loud refusal).
+# $NPM_PACKAGE, and every install/uninstall is identity-verified before it
+# touches anything: the REGISTRY must point at $EXPECTED_NPM_REPO, a LOCALLY
+# installed manifest at $EXPECTED_NPM_REPO or the fork ($FORK_SLUG)
+# (mismatch → loud refusal).
 NPM_PACKAGE="jevgrep"            # the ONLY npm package this script installs/uninstalls
 EXPECTED_NPM_REPO="github.com/kyu1204/jgrep"
 UPSTREAM_SLUG="kyu1204/jgrep"
@@ -439,6 +443,21 @@ npm_repo_url_matches() {
 	esac
 }
 
+npm_manifest_repo_url_matches() {
+	# $1 = URL → 0 when a LOCALLY installed manifest points at this project:
+	# upstream ($EXPECTED_NPM_REPO = kyu1204/jgrep) OR the fork ($FORK_SLUG =
+	# Emasoft/jgrep) — same project, upstream or fork; npm-link installs of the
+	# fork carry the fork's manifest URL. Accepts the ssh-style
+	# git@github.com:owner/repo spelling for both. Anything else (the unrelated
+	# 'jgrep' package, a hijacked name) is refused.
+	local url="$1"
+	[ -n "$url" ] || return 1
+	case "$url" in
+	*"$EXPECTED_NPM_REPO"* | *"github.com:${EXPECTED_NPM_REPO#github.com/}"* | *"github.com/$FORK_SLUG"* | *"github.com:$FORK_SLUG"*) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
 npm_registry_identity_probe() {
 	# read-only registry probe; sets NPM_REG_URL / NPM_REG_VER / NPM_REG_TARBALL.
 	# rc 0 = identity verified, 1 = MISMATCH, 2 = registry unreachable/empty.
@@ -528,14 +547,15 @@ npm_pkg_json_repository_url() {
 
 verify_npm_package_identity_local() {
 	# offline identity gate for every `npm uninstall -g` this script runs: the
-	# LOCALLY installed $NPM_PACKAGE manifest must point at $EXPECTED_NPM_REPO.
-	# Refuses loudly (exit 1) on mismatch, on a missing repository field, and
-	# when npm claims the package but no manifest can be found.
+	# LOCALLY installed $NPM_PACKAGE manifest must point at upstream
+	# ($EXPECTED_NPM_REPO) or this fork ($FORK_SLUG). Refuses loudly (exit 1)
+	# on mismatch, on a missing repository field, and when npm claims the
+	# package but no manifest can be found.
 	local f url
 	if ! f="$(npm_global_pkg_json)"; then
 		warn "$PROG: refusing to uninstall: npm owns jgrep ('npm ls -g $NPM_PACKAGE' succeeds)"
 		warn "  but the installed package manifest is missing or unreadable — identity unverifiable."
-		warn "  expected repository: *$EXPECTED_NPM_REPO* — observed: <no $NPM_PACKAGE/package.json>"
+		warn "  expected: a manifest pointing at $UPSTREAM_SLUG or $FORK_SLUG — observed: <no $NPM_PACKAGE/package.json>"
 		warn "  inspect it manually first: npm ls -g $NPM_PACKAGE && npm root -g"
 		exit 1
 	fi
@@ -543,13 +563,12 @@ verify_npm_package_identity_local() {
 	if [ -z "$url" ]; then
 		warn "$PROG: refusing to uninstall: the installed $NPM_PACKAGE manifest has no repository field — identity unverifiable."
 		warn "  manifest: $f"
-		warn "  expected repository: *$EXPECTED_NPM_REPO* — observed: <no repository field>"
+		warn "  expected: a manifest pointing at $UPSTREAM_SLUG or $FORK_SLUG — observed: <no repository field>"
 		exit 1
 	fi
-	if ! npm_repo_url_matches "$url"; then
-		warn "$PROG: refusing to uninstall: the locally installed npm package '$NPM_PACKAGE' does not point at $EXPECTED_NPM_REPO."
-		warn "  observed repository.url: $url"
-		warn "  expected: a URL containing $EXPECTED_NPM_REPO (manifest: $f)"
+	if ! npm_manifest_repo_url_matches "$url"; then
+		warn "$PROG: refusing to uninstall: the locally installed npm package '$NPM_PACKAGE' does not point at $UPSTREAM_SLUG or $FORK_SLUG."
+		warn "  expected: a manifest pointing at $UPSTREAM_SLUG or $FORK_SLUG; observed: $url (manifest: $f)"
 		warn "  no override exists on purpose: npm also hosts an UNRELATED 'jgrep' package (name collision),"
 		warn "  and this check guards against future takeovers of the '$NPM_PACKAGE' name."
 		exit 1
@@ -1477,7 +1496,11 @@ archive_existing() {
 
 solve_npm_owned_conflict() {
 	# called when the destination is the npm global bin dir and npm owns jevgrep
-	# identity gate: `npm uninstall -g` only runs on a verified upstream package
+	# identity gate: `npm uninstall -g` only runs on a verified upstream/fork
+	# package. A refused displacement is FATAL in every mode — the gate exits 1
+	# with the refusal message, so headless (--choice/--yes) runs never succeed
+	# silently; interactive runs refuse equally loudly (no override exists for
+	# a hijacked identity).
 	if [ "$OPT_DRY_RUN" -eq 0 ]; then
 		verify_npm_package_identity_local
 	fi
@@ -2349,8 +2372,9 @@ opt_uninstall() {
 		warn "warning: $total jgrep installs detected — uninstall [7] cleans all of them"
 	fi
 	# identity gate: never run `npm uninstall -g` unless the LOCALLY installed
-	# package manifest proves it is the upstream jevgrep (offline check; also
-	# covers the npm-claims-but-manifest-missing case)
+	# package manifest proves it is upstream jevgrep or this fork (offline
+	# check; also covers the npm-claims-but-manifest-missing case). The refusal
+	# exits 1 in every mode — headless runs never succeed silently.
 	if npm_owns_live; then
 		verify_npm_package_identity_local
 	fi
