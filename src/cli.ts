@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo; the surface used is trivial
 import fs from "node:fs";
-import { chunkPaths, diffChunks, gitDiff, jgrep, loadCache, saveCache, type Hit, type Kind } from "./jgrep";
+// @ts-expect-error — no @types/node in this zero-dep Bun-only repo; only createHash is used
+import { createHash } from "node:crypto";
+import { chunkPaths, diffChunks, estimateRun, gitDiff, jgrep, loadCache, saveCache, type Hit, type Kind } from "./jgrep";
 import { readRows, loadQuestions, scoreRows, flattenAnswers, toCsv } from "./rows";
 import { resolveApiKey, resolvePricePerMtok, resolveProvider, verifyApiKey, type Backend } from "./providers";
 import { JevProviderError } from "./errors";
@@ -32,9 +34,8 @@ usage: jgrep init                       interactive setup (provider, key, agent 
   -t, --threshold <p>   print chunks with probability >= p (default 0.7)
   -C, --show            print the matching chunk body under each hit
   -a, --all             print every chunk with its probability, best first
-      --group           one verdict per whitespace-signature group; --json adds "groups"
-      --votes <n>       judge every chunk N times (1-5, default 1); the median probability wins
-      --verify          strict re-ask of every hit; the hit stands only at p >= 0.6 × threshold
+      --group/--votes <n>/--verify   grouped verdicts, N-vote medians, strict re-ask
+      --estimate/--budget <usd>/--sarif/--envelopes   cost dry run, budget stop, SARIF, envelopes
       --json            machine-readable output: hits as a JSON array
                         (v0.3.0-compatible: [{file,start,end,p,text}]; rows: flattened objects)
       --json-errors     with --json: a JSON object instead — code mode
@@ -69,6 +70,7 @@ CI lint:    ! jgrep --diff origin/main "adds an endpoint without an auth check"
 
 examples:
   jgrep "catches an error and silently ignores it" src/
+  jgrep --estimate "swallows errors" src/
   jgrep --rows creators.csv "beauty is the main content of this account"
   jgrep --rows creators.csv --questions beauty.json --out scored.csv
   jgrep -C "reads user input without validating it" app/
@@ -81,6 +83,7 @@ const c = (code: string, s: string) => (tty ? `\x1b[${code}m${s}\x1b[0m` : s);
 export function parse(argv: string[]) {
   const o = {
     threshold: 0.7, batch: 16, concurrency: 16, all: false, show: false, group: false, votes: 1, verify: false, json: false, jsonErrors: false, cache: true,
+    estimate: false, sarif: false, envelopes: false, budget: null as number | null,
     diff: null as string[] | null, rows: "", questions: "", out: "",
     api: "", model: "", timeout: 15, requestTimeout: 30, retries: 4, rate: 0, failFast: false, noProbe: false,
   };
@@ -96,8 +99,12 @@ export function parse(argv: string[]) {
     else if (a === "--group") o.group = true;
     else if (a === "--votes") o.votes = Number(argv[++i]);
     else if (a === "--verify") o.verify = true;
+    else if (a === "--envelopes") o.envelopes = true;
+    else if (a === "--estimate") o.estimate = true;
     else if (a === "--json") o.json = true;
     else if (a === "--json-errors") { o.jsonErrors = true; o.json = true; } // implies --json
+    else if (a === "--sarif") o.sarif = true; // machine-readable SARIF 2.1.0 (its own shape, not --json's)
+    else if (a === "--budget") o.budget = Number(argv[++i]);
     else if (a === "--no-cache") o.cache = false;
     else if (a === "--api") o.api = argv[++i] ?? "";
     else if (a === "--model") o.model = argv[++i] ?? "";
@@ -131,6 +138,10 @@ export function parse(argv: string[]) {
   // re-asks stop adding signal (rejected before anything is sent or cached).
   if (!Number.isInteger(o.votes) || o.votes < 1 || o.votes > 5)
     throw new Error("votes must be an integer between 1 and 5");
+  // --budget (WI-7): dollars; 0 stays legal (stop once the first batch has spent
+  // anything), negative/non-finite gets the generic numeric error like every flag.
+  if (o.budget !== null && !(Number.isFinite(o.budget) && o.budget >= 0))
+    throw new Error("numeric option expected");
   return { ...o, question: rest[0], paths: rest.slice(1) };
 }
 
@@ -145,6 +156,7 @@ interface Wiring {
   ratePerSec?: number;
   failFast: boolean;
   pricePerMtok: number; // $/Mtok for the cost estimate — resolved (and validated) up front
+  budget?: number;      // --budget > $JEV_BUDGET > undefined (unlimited); jgrep() meters it per batch
 }
 
 /** ` · 4 errored (3 timeout, 1 rate_limited)` — kind counts ordered by count desc, then kind asc. */
@@ -168,9 +180,73 @@ function printExamples(lines: { line: string; hint?: string }[]) {
   if (lines.length > 5) console.error(c("31", `  … and ${lines.length - 5} more`));
 }
 
+// ---- --sarif (WI-7) --------------------------------------------------------------
+/** SARIF 2.1.0 rendering of a run: one rule per description hash, one result per hit
+ *  (message = the description, location = file uri + the chunk's start line). The shape
+ *  GitHub code scanning and every SARIF consumer ingest; printed instead of text when
+ *  --sarif is set (works with --diff and plain runs alike). */
+export function toSarif(question: string, hits: Hit[]) {
+  const ruleId = `jgrep-${createHash("sha1").update(question).digest("hex").slice(0, 12)}`;
+  return {
+    $schema: "https://json.schemastore.org/sarif-2.1.0.json",
+    version: "2.1.0",
+    runs: [{
+      tool: { driver: { name: "jgrep", rules: [{ id: ruleId, shortDescription: { text: question } }] } },
+      results: hits.map((h) => ({
+        ruleId,
+        message: { text: question },
+        locations: [{
+          physicalLocation: {
+            artifactLocation: { uri: h.file },
+            region: { startLine: h.start },
+          },
+        }],
+      })),
+    }],
+  };
+}
+
+// ---- --budget (WI-7) ---------------------------------------------------------------
+/** $JEV_BUDGET: the default run budget in dollars (an explicit --budget flag wins).
+ *  Invalid values are fatal before anything can be spent — same up-front philosophy
+ *  as JEV_PRICE_PER_MTOK. Unset/empty means unlimited. */
+export function resolveBudgetEnv(env: Record<string, string | undefined>): number | undefined {
+  const raw = env.JEV_BUDGET?.trim();
+  if (!raw) return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0)
+    throw new JevProviderError("bad_request", `JEV_BUDGET must be a non-negative number (got "${raw}")`, {
+      provider: "generic", retryable: false, hint: "JEV_BUDGET is dollars, e.g. 0.05",
+    });
+  return n;
+}
+
+// ---- --estimate (WI-7) ---------------------------------------------------------------
+/** Chunk-only dry run: runs ONLY the chunker — no provider, no key, no probe, no
+ *  network, no cache — and prints a per-file chunk table plus the documented token/
+ *  cost model (~270 tokens of request overhead + ~300 per chunk, priced at $/Mtok).
+ *  Provider-independent (--api/--model/keys are irrelevant), so it runs BEFORE any
+ *  provider resolution. Exit 0. */
+function estimateMain(o: ReturnType<typeof parse>) {
+  const pricePerMtok = resolvePricePerMtok();
+  const chunks = o.diff ? diffChunks(gitDiff(o.diff)) : chunkPaths(o.paths.length ? o.paths : ["."]);
+  const perFile = new Map<string, number>();
+  for (const ch of chunks) perFile.set(ch.file, (perFile.get(ch.file) ?? 0) + 1);
+  const files = [...perFile.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
+  const width = Math.max(...files.map(([f]) => f.length), "file".length);
+  console.log(`${"file".padEnd(width)}  chunks`);
+  for (const [file, n] of files) console.log(`${file.padEnd(width)}  ${n}`);
+  console.log(`${"total".padEnd(width)}  ${chunks.length}`);
+  const est = estimateRun(chunks.length, o.batch, pricePerMtok);
+  console.log(`estimated: ${est.chunks} chunks, ~${est.tokens} tokens, ~$${est.cost.toFixed(4)}`);
+}
+
 async function main() {
   if (process.argv[2] === "init") { const { init } = await import("./init"); return init(); }
   const o = parse(process.argv.slice(2));
+  // --estimate (WI-7) is provider-independent: it runs before resolveProvider so an
+  // irrelevant --api can neither fail the dry run nor trigger the startup probe.
+  if (o.estimate) return estimateMain(o);
   // Provider resolution before anything else: unknown --api, or gateway without
   // JEV_GATEWAY_URL, throws JevProviderError straight to the catch (exit 2).
   const backend = resolveProvider(o.api || undefined);
@@ -196,6 +272,7 @@ async function main() {
     model: o.model || process.env.JEV_MODEL || undefined,
     timeoutSec: o.timeout, requestTimeoutSec: o.requestTimeout, maxRetries: o.retries,
     ratePerSec: o.rate || undefined, failFast: o.failFast, pricePerMtok,
+    budget: o.budget ?? resolveBudgetEnv(process.env), // --budget (WI-7): flag > $JEV_BUDGET > unlimited
   };
   if (o.rows) return rowsMain(o, wiring);
   if (!o.question) { console.error(USAGE); process.exit(2); }
@@ -213,7 +290,12 @@ async function main() {
     if (process.stderr.isTTY) process.stderr.write("\r\x1b[K");
 
     const rows: Hit[] = o.all ? [...r.all].sort((a, b) => b.p - a.p) : r.hits;
-    if (o.json) {
+    if (o.sarif) {
+      // --sarif (WI-7): machine-readable SARIF 2.1.0 instead of text — one rule per
+      // description hash, one result per hit at its chunk's start line. True hits only
+      // (the --all tail below the threshold is not a finding), --diff or plain runs.
+      console.log(JSON.stringify(toSarif(o.question ?? "", r.hits), null, 2));
+    } else if (o.json) {
       // Backward-compatible (the upstream v0.3.0 contract): --json is the bare hit
       // array, byte-for-byte the old shape. Errored chunks never enter it (they
       // never enter all/hits) and surface via the stderr summary + exit 2;
@@ -249,7 +331,11 @@ async function main() {
       }
     }
     const cost = r.cost ?? (r.tokens * wiring.pricePerMtok) / 1e6;
-    const summary = `${r.hits.length} hits / ${r.chunks} chunks (${r.cached} cached) · ${r.tokens} tokens · $${cost.toFixed(4)} · ${((Date.now() - t0) / 1000).toFixed(1)}s`;
+    // --budget (WI-7): when the meter tripped, the summary names the stop and the limit
+    // (the per-chunk budget_exhausted errors already carry the "raise --budget" hint).
+    const budgetStopped = r.errors.some((e) => e.kind === "budget_exhausted");
+    const summary = `${r.hits.length} hits / ${r.chunks} chunks (${r.cached} cached) · ${r.tokens} tokens · $${cost.toFixed(4)} · ${((Date.now() - t0) / 1000).toFixed(1)}s`
+      + (budgetStopped ? ` · stopped by --budget at $${cost.toFixed(4)} (limit $${wiring.budget})` : "");
     console.error(c("90", r.errors.length ? summary + erroredSuffix(r.errors) : summary));
     printExamples(r.errors.map((e) => ({ line: `  ${e.kind}: ${e.file}:${e.start}-${e.end} ${e.message.slice(0, 120)}`, hint: e.hint })));
     // grep semantics when clean; 2 when any chunk errored (partial failure).

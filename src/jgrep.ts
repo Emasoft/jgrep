@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { BACKENDS, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
+import { BACKENDS, DEFAULT_PRICE_PER_MTOK, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
 import { runPool, type PoolResult } from "./pool";
 import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
 
@@ -199,8 +199,8 @@ export function chunkPaths(paths: string[]): Chunk[] {
 }
 
 // ---- Jev --------------------------------------------------------------------
-export function buildRequest(question: string, chunks: Chunk[], kind: Kind = "code", model = "jev-latest", votes = 1) {
-  const state = { chunks: chunks.map((c, i) => ({ id: `c${i}`, file: c.file, lines: `${c.start}-${c.end}`, [kind]: c.text })) };
+export function buildRequest(question: string, chunks: Chunk[], kind: Kind = "code", model = "jev-latest", votes = 1, envelopes = false) {
+  const state = { chunks: chunks.map((c, i) => ({ id: `c${i}`, file: c.file, lines: `${c.start}-${c.end}`, [kind]: envelopes ? c.text + numberEnvelope(c.text) : c.text })) };
   const what = kind === "diff"
     ? "Does that diff hunk (lines starting with + were added, - removed) match this description"
     : "Does that code match this description";
@@ -216,6 +216,27 @@ export function buildRequest(question: string, chunks: Chunk[], kind: Kind = "co
     }
   });
   return { model, state, questions };
+}
+
+// ---- --envelopes (WI-9) --------------------------------------------------------
+/** Cap on the numbers spelled out per chunk: the envelope is a hint for the judge,
+ *  not a transcript — past ~20 digits it stops helping and starts costing tokens. */
+export const ENVELOPE_MAX_NUMBERS = 20;
+const NUMBER_RE = /-?\d+(?:\.\d+)?/g;
+
+/**
+ * WI-9 numeric envelope: Jev's documented weakness is counting ("at most 3 retry
+ * sites?") — the chunk arrives as prose and the digits get miscounted. With
+ * --envelopes the first <=20 numbers of the chunk text are spelled out as a
+ * machine-readable suffix ("\n[numbers: 42, 7]"). The suffix is appended INSIDE
+ * buildRequest — the request carries it, but cache keys hash the RAW chunk text, so
+ * envelope and non-envelope runs share one cache (a chunk judged once is never paid
+ * for twice either way). Off by default; chunks without numbers get no suffix.
+ */
+export function numberEnvelope(text: string): string {
+  const nums = text.match(NUMBER_RE);
+  if (!nums || nums.length === 0) return "";
+  return `\n[numbers: ${nums.slice(0, ENVELOPE_MAX_NUMBERS).join(", ")}]`;
 }
 
 // ---- cache ------------------------------------------------------------------
@@ -263,6 +284,27 @@ export const VERIFY_PREFIX = "Verify strictly — answer only if clearly matchin
 /** --verify hysteresis (documented): a hit stands when its re-ask p >= threshold * VERIFY_GATE. */
 export const VERIFY_GATE = 0.6;
 
+// ---- --estimate (WI-7) ---------------------------------------------------------
+/** The documented token model behind `--estimate` (mirrors the README Cost section's
+ *  math, which lands $0.010–$0.012 on the 896-chunk reference repo): ~270 tokens of
+ *  fixed overhead per REQUEST (system framing + the answers schema) plus ~300 tokens
+ *  per CHUNK (chunk body + its question instructions) — one full 16-chunk batch ≈
+ *  270 + 16 × 300 ≈ 5,070 input tokens. Cost is tokens × the $/Mtok price
+ *  (JEV_PRICE_PER_MTOK, default $0.042); output is free. Provider-independent. */
+export const ESTIMATE_REQUEST_OVERHEAD_TOKENS = 270;
+export const ESTIMATE_TOKENS_PER_CHUNK = 300;
+
+export interface Estimate { chunks: number; requests: number; tokens: number; cost: number }
+
+/** Token/cost estimate for a run of `chunkCount` chunks batched `batch` per request,
+ *  priced at `pricePerMtok` $/Mtok. Pure math — the chunker's caller feeds the count. */
+export function estimateRun(chunkCount: number, batch: number, pricePerMtok: number): Estimate {
+  const perBatch = Math.max(1, Math.floor(batch) || 1);
+  const requests = Math.ceil(chunkCount / perBatch);
+  const tokens = requests * ESTIMATE_REQUEST_OVERHEAD_TOKENS + chunkCount * ESTIMATE_TOKENS_PER_CHUNK;
+  return { chunks: chunkCount, requests, tokens, cost: (tokens * pricePerMtok) / 1e6 };
+}
+
 // ---- core -------------------------------------------------------------------
 // Retry/deadline defaults live in ONE place (here); jgrep()/scoreRows() resolve
 // them once per run and the pool workers only read the resolved values.
@@ -281,6 +323,9 @@ export interface Options {
   group?: boolean;             // --group: fill result.groups[] (the intra-run signature dedup is always on)
   votes?: number;              // --votes: judge every chunk N times (1-5); the MEDIAN probability wins
   verify?: boolean;            // --verify: strict re-ask of every hit; the hit stands only at p >= threshold * 0.6
+  envelopes?: boolean;         // --envelopes (WI-9): append each chunk's numbers ("[numbers: 42, 7]") to the judged text
+  budget?: number;             // --budget (WI-7): once metered cost exceeds this many dollars, un-run chunks error budget_exhausted
+  pricePerMtok?: number;       // $/Mtok for the --budget meter when the provider reports no cost (default DEFAULT_PRICE_PER_MTOK)
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
 export interface ChunkError { file: string; start: number; end: number; kind: JevErrorKind; message: string; hint?: string }
@@ -329,6 +374,7 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
   // a re-run replays the same median for free) and the verdict to the MEDIAN of the N
   // answers. votes=1 keeps the byte-exact legacy single-question request and plain keys.
   const votes = Math.max(1, Math.min(5, Math.floor(o.votes ?? 1)));
+  const envelopes = o.envelopes ?? false; // --envelopes (WI-9): judged text gains "[numbers: …]"
   const keyOf = (ci: number): string => key(model, kind, question, chunks[ci]);
   const qid = (j: number, v: number): string => (votes > 1 ? `c${j}#v${v}` : `c${j}`);
   chunks.forEach((c, i) => {
@@ -366,11 +412,29 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
   };
   let tokens = 0;
   let cost: number | undefined; // stays undefined unless a provider reports a cost
+  // --budget (WI-7): the meter mirrors the CLI summary line — the provider-reported
+  // cost when one arrived, else tokens × $/Mtok. Checked at each worker's ENTRY, i.e.
+  // AFTER the previous batch's spend was recorded: in-flight batches finish (their
+  // hits and cache entries are kept), later ones refuse to start for free.
+  const price = o.pricePerMtok ?? DEFAULT_PRICE_PER_MTOK;
+  const meteredCost = (): number => (cost !== undefined ? cost : (tokens * price) / 1e6);
+  const budgetStop = (): boolean => o.budget !== undefined && meteredCost() > o.budget;
+  const budgetError = (): JevProviderError =>
+    new JevProviderError(
+      "budget_exhausted",
+      `budget exhausted: $${meteredCost().toFixed(4)} spent of the $${o.budget} --budget`,
+      { provider: backend.name, retryable: false, hint: "raise --budget" },
+    );
   // Run-level success flag (plan §1.5): drives the invalid_api_key expired-vs-wrong-key
   // hint. Tracked HERE (not PoolResult) because failFast throws the pool result away.
   let hadSuccess = false;
   const worker = async (b: number[], index: number): Promise<BatchOutcome> => {
-    const res = await postSystemOne(buildRequest(question, b.map((i) => chunks[i]), kind, model, votes), backend, apiKeyOf(), {
+    // --budget (WI-7): refuse to start a batch once the meter exceeds the budget — no
+    // request, no spend. budget_exhausted is non-retryable but deliberately NOT fatal
+    // (see errors.ts FATAL_KINDS): the breaker never trips on it, so every remaining
+    // batch reports the same stop instead of the run becoming circuit_breaker_open.
+    if (budgetStop()) throw budgetError();
+    const res = await postSystemOne(buildRequest(question, b.map((i) => chunks[i]), kind, model, votes, envelopes), backend, apiKeyOf(), {
       ...post,
       deadlineMs: Date.now() + timeoutMs, // per-batch deadline, retries included (§1.6.1)
     });
@@ -503,7 +567,8 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
       const vBatches: (typeof pending)[] = [];
       for (let i = 0; i < pending.length; i += batch) vBatches.push(pending.slice(i, i + batch));
       const vWorker = async (bp: typeof pending, index: number): Promise<VerifyOutcome> => {
-        const req = buildRequest(question, bp.map(({ hit }) => hit), kind, model);
+        if (budgetStop()) throw budgetError(); // --budget meters the verify pass too
+        const req = buildRequest(question, bp.map(({ hit }) => hit), kind, model, 1, envelopes);
         for (const id of Object.keys(req.questions))
           req.questions[id] = { type: "noul", instructions: VERIFY_PREFIX + (req.questions[id] as { instructions: string }).instructions };
         const res = await postSystemOne(req, backend, apiKeyOf(), { ...post, deadlineMs: Date.now() + timeoutMs });

@@ -106,9 +106,8 @@ usage: jgrep init                       interactive setup (provider, key, agent 
   -t, --threshold <p>   print chunks with probability >= p (default 0.7)
   -C, --show            print the matching chunk body under each hit
   -a, --all             print every chunk with its probability, best first
-      --group           one verdict per whitespace-signature group; --json adds "groups"
-      --votes <n>       judge every chunk N times (1-5, default 1); the median probability wins
-      --verify          strict re-ask of every hit; the hit stands only at p >= 0.6 × threshold
+      --group/--votes <n>/--verify   grouped verdicts, N-vote medians, strict re-ask
+      --estimate/--budget <usd>/--sarif/--envelopes   cost dry run, budget stop, SARIF, envelopes
       --json            machine-readable output: hits as a JSON array
                         (v0.3.0-compatible: [{file,start,end,p,text}]; rows: flattened objects)
       --json-errors     with --json: a JSON object instead — code mode
@@ -143,6 +142,7 @@ CI lint:    ! jgrep --diff origin/main "adds an endpoint without an auth check"
 
 examples:
   jgrep "catches an error and silently ignores it" src/
+  jgrep --estimate "swallows errors" src/
   jgrep --rows creators.csv "beauty is the main content of this account"
   jgrep --rows creators.csv --questions beauty.json --out scored.csv
   jgrep -C "reads user input without validating it" app/

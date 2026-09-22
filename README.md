@@ -250,6 +250,8 @@ jgrep [options] --rows <file> --questions <q.json> [--out scored.csv]
   -t, --threshold <p>   print chunks with probability >= p (default 0.7)
   -C, --show            print the matching chunk body under each hit
   -a, --all             print every chunk with its probability, best first
+      --group/--votes <n>/--verify   grouped verdicts, N-vote medians, strict re-ask
+      --estimate/--budget <usd>/--sarif/--envelopes   cost dry run, budget stop, SARIF, envelopes
       --json            machine-readable output: hits as a JSON array
                         (v0.3.0-compatible: [{file,start,end,p,text}]; rows:
                         [flattened answer objects, null for errored rows])
@@ -278,6 +280,31 @@ jgrep [options] --rows <file> --questions <q.json> [--out scored.csv]
       --no-cache        ignore and do not write ~/.cache/jgrep
   -v, --version         print version
 ```
+
+### Judging, cost controls, and machine-readable output
+
+The `--help` screen lists every flag on one line; these are the same flags in
+full.
+
+- `--group` folds chunks with the same whitespace signature into one verdict and,
+  with `--json`, adds a `"groups"` array.
+- `--votes N` (1–5, default 1) judges every chunk N times; the median probability
+  wins.
+- `--verify` re-asks every hit strictly; the hit stands only at
+  `p >= 0.6 × threshold`.
+- `--envelopes` appends each chunk's numbers (`[numbers: 42, 7]`) to the judged
+  chunk text, steadying Jev's counting of quantities (off by default; cache keys
+  stay keyed on the raw chunk text, so an envelope re-run replays for free).
+- `--estimate` is a dry run: per-file chunk counts plus the estimated tokens and
+  cost (~270 tokens of request overhead + ~300 per chunk) — no network, no cache
+  writes.
+- `--budget <usd>` stops the run once its metered cost exceeds `<usd>` dollars
+  (`$JEV_BUDGET` env override, `0` legal); un-run chunks error kind
+  `budget_exhausted` with a `raise --budget` hint — hits and cached answers are
+  kept.
+- `--sarif` prints SARIF 2.1.0 instead of text: one rule per description, one
+  result per hit (file uri + region.startLine) — ingestible by GitHub code
+  scanning.
 
 ## How it works
 
