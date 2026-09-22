@@ -221,6 +221,27 @@ test("backoff is capped by the remaining deadline; an expired deadline aborts wi
   }
 });
 
+test("FIX 0: fractional timer values never crash — the deadline-derived per-attempt timeout is integer-rounded (no RangeError)", async () => {
+  const { calls, fetchImpl } = scriptedFetch(() => resp(200, GOOD));
+  // requestTimeoutMs > the remaining deadline: the min() picks the FRACTIONAL deadline
+  // remainder (deadline - performance.now() is never a whole ms) — the exact value that
+  // made node's AbortSignal.timeout throw RangeError "out of range" at pristine HEAD
+  // (bun coerces floats, so the suite never caught it).
+  const r = await postSystemOne({ model: "m", questions: {} }, BACKENDS.typesafe, "k", {
+    fetchImpl,
+    deadlineMs: Date.now() + 1234,
+    requestTimeoutMs: 5000,
+  });
+  expect(r.answers.c0.noul).toBe(0.9); // completed: no exception, let alone one mentioning "out of range"
+  expect(calls.length).toBe(1);
+  // The documented regression shape: deadline under the request timeout.
+  const r2 = await postSystemOne({ model: "m", questions: {} }, BACKENDS.typesafe, "k", {
+    fetchImpl, deadlineMs: Date.now() + 1234, requestTimeoutMs: 1000,
+  });
+  expect(r2.answers.c0.noul).toBe(0.9);
+  expect(calls.length).toBe(2);
+});
+
 // ---- postSystemOne: request shape, cost extraction ----
 
 test("headers and URL: three headers on every request, URL from the backend", async () => {

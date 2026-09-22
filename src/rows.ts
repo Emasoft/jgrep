@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { BACKENDS, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
 import { runPool, type PoolResult } from "./pool";
 import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
-import { DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, KEY_WORKED_EARLIER_HINT, type Cache } from "./jgrep";
+import { DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, KEY_WORKED_EARLIER_HINT, normalizeForCache, type Cache } from "./jgrep";
 
 export type Row = Record<string, string>;
 export type Questions = Record<string, { type: "noul" | "choice" | "score"; instructions: string; [k: string]: unknown }>;
@@ -74,7 +74,16 @@ export function buildRowsRequest(rows: Row[], questions: Questions, model = "jev
   return { model, state, questions: qs };
 }
 
-const key = (model: string, qJson: string, r: Row) => createHash("sha1").update(`${model}\0rows\0${qJson}\0${JSON.stringify(r)}`).digest("hex");
+// Cache key (WI-6): the row — the judged content of rows mode — is normalized before
+// hashing: every string value goes through normalizeForCache (lines trimmed, blank
+// lines dropped), so whitespace-only reformatting of a CSV/JSONL row (re-indentation,
+// trailing spaces, blank-line churn) does not re-bill; any content change does.
+// Model and question JSON stay verbatim. Vote/verify-style suffixes (none here yet)
+// would compose after this normalized base.
+const normalizeRow = (r: Row) =>
+  Object.fromEntries(Object.entries(r).map(([k, v]) => [k, normalizeForCache(v)]));
+const key = (model: string, qJson: string, r: Row) =>
+  createHash("sha1").update(`${model}\0rows\0${qJson}\0${JSON.stringify(normalizeRow(r))}`).digest("hex");
 
 export interface RowsOptions {
   batch: number; concurrency: number; apiKey?: string;

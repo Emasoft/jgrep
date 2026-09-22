@@ -230,13 +230,24 @@ through the stderr summary and exit 2. New in 0.4.0: **`--json-errors`**
 `{"answers":[…],"errors":[{row,kind,message}]}`. `--out` writes whichever
 shape was selected.
 
-Two cache notes. Keys now include the resolved model id, so entries for another
+Cache notes. Keys include the resolved model id, so entries for another
 provider's model — openrouter's `~typesafe/jev-latest`, any `--model` override —
 are separate from typesafe's `jev-latest`: those queries re-bill once on the
-first run after upgrading, default typesafe queries keep their old keys. And a
+first run after upgrading, default typesafe queries keep their old keys. A
 failed batch is retried as a whole: keeping per-answer results from a failed
 batch depends on the provider returning per-question answers alongside errors,
 which is still to be verified on the OpenRouter alpha surface.
+
+New in 0.7.0. Cache keys hash the **whitespace-normalized** chunk
+text (lines trimmed, blank lines dropped) rather than the raw bytes, so
+reformatting a file — re-indentation, trailing spaces, blank-line churn — does
+not re-bill; any change in actual content still does. Entries keyed on the old
+raw chunk text simply miss once and re-bill after upgrading; there is no
+migration code. The cache is also capped at **10,000 entries** (`v1` envelope
+with an insertion-order list): when a save would exceed the cap, the oldest
+entries are evicted first and the newest judgments always survive. Saves are
+atomic — written to a temp file next to the cache and renamed into place — so
+concurrent jgrep processes can never see a half-written cache.
 
 ## All options
 
@@ -250,6 +261,10 @@ jgrep [options] --rows <file> --questions <q.json> [--out scored.csv]
   -t, --threshold <p>   print chunks with probability >= p (default 0.7)
   -C, --show            print the matching chunk body under each hit
   -a, --all             print every chunk with its probability, best first
+      --group/--votes <n>/--verify   grouped verdicts, N-vote medians, strict re-ask
+      --estimate/--budget <usd>/--sarif/--envelopes   cost dry run, budget stop, SARIF, envelopes
+      --funcs           two-phase navigation: shortlist files by function signatures, then search only those
+      --tag <list>      classify hits: one choice question per hit; the winning category prints as [tag]
       --json            machine-readable output: hits as a JSON array
                         (v0.3.0-compatible: [{file,start,end,p,text}]; rows:
                         [flattened answer objects, null for errored rows])
@@ -257,8 +272,7 @@ jgrep [options] --rows <file> --questions <q.json> [--out scored.csv]
                         {hits:[...], errors:[{file,start,end,kind,message}]};
                         rows mode {answers:[...], errors:[{row,kind,message}]}
       --diff [ref]      grep git diff hunks instead of files
-                        (working tree by default, or against <ref>)
-      --staged          with --diff: staged changes only
+                        (working tree by default, or against <ref>; --staged = staged only)
       --rows <file>     grep rows of a CSV / JSONL file instead of code
       --questions <f>   with --rows: JSON of Jev questions (noul/choice/score)
                         asked of every row; prints the table with answer columns
@@ -274,10 +288,50 @@ jgrep [options] --rows <file> --questions <q.json> [--out scored.csv]
       --retries <n>     failed attempts tolerated per batch (default 4)
       --rate <req/s>    global request pacing (token bucket); 0 = unlimited
       --fail-fast       abort on the first fatal error instead of isolating it
-      --no-probe        skip the openrouter startup probe
-      --no-cache        ignore and do not write ~/.cache/jgrep
+      --no-probe/--no-cache   skip the openrouter startup probe; ignore and do not write ~/.cache/jgrep
   -v, --version         print version
 ```
+
+### Judging, cost controls, and machine-readable output
+
+The `--help` screen lists every flag on one line; these are the same flags in
+full.
+
+- `--group` folds chunks with the same whitespace signature into one verdict and,
+  with `--json`, adds a `"groups"` array.
+- `--votes N` (1–5, default 1) judges every chunk N times; the median probability
+  wins.
+- `--verify` re-asks every hit strictly; the hit stands only at
+  `p >= 0.6 × threshold`.
+- `--envelopes` appends each chunk's numbers (`[numbers: 42, 7]`) to the judged
+  chunk text, steadying Jev's counting of quantities (off by default; cache keys
+  stay keyed on the whitespace-normalized chunk text, so an envelope re-run
+  replays for free).
+- `--estimate` is a dry run: per-file chunk counts plus the estimated tokens and
+  cost (~270 tokens of request overhead + ~300 per chunk) — no network, no cache
+  writes.
+- `--budget <usd>` stops the run once its metered cost exceeds `<usd>` dollars
+  (`$JEV_BUDGET` env override, `0` legal); un-run chunks error kind
+  `budget_exhausted` with a `raise --budget` hint — hits and cached answers are
+  kept.
+- `--sarif` prints SARIF 2.1.0 instead of text: one rule per description, one
+  result per hit (file uri + region.startLine) — ingestible by GitHub code
+  scanning.
+- `--funcs` is two-phase **function navigation**: pass 1 packs all of a file's
+  regex-extracted function/method/class signature lines into one signature chunk
+  per file (a tree-sitter parse is a future upgrade — the regexes are the
+  documented fallback) and judges those first; pass 2 then runs the normal chunk
+  search only on the files whose signatures matched, so the search cost tracks
+  the shortlist instead of the whole tree. Files in unsupported languages (see
+  `funcs.ts` for the extension map) and files with no extractable signatures are
+  skipped in `--funcs` mode — pass 1 cannot shortlist what it never saw.
+- `--tag "best-effort cleanup,real bug"` classifies the standing hits with one
+  `choice` question per hit (batched like the search, at most 16 hits per
+  request): the winning category prints after the `p` column (`[real bug]`) and
+  rides on `--json` hit objects as `tag`/`tag_p`. It runs after `--verify`
+  filtering, so tags only attach to hits that survived the gate. A failed tag
+  batch never errors the run — those hits stay untagged (the annotation pass is
+  never worth failing a search that already answered).
 
 ## How it works
 

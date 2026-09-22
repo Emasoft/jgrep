@@ -434,10 +434,14 @@ export async function postSystemOne(
       );
     }
 
+    // FIX 0: node timers throw RangeError ("out of range") on fractional delays — bun
+    // coerces floats, which is why the tests never saw it. The deadline-derived value is
+    // fractional by construction (performance.now()), so round UP to a whole ms, floored
+    // at 1 so a sub-ms window still aborts instead of crashing the whole run.
     const perAttemptMs = deadline === undefined
       ? requestTimeoutMs
       : Math.min(requestTimeoutMs, deadline - monotonicMs());
-    const signal = AbortSignal.timeout(perAttemptMs);
+    const signal = AbortSignal.timeout(Math.max(1, Math.ceil(perAttemptMs)));
 
     // What failed THIS attempt (a retryable status or a retryable transport error).
     let retryStatus: number | undefined;
@@ -516,7 +520,11 @@ export async function postSystemOne(
     const retryAfterMs = parseRetryAfter(retryAfterRaw); // transport errors have no header -> null
     let wait = Math.min(Math.max(delay, retryAfterMs ?? 0), RETRY_AFTER_MAX_MS);
     if (deadline !== undefined) wait = Math.max(0, Math.min(wait, deadline - monotonicMs()));
-    await sleep(wait);
+    // FIX 0: jitter (rand() * cap) and a deadline cap are fractional — node's timers
+    // reject fractional delays, so round to a whole ms; <=0 (deadline fully consumed)
+    // skips the nap entirely: the next attempt dies at the deadline check anyway.
+    const waitMs = Math.round(wait);
+    if (waitMs > 0) await sleep(waitMs);
   }
 }
 
