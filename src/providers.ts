@@ -200,7 +200,14 @@ export function resolveProvider(name: string | undefined, env: Env = process.env
 declare const performance: { now(): number };
 const monotonicMs = (): number => performance.now();
 
-const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+// Node's AbortSignal.timeout throws `RangeError: The value of "delay" is out of range.
+// It must be an integer.` on fractional delays; Bun silently accepts them (WI-11 bug: the
+// monotonic deadline conversion produced e.g. 14999.918084 and every batch failed as
+// bad_request). Every computed ms value crossing into an abort signal is therefore
+// floored to a positive integer here; timer sleeps are floored at their call sites.
+const abortDelayMs = (ms: number): number => Math.max(1, Math.floor(ms));
+
+const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.floor(ms))));
 
 /** DI seam for fetch — same shape as the export that still lives in jgrep.ts (until Step 4). */
 export type Fetch = typeof fetch;
@@ -255,9 +262,10 @@ export class RateLimiter {
     this.lastMs = t;
   }
 
-  /** ms until the queue head can be granted a token (0 when one is free now). */
+  /** Integer ms until the queue head can be granted a token (0 when one is free now) —
+   *  the refill math is fractional and timers take integers. */
   private headWaitMs(): number {
-    return Math.max(0, ((1 - this.tokens) / this.rate) * 1000);
+    return Math.max(0, Math.floor(((1 - this.tokens) / this.rate) * 1000));
   }
 
   /** True when the waiter carries a deadline the monotonic clock has already passed. */
@@ -437,7 +445,9 @@ export async function postSystemOne(
     const perAttemptMs = deadline === undefined
       ? requestTimeoutMs
       : Math.min(requestTimeoutMs, deadline - monotonicMs());
-    const signal = AbortSignal.timeout(perAttemptMs);
+    // The deadline branch is fractional (monotonic math) and Node throws RangeError on a
+    // fractional abort delay — floor to a positive integer (see abortDelayMs).
+    const signal = AbortSignal.timeout(abortDelayMs(perAttemptMs));
 
     // What failed THIS attempt (a retryable status or a retryable transport error).
     let retryStatus: number | undefined;
@@ -512,11 +522,12 @@ export async function postSystemOne(
       );
     }
 
-    const delay = jitteredDelayMs(attempt); // full jitter, base 500ms, cap 30s
+    const delay = jitteredDelayMs(attempt); // full jitter, base 500ms, cap 30s (float — floored below)
     const retryAfterMs = parseRetryAfter(retryAfterRaw); // transport errors have no header -> null
     let wait = Math.min(Math.max(delay, retryAfterMs ?? 0), RETRY_AFTER_MAX_MS);
-    if (deadline !== undefined) wait = Math.max(0, Math.min(wait, deadline - monotonicMs()));
-    await sleep(wait);
+    if (deadline !== undefined) wait = Math.min(wait, deadline - monotonicMs());
+    // Integer ms only: jitter and the deadline remainder are floats (see abortDelayMs).
+    await sleep(Math.max(0, Math.floor(wait)));
   }
 }
 
@@ -538,7 +549,7 @@ export async function verifyApiKey(
         state: "ping",
         questions: { ok: { type: "noul", instructions: "Is the state the word ping?" } },
       }),
-      signal: AbortSignal.timeout(VERIFY_TIMEOUT_MS),
+      signal: AbortSignal.timeout(abortDelayMs(VERIFY_TIMEOUT_MS)), // literal int — floored for uniformity
     });
     let model: string | undefined;
     if (res.ok) {
