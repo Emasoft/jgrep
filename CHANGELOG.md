@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed dead code: the redundant unreachable-codes branch in `classifyTransport` (identical fallthrough) and the unused `installSkills` (superseded by init's universal skill installer).
 - Docs: README now says code-mode `--json` is byte-identical to 0.3.0 while rows mode is a flattened answer array; the bench `--limit` note reads "rows per class"; the Bench workflow input says "Rows per class / cases"; the `--help` init line reads "(provider, key, agent skills)".
 - CI runs the bench unit tests too (`bun test src/ bench/`).
+- `--rate` pacing: queued waiters whose batch deadline lapses are evicted from the rate-limiter queue and fail with `timeout` **without consuming a token**; limiter errors name the provider.
 
 ## [0.4.0] - 2026-09-20 — providers, reliability, isolation, benchmarks (issue #1: WI-1, WI-8, WI-11, WI-12)
 
