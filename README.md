@@ -220,8 +220,11 @@ go to stderr. Every failure carries a typed kind:
 **`--json` is unchanged** (same contract as 0.3.0): the bare array — code mode
 `[{file,start,end,p,text}]`, rows questions mode the scored table rows (your row
 fields plus the answer columns), rows single-description mode the shown hits
-`[{row, p, ...row fields}]` with `row` the CSV line number. Errored rows never
-enter the array; errors surface through the stderr summary and exit 2.
+`[{row, p, ...row fields}]` with `row` the CSV line number. Questions mode
+(`--questions`) includes **every row** — an errored row keeps its place with the
+question columns empty (its flattened answer is null); single-description mode
+emits only the shown hits, so errored rows never enter that array. Errors
+surface through the stderr summary and exit 2.
 
 ## How it works
 
