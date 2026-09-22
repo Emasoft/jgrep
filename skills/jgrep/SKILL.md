@@ -83,6 +83,7 @@ jgrep "description" src/                 # hits with p >= 0.7, file order
 jgrep -t 0.85 "description" src/         # fewer, higher-precision hits
 jgrep -C "description" src/              # print the matching chunk bodies
 jgrep --json "description" src/          # hits as a JSON array: [{file,start,end,p,text}]
+jgrep --tag "real bug,needs review" "description" src/   # classify hits, e.g. for triage
 jgrep --json-errors "description" src/   # object instead: {hits:[...], errors:[...]}
 jgrep -a -t 0 "description" src/ | head  # everything, best first (when 0 hits)
 jgrep --diff --staged "rule"             # lint your staged change
@@ -95,7 +96,7 @@ jgrep --api openrouter "rule" src/       # pick a provider: typesafe | openroute
 `jgrep --help` prints the full reference — every flag, default, and exit status:
 
 ```
-jgrep 0.4.0 — semantic grep powered by Jev (TypeSafe)
+jgrep 0.7.0 — semantic grep powered by Jev (TypeSafe)
 
 usage: jgrep init                       interactive setup (provider, key, agent skills)
        jgrep [options] "<description>" [path ...]
@@ -108,14 +109,15 @@ usage: jgrep init                       interactive setup (provider, key, agent 
   -a, --all             print every chunk with its probability, best first
       --group/--votes <n>/--verify   grouped verdicts, N-vote medians, strict re-ask
       --estimate/--budget <usd>/--sarif/--envelopes   cost dry run, budget stop, SARIF, envelopes
+      --funcs           two-phase navigation: shortlist files by function signatures, then search only those
+      --tag <list>      classify hits: one choice question per hit; the winning category prints as [tag]
       --json            machine-readable output: hits as a JSON array
                         (v0.3.0-compatible: [{file,start,end,p,text}]; rows: flattened objects)
       --json-errors     with --json: a JSON object instead — code mode
                         {hits:[...], errors:[{file,start,end,kind,message}]};
                         rows mode {answers:[...], errors:[{row,kind,message}]}
       --diff [ref]      grep git diff hunks instead of files
-                        (working tree by default, or against <ref>)
-      --staged          with --diff: staged changes only
+                        (working tree by default, or against <ref>; --staged = staged only)
       --rows <file>     grep rows of a CSV / JSONL file instead of code
       --questions <f>   with --rows: JSON of Jev questions (noul/choice/score)
                         asked of every row; prints the table with answer columns
@@ -131,8 +133,7 @@ usage: jgrep init                       interactive setup (provider, key, agent 
       --retries <n>     failed attempts tolerated per batch (default 4)
       --rate <req/s>    global request pacing (token bucket); 0 = unlimited
       --fail-fast       abort on the first fatal error instead of isolating it
-      --no-probe        skip the openrouter startup probe
-      --no-cache        ignore and do not write ~/.cache/jgrep
+      --no-probe/--no-cache   skip the openrouter startup probe; ignore and do not write ~/.cache/jgrep
   -v, --version         print version
 
 exit status: 0 when something matched, 1 when nothing did, 2 on error or when any

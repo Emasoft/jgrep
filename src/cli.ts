@@ -3,7 +3,7 @@
 import fs from "node:fs";
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo; only createHash is used
 import { createHash } from "node:crypto";
-import { chunkPaths, diffChunks, estimateRun, gitDiff, jgrep, loadCache, saveCache, type Hit, type Kind } from "./jgrep";
+import { chunkPaths, diffChunks, estimateRun, gitDiff, jgrep, jgrepFuncs, loadCache, parseTagCategories, saveCache, type Hit, type Kind } from "./jgrep";
 import { readRows, loadQuestions, scoreRows, flattenAnswers, toCsv } from "./rows";
 import { resolveApiKey, resolvePricePerMtok, resolveProvider, verifyApiKey, type Backend } from "./providers";
 import { JevProviderError } from "./errors";
@@ -20,7 +20,7 @@ declare const process: {
   stderr: { isTTY?: boolean; write(s: string): void };
 };
 
-const VERSION = "0.4.0";
+const VERSION = "0.7.0";
 // Exported so src/skill.test.ts can pin skills/jgrep/SKILL.md's embedded help
 // block to this exact text (the template already embeds the rendered VERSION).
 export const USAGE = `jgrep ${VERSION} — semantic grep powered by Jev (TypeSafe)
@@ -36,14 +36,15 @@ usage: jgrep init                       interactive setup (provider, key, agent 
   -a, --all             print every chunk with its probability, best first
       --group/--votes <n>/--verify   grouped verdicts, N-vote medians, strict re-ask
       --estimate/--budget <usd>/--sarif/--envelopes   cost dry run, budget stop, SARIF, envelopes
+      --funcs           two-phase navigation: shortlist files by function signatures, then search only those
+      --tag <list>      classify hits: one choice question per hit; the winning category prints as [tag]
       --json            machine-readable output: hits as a JSON array
                         (v0.3.0-compatible: [{file,start,end,p,text}]; rows: flattened objects)
       --json-errors     with --json: a JSON object instead — code mode
                         {hits:[...], errors:[{file,start,end,kind,message}]};
                         rows mode {answers:[...], errors:[{row,kind,message}]}
       --diff [ref]      grep git diff hunks instead of files
-                        (working tree by default, or against <ref>)
-      --staged          with --diff: staged changes only
+                        (working tree by default, or against <ref>; --staged = staged only)
       --rows <file>     grep rows of a CSV / JSONL file instead of code
       --questions <f>   with --rows: JSON of Jev questions (noul/choice/score)
                         asked of every row; prints the table with answer columns
@@ -59,8 +60,7 @@ usage: jgrep init                       interactive setup (provider, key, agent 
       --retries <n>     failed attempts tolerated per batch (default 4)
       --rate <req/s>    global request pacing (token bucket); 0 = unlimited
       --fail-fast       abort on the first fatal error instead of isolating it
-      --no-probe        skip the openrouter startup probe
-      --no-cache        ignore and do not write ~/.cache/jgrep
+      --no-probe/--no-cache   skip the openrouter startup probe; ignore and do not write ~/.cache/jgrep
   -v, --version         print version
 
 exit status: 0 when something matched, 1 when nothing did, 2 on error or when any
@@ -83,8 +83,8 @@ const c = (code: string, s: string) => (tty ? `\x1b[${code}m${s}\x1b[0m` : s);
 export function parse(argv: string[]) {
   const o = {
     threshold: 0.7, batch: 16, concurrency: 16, all: false, show: false, group: false, votes: 1, verify: false, json: false, jsonErrors: false, cache: true,
-    estimate: false, sarif: false, envelopes: false, budget: null as number | null,
-    diff: null as string[] | null, rows: "", questions: "", out: "",
+    estimate: false, sarif: false, envelopes: false, funcs: false, budget: null as number | null,
+    diff: null as string[] | null, rows: "", questions: "", out: "", tag: "",
     api: "", model: "", timeout: 15, requestTimeout: 30, retries: 4, rate: 0, failFast: false, noProbe: false,
   };
   const rest: string[] = [];
@@ -100,6 +100,8 @@ export function parse(argv: string[]) {
     else if (a === "--votes") o.votes = Number(argv[++i]);
     else if (a === "--verify") o.verify = true;
     else if (a === "--envelopes") o.envelopes = true;
+    else if (a === "--funcs") o.funcs = true;
+    else if (a === "--tag") o.tag = argv[++i] ?? ""; // comma-separated categories; validated below
     else if (a === "--estimate") o.estimate = true;
     else if (a === "--json") o.json = true;
     else if (a === "--json-errors") { o.jsonErrors = true; o.json = true; } // implies --json
@@ -138,6 +140,11 @@ export function parse(argv: string[]) {
   // re-asks stop adding signal (rejected before anything is sent or cached).
   if (!Number.isInteger(o.votes) || o.votes < 1 || o.votes > 5)
     throw new Error("votes must be an integer between 1 and 5");
+  // --tag (WI-4): at least 2 categories — a choice over a single criterion is not a
+  // classification. Categories are trimmed/empties-dropped; the raw string passes
+  // through to jgrep(), which re-parses it the same way.
+  if (o.tag !== "" && parseTagCategories(o.tag).length < 2)
+    throw new Error(`--tag needs at least 2 comma-separated categories (got ${parseTagCategories(o.tag).length})`);
   // --budget (WI-7): dollars; 0 stays legal (stop once the first batch has spent
   // anything), negative/non-finite gets the generic numeric error like every flag.
   if (o.budget !== null && !(Number.isFinite(o.budget) && o.budget >= 0))
@@ -279,14 +286,17 @@ async function main() {
 
   const t0 = Date.now();
   const kind: Kind = o.diff ? "diff" : "code";
-  const chunks = o.diff ? diffChunks(gitDiff(o.diff)) : chunkPaths(o.paths.length ? o.paths : ["."]);
-  if (!chunks.length) { console.error(o.diff ? "empty diff" : "no text files found"); process.exit(1); }
+  // --funcs (WI-5) builds its own chunks inside jgrepFuncs (pass-1 signature chunks,
+  // then pass-2 normal chunks of the shortlist) — the eager chunking below is skipped.
+  // Applies to code search only: --diff keeps judging hunks (funcs ignored there).
+  const chunks = o.funcs && !o.diff ? null : (o.diff ? diffChunks(gitDiff(o.diff)) : chunkPaths(o.paths.length ? o.paths : ["."]));
+  if (chunks !== null && !chunks.length) { console.error(o.diff ? "empty diff" : "no text files found"); process.exit(1); }
   const cache = o.cache ? loadCache() : {};
   try {
-    const r = await jgrep(o.question, chunks, {
-      ...o, kind, cache, ...wiring,
-      onProgress: (d, n) => { if (process.stderr.isTTY) process.stderr.write(`\r${d}/${n} requests`); },
-    });
+    const onProgress = (d: number, n: number) => { if (process.stderr.isTTY) process.stderr.write(`\r${d}/${n} requests`); };
+    const r = chunks !== null
+      ? await jgrep(o.question, chunks, { ...o, kind, cache, ...wiring, onProgress })
+      : await jgrepFuncs(o.question, o.paths.length ? o.paths : ["."], { ...o, kind, cache, ...wiring, onProgress });
     if (process.stderr.isTTY) process.stderr.write("\r\x1b[K");
 
     const rows: Hit[] = o.all ? [...r.all].sort((a, b) => b.p - a.p) : r.hits;
@@ -303,7 +313,13 @@ async function main() {
       // --group opts into an object too: groups[] rides next to the hits (with
       // --json-errors also the errors — key order hits, groups, errors keeps the
       // documented shape prefix-stable).
-      const hits = rows.map((h) => ({ file: h.file, start: h.start, end: h.end, p: h.p, text: h.text }));
+      // --tag (WI-4): tag/tag_p ride on hit objects ONLY when --tag was passed AND the
+      // hit actually carries a tag (a failed tag batch leaves the bare v0.3.0 shape —
+      // byte-identical output, same as the no-tag contract the v0.3.0 consumers pin).
+      const hits = rows.map((h) => ({
+        file: h.file, start: h.start, end: h.end, p: h.p, text: h.text,
+        ...(o.tag && h.tag !== undefined ? { tag: h.tag, ...(h.tag_p !== undefined ? { tag_p: h.tag_p } : {}) } : {}),
+      }));
       const payload = o.jsonErrors || o.group
         ? {
             hits,
@@ -326,7 +342,9 @@ async function main() {
       for (const h of rows) {
         const head = h.text.split("\n").find((l) => l.trim() && !l.startsWith("@@"))?.trim().slice(0, 90) ?? "";
         const pcol = h.p >= o.threshold ? "32" : "90";
-        console.log(`${c("35", h.file)}${c("36", ":")}${c("32", `${h.start}-${h.end}`)}  ${c(pcol, `p=${h.p.toFixed(2)}`)}  ${head}`);
+        // --tag (WI-4): the winning category prints right after the p column.
+        const tagcol = h.tag !== undefined ? c("33", ` [${h.tag}]`) : "";
+        console.log(`${c("35", h.file)}${c("36", ":")}${c("32", `${h.start}-${h.end}`)}  ${c(pcol, `p=${h.p.toFixed(2)}`)}${tagcol}  ${head}`);
         if (o.show) console.log(h.text.split("\n").map((l) => "    " + l).join("\n") + "\n");
       }
     }

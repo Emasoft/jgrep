@@ -7,9 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-22 — roadmap completion (issue #1: WI-2, WI-3, WI-4, WI-5, WI-6, WI-7, WI-9, WI-10)
+
+Completes the deferred roadmap of
+[Emasoft/jgrep#1](https://github.com/Emasoft/jgrep/issues/1): every remaining
+work item is implemented. [0.4.0](#040---2026-09-20--providers-reliability-isolation-benchmarks-issue-1-wi-1-wi-8-wi-11-wi-12)
+shipped WI-1 (multi-provider), WI-8 (error taxonomy), WI-11 (partial-failure
+isolation), and WI-12 (benchmarks); markdown chunking ships here too.
+
 ### Added
 
-- markdown-aware chunking: .md/.mdx files split at headings with section-trail context; fenced code blocks never split — sub-section extraction via -C/--json start-end
+- **`--group`** (WI-3): chunks sharing a whitespace-normalized signature are
+  near-identical boilerplate — the first is judged, siblings inherit its
+  verdict (exactly one question for the whole family), and `--group` prints
+  one group per signature (representative body + sites; `--json`/`--json-errors`
+  gain `groups[]`).
+- **`--tag <list>`** (WI-4): classify the standing hits — one `choice` question
+  per hit (at most 16 per request), categories given comma-separated. The
+  winning category prints after the `p` column (`[real bug]`) and rides on
+  `--json` hit objects as `tag`/`tag_p`. Runs after `--verify` filtering; a
+  failed tag batch never errors the run — those hits stay untagged.
+- **Verification cascade** (WI-2): `--verify` re-asks every hit with strict
+  instructions and keeps it only at `p >= 0.6 × threshold` (fail-open when the
+  verify batch itself fails); `--votes <n>` (1–5) judges every chunk n times
+  and the MEDIAN probability wins, with per-vote cache keys.
+- **`--funcs`** (WI-5): two-phase function navigation — pass 1 packs all of a
+  file's regex-extracted function/method/class signature lines into one
+  signature chunk per file (tree-sitter is a future upgrade; the regexes are
+  the documented fallback) and judges those first; pass 2 runs the normal
+  chunk search only on the shortlisted files. Files in unsupported languages
+  and files with no extractable signatures are skipped.
+- **Cost controls & SARIF** (WI-7): `--estimate` is an offline chunk/token/cost
+  preview (no network, no cache writes); `--budget <usd>` meters per-batch cost
+  (provider-reported else tokens × price) and over-budget chunks error
+  `budget_exhausted` (`JEV_BUDGET` env override); `--sarif` prints SARIF 2.1.0
+  ingestible by GitHub code scanning.
+- **`--envelopes`** (WI-9): appends each chunk's numbers (`[numbers: 42, 7]`)
+  to the judged text, steadying Jev's counting of quantities; off by default,
+  and envelope/non-envelope runs share one cache.
+- **Cache hardening** (WI-6): keys hash the whitespace-normalized chunk text
+  (reformatting a file no longer re-bills; old raw-text keys miss once and
+  re-bill, no migration code), saves are atomic (temp file + rename, so
+  concurrent processes never see a half-written cache), and the cache is
+  capped at 10,000 entries with oldest-first eviction (v1 envelope with an
+  insertion-order list).
+- markdown-aware chunking: .md/.mdx files split at headings with section-trail
+  context; fenced code blocks never split — sub-section extraction via
+  -C/--json start-end.
 
 ### Fixed
 
@@ -21,6 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `JEV_PRICE_PER_MTOK` is validated right after provider resolution (both modes) — an invalid price can no longer surface only after the run has billed tokens.
 - install-dev.sh: `check` and choice 6 never create the target directory (a missing `~/.local/bin` was mkdir'd under "no mutation").
 - The gateway 402 hint drops the "top up credits at …" clause when the provider has no billing URL ("insufficient credits on the gateway provider").
+- Reliability: expired waiters are evicted from the rate limiter without consuming a token, and the per-batch deadline is monotonic with a fail-fast settlement guard.
 - Removed dead code: the redundant unreachable-codes branch in `classifyTransport` (identical fallthrough) and the unused `installSkills` (superseded by init's universal skill installer).
 - Docs: README now says code-mode `--json` is byte-identical to 0.3.0 while rows mode is a flattened answer array; the bench `--limit` note reads "rows per class"; the Bench workflow input says "Rows per class / cases"; the `--help` init line reads "(provider, key, agent skills)".
 - CI runs the bench unit tests too (`bun test src/ bench/`).

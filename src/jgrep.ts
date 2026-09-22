@@ -9,12 +9,14 @@ import { createHash } from "node:crypto";
 import { BACKENDS, DEFAULT_PRICE_PER_MTOK, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
 import { runPool, type PoolResult } from "./pool";
 import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
+import { detectLanguage, signatureChunk } from "./funcs";
 
 // DI seam for fetch (moved to providers.ts; re-exported so existing imports keep working)
 export type { Fetch };
 
 export interface Chunk { file: string; start: number; end: number; text: string; context?: string }
-export interface Hit extends Chunk { p: number }
+/** A hit may carry a --tag (WI-4) verdict: the winning category name and its probability. */
+export interface Hit extends Chunk { p: number; tag?: string; tag_p?: number }
 export type Kind = "code" | "diff";
 
 // ---- chunking ---------------------------------------------------------------
@@ -229,9 +231,10 @@ const NUMBER_RE = /-?\d+(?:\.\d+)?/g;
  * sites?") — the chunk arrives as prose and the digits get miscounted. With
  * --envelopes the first <=20 numbers of the chunk text are spelled out as a
  * machine-readable suffix ("\n[numbers: 42, 7]"). The suffix is appended INSIDE
- * buildRequest — the request carries it, but cache keys hash the RAW chunk text, so
- * envelope and non-envelope runs share one cache (a chunk judged once is never paid
- * for twice either way). Off by default; chunks without numbers get no suffix.
+ * buildRequest — the request carries it, but cache keys hash the whitespace-
+ * NORMALIZED chunk text (WI-6), so envelope and non-envelope runs share one cache
+ * (a chunk judged once is never paid for twice either way). Off by default; chunks
+ * without numbers get no suffix.
  */
 export function numberEnvelope(text: string): string {
   const nums = text.match(NUMBER_RE);
@@ -243,14 +246,69 @@ export function numberEnvelope(text: string): string {
 // One JSON file for now; move to sqlite if it grows past a few MB.
 const CACHE_FILE = path.join(os.homedir(), ".cache", "jgrep", "cache.json");
 export type Cache = Record<string, any>;
-export function loadCache(): Cache {
-  try { return JSON.parse(fs.readFileSync(CACHE_FILE, "utf8")); } catch { return {}; }
+
+/** WI-6 size cap: at most this many entries survive a save; the OLDEST-inserted
+ *  keys are evicted first, so the newest judgments always survive. */
+export const CACHE_MAX_ENTRIES = 10_000;
+
+/** Pure eviction seam (WI-6): drops entries from the FRONT of the insertion order
+ *  until `c` fits `cap`. Object.keys of a JSON-parsed cache IS insertion order (a
+ *  40-char sha1 hex key is never an integer-like array index), so the front of that
+ *  order is the oldest generation. Mutates and returns `c`. Exported so the cap and
+ *  oldest-first rule are testable without driving 10k entries through the disk. */
+export function evict(c: Cache, cap: number = CACHE_MAX_ENTRIES): Cache {
+  const overflow = Object.keys(c).length - cap;
+  if (overflow <= 0) return c;
+  for (const k of Object.keys(c).slice(0, overflow)) delete c[k];
+  return c;
 }
-export function saveCache(c: Cache) {
+
+/**
+ * Whitespace-normalized chunk identity for the persistent cache key (WI-6): lines
+ * trimmed, blank lines dropped, re-joined — the same rule as chunkSignature, kept a
+ * SEPARATE function because the two serve different masters. chunkSignature only
+ * dedups identical chunks WITHIN one run; this one decides what a cached judgment
+ * costs: whitespace-only reformatting (re-indentation, trailing spaces, blank-line
+ * churn) must not re-bill, while any change in actual content still hashes
+ * differently and re-bills. Rows mode normalizes the judged row through this too.
+ */
+export function normalizeForCache(text: string): string {
+  return text.split("\n").map((l) => l.trim()).filter((l) => l.length > 0).join("\n");
+}
+
+/** Disk format v1 (WI-6): `{"v":1,"entries":{…},"order":["key",…]}` with `order` =
+ *  insertion order (front = oldest). Returns the FLAT entry map either way, so every
+ *  consumer keeps treating the cache as Record<key, p>. A legacy flat object (no
+ *  envelope) loads unchanged and is re-persisted in the envelope on the next save —
+ *  entries kept, order taken as Object.keys. No migration code: entries keyed on the
+ *  pre-normalization raw chunk text simply miss once and re-bill (README cache note). */
+export function loadCache(file: string = CACHE_FILE): Cache {
   try {
-    fs.mkdirSync(path.dirname(CACHE_FILE), { recursive: true });
-    fs.writeFileSync(CACHE_FILE, JSON.stringify(c));
-  } catch { /* cache is best-effort */ }
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+    if (parsed.entries && typeof parsed.entries === "object" && !Array.isArray(parsed.entries))
+      return parsed.entries as Cache;
+    return parsed as Cache;
+  } catch { return {}; }
+}
+
+/** Best-effort persist (WI-6): evict past CACHE_MAX_ENTRIES, then write
+ *  `${file}.tmp-<pid>` in the SAME directory and fs.renameSync it over the target —
+ *  a same-directory rename is atomic, so concurrent jgrep processes never observe a
+ *  half-written cache and the worst case is a lost save, never a corrupted file.
+ *  Any failure skips the save silently (as before) and removes the tmp file
+ *  best-effort. The `file` parameter is a test seam; production callers rely on the
+ *  default CACHE_FILE. */
+export function saveCache(c: Cache, file: string = CACHE_FILE) {
+  const tmp = `${file}.tmp-${process.pid}`;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    evict(c);
+    fs.writeFileSync(tmp, JSON.stringify({ v: 1, entries: c, order: Object.keys(c) }));
+    fs.renameSync(tmp, file);
+  } catch {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* cache is best-effort */ }
+  }
 }
 // Normalized signature: whitespace-insensitive chunk identity. Chunks sharing
 // a signature are near-identical boilerplate — judge one, siblings inherit.
@@ -259,16 +317,21 @@ export function chunkSignature(text: string): string {
 }
 
 // Intra-run signature key (WI-3): sha1 over (kind, question, normalized text).
-// Deliberately NOT the plain-text cache key above (which stays byte-exact per
-// chunk) — the signature only dedups identical chunks WITHIN a single run.
+// Deliberately NOT the persistent cache key below — the signature only dedups
+// identical chunks WITHIN a single run.
 const sigKey = (kind: Kind, q: string, c: Chunk) =>
   createHash("sha1").update(`${kind}\0${q}\0${chunkSignature(c.text)}`).digest("hex");
 
+// Persistent cache key (WI-6): sha1 over (model, kind, question, NORMALIZED chunk
+// text [, context]) — normalizeForCache(c.text), not the raw bytes, so whitespace-
+// only reformatting of a file never re-bills while any content change does. Old
+// raw-text keys simply miss and re-bill once (no migration code; README note).
 // Markdown chunks fold their context trail into the key; chunks without context
-// keep the exact pre-markdown key string (no trailing \0), so old cache entries stay valid.
+// keep the exact pre-markdown key shape (no trailing \0). The #v{i} (votes) and
+// #verify suffixes compose AFTER this normalized base — suffix logic unchanged.
 const key = (model: string, kind: Kind, q: string, c: Chunk) =>
   createHash("sha1")
-    .update(c.context ? `${model}\0${kind}\0${q}\0${c.text}\0${c.context}` : `${model}\0${kind}\0${q}\0${c.text}`)
+    .update(c.context ? `${model}\0${kind}\0${q}\0${normalizeForCache(c.text)}\0${c.context}` : `${model}\0${kind}\0${q}\0${normalizeForCache(c.text)}`)
     .digest("hex");
 
 // ---- votes & verify (WI-2) ----------------------------------------------------
@@ -283,6 +346,40 @@ export function median(ps: number[]): number {
 export const VERIFY_PREFIX = "Verify strictly — answer only if clearly matching: ";
 /** --verify hysteresis (documented): a hit stands when its re-ask p >= threshold * VERIFY_GATE. */
 export const VERIFY_GATE = 0.6;
+
+// ---- --tag (WI-4) ---------------------------------------------------------------
+/** Cap on hits per --tag request: tagging annotates results that are already paid
+ *  for, so even a raised --batch never packs more than a default main-pass batch
+ *  into one annotation request. */
+export const TAG_BATCH_MAX = 16;
+
+/** --tag (WI-4) categories: split on commas, trimmed, empties dropped. The CLI
+ *  rejects lists with fewer than 2 categories (a one-way choice is not a category);
+ *  the core tolerates any non-empty list so library callers set their own floor. */
+export function parseTagCategories(tag: string): string[] {
+  return tag.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+/**
+ * --tag (WI-4) request: the standing hits as state (batch-local ids `h0..hN`, the
+ * same convention as the main pass's `c0..cN`) plus ONE `choice` question per hit
+ * whose criteria are the user's categories keyed `t0..tN`. The winning criterion's
+ * NAME (the category string) becomes `Hit.tag`, its probability `Hit.tag_p`.
+ */
+export function buildTagRequest(hits: Hit[], tags: string[], kind: Kind = "code", model = "jev-latest") {
+  const criteria: Record<string, string> = {};
+  tags.forEach((t, i) => { criteria[`t${i}`] = t; });
+  const state = { chunks: hits.map((h, j) => ({ id: `h${j}`, file: h.file, lines: `${h.start}-${h.end}`, [kind]: h.text })) };
+  const questions: Record<string, unknown> = {};
+  hits.forEach((_, j) => {
+    questions[`h${j}`] = {
+      type: "choice",
+      instructions: `Which category best fits the code in chunk h${j}? Choose exactly one.`,
+      criteria,
+    };
+  });
+  return { model, state, questions };
+}
 
 // ---- --estimate (WI-7) ---------------------------------------------------------
 /** The documented token model behind `--estimate` (mirrors the README Cost section's
@@ -323,6 +420,8 @@ export interface Options {
   group?: boolean;             // --group: fill result.groups[] (the intra-run signature dedup is always on)
   votes?: number;              // --votes: judge every chunk N times (1-5); the MEDIAN probability wins
   verify?: boolean;            // --verify: strict re-ask of every hit; the hit stands only at p >= threshold * 0.6
+  tag?: string;                // --tag (WI-4): comma-separated categories; one choice question per standing hit, the winner rides on Hit.tag
+  funcs?: boolean;             // --funcs (WI-5): two-phase navigation — shortlist files by signature chunks, then search only those
   envelopes?: boolean;         // --envelopes (WI-9): append each chunk's numbers ("[numbers: 42, 7]") to the judged text
   budget?: number;             // --budget (WI-7): once metered cost exceeds this many dollars, un-run chunks error budget_exhausted
   pricePerMtok?: number;       // $/Mtok for the --budget meter when the provider reports no cost (default DEFAULT_PRICE_PER_MTOK)
@@ -345,6 +444,10 @@ interface BatchOutcome { index: number; entries: { chunkIndex: number; p: number
 /** What one --verify batch worker hands back (same shape idea as BatchOutcome). */
 interface VerifyOutcome { index: number; got: { hit: Hit; p: number }[]; missing: Hit[] }
 
+/** What one --tag batch worker hands back (same shape idea as VerifyOutcome): the
+ *  hits this batch successfully categorized. Unlisted hits of the batch stay untagged. */
+interface TagOutcome { index: number; got: { hit: Hit; tag: string; p: number }[] }
+
 /** Appended to an invalid_api_key hint when at least one batch succeeded earlier in the
  *  SAME run (plan §1.5): a 401/403 then means the key expired/was revoked, not that the
  *  user handed over the wrong provider's key. */
@@ -364,8 +467,9 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
   // Signature clustering (WI-3): chunks sharing a whitespace-normalized signature are
   // near-identical boilerplate — the FIRST cache-missing chunk of a signature (the head)
   // enters the batch todo, siblings inherit the head's verdict once the pool settles.
-  // The plain-text cache stays byte-exact per chunk (keys unchanged); `cached` counts
-  // only genuinely cache-served chunks — an inheriting sibling is deduped, not cached.
+  // The persistent cache is keyed on the whitespace-normalized chunk text (WI-6);
+  // `cached` counts only genuinely cache-served chunks — an inheriting sibling is
+  // deduped, not cached.
   const heads = new Map<string, number>();        // signature key -> head chunk index
   const siblingsOf = new Map<string, number[]>(); // signature key -> chunk indices that inherit the verdict
   let cached = 0;
@@ -615,6 +719,56 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
     // back to its main-pass p — which cleared `threshold`, so it stands.
     hits = hits.filter((h) => (verdictOf.get(h) ?? h.p) >= gate);
   }
+  // --tag (WI-4): one `choice` question per STANDING hit, run AFTER --verify filtering
+  // so a tag only lands on hits that survived the hysteresis gate. The categories become
+  // criteria `t0..tN`; the chosen criterion's name rides on the hit as `tag` with its
+  // probability as `tag_p` (the Hit objects are shared with `all`, so --all/--json see
+  // them too). Batched <=TAG_BATCH_MAX hits per request through the same pool +
+  // postSystemOne machinery as the verify pass (same retries, pacing, deadlines, lazy
+  // key resolution); its tokens/cost meter the same way.
+  // ERROR POLICY (deliberate, differs from the verify pass): the tag pass NEVER throws
+  // and NEVER records errors[] — a failed tag batch (retries exhausted, breaker open,
+  // --budget stopped) simply leaves those hits untagged and the search result stands.
+  // Tags annotate results that already cleared the threshold; surfacing them as chunk
+  // errors would turn an answered search into an exit-2 run, and --fail-fast governs
+  // the search, not this annotation pass.
+  if (o.tag && hits.length > 0) {
+    const tags = parseTagCategories(o.tag);
+    if (tags.length > 0) {
+      const criteria: Record<string, string> = {};
+      tags.forEach((t, i) => { criteria[`t${i}`] = t; });
+      // <=16 hits per request even when --batch was raised (TAG_BATCH_MAX above).
+      const tagBatch = Math.max(1, Math.min(TAG_BATCH_MAX, batch));
+      const tBatches: Hit[][] = [];
+      for (let i = 0; i < hits.length; i += tagBatch) tBatches.push(hits.slice(i, i + tagBatch));
+      const tWorker = async (bh: Hit[], index: number): Promise<TagOutcome> => {
+        if (budgetStop()) return { index, got: [] }; // --budget exhausted: no tags, no error (policy above)
+        const res = await postSystemOne(buildTagRequest(bh, tags, kind, model), backend, apiKeyOf(), {
+          ...post,
+          deadlineMs: Date.now() + timeoutMs, // per-batch deadline, retries included (§1.6.1)
+        });
+        tokens += res.usage?.input_tokens ?? 0;
+        if (res.cost !== undefined) cost = (cost ?? 0) + res.cost;
+        const got: { hit: Hit; tag: string; p: number }[] = [];
+        bh.forEach((hit, j) => {
+          // A choice answer names its criterion by KEY (`t0`) with `probabilities`
+          // keyed the same way; a provider that echoes the category NAME instead maps
+          // just the same. An unusable answer leaves that hit untagged (policy above).
+          const a = res.answers[`h${j}`];
+          const choice = typeof a?.choice === "string" && a.choice ? a.choice : undefined;
+          const name = choice === undefined ? undefined : criteria[choice] ?? choice;
+          const p = a?.probabilities?.[choice ?? ""] ?? a?.probabilities?.[name ?? ""];
+          if (name !== undefined && tags.includes(name) && typeof p === "number" && Number.isFinite(p))
+            got.push({ hit, tag: name, p });
+        });
+        return { index, got };
+      };
+      // failFast is deliberately NOT honored here (error policy above): every failure
+      // lands in tPool.errors and is dropped — hits stay untagged, nothing is recorded.
+      const tPool = await runPool(tBatches, { concurrency: o.concurrency }, tWorker);
+      for (const r of tPool.results) for (const g of r.got) { g.hit.tag = g.tag; g.hit.tag_p = g.p; }
+    }
+  }
   // --group (WI-3): one Group per signature present in the hits, sorted p desc (stable
   // for ties: first-site order). Sites keep hit (file) order; representative is the
   // first hit's chunk body. Sites judged this run share the head's p; cache-served
@@ -635,6 +789,42 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
     groups = [...bySig.values()].sort((a, b) => b.p - a.p);
   }
   return { hits, all: ordered, chunks: chunks.length, tokens, cached, errors, ...(cost !== undefined ? { cost } : {}), ...(groups !== undefined ? { groups } : {}) };
+}
+
+// ---- --funcs (WI-5): two-phase function navigation ----------------------------
+/**
+ * Two-phase navigation over `paths`. Pass 1 judges ONE SIGNATURE chunk per
+ * supported source file (funcs.signatureChunk: regex-extracted function/method/
+ * class lines, tree-sitter deferred) exactly like any chunk — a handful of chunks
+ * for a whole tree. The files whose signature chunk reaches `threshold` become the
+ * shortlist; pass 2 is the NORMAL chunk search run only on those files, so the
+ * search cost is proportional to the shortlist instead of the whole tree.
+ *
+ * Files in unsupported languages (funcs.detectLanguage → null) and supported files
+ * with no extractable signatures are SKIPPED entirely — pass 1 cannot shortlist
+ * what it never saw (documented). The returned Result is pass 2's (real-code
+ * file:line hits); when nothing is shortlisted, pass 1's Result comes back with
+ * 0 hits. Pass-1 chunk errors stay pass-1-internal (they only shrink the
+ * shortlist); a fatal throw (fail-fast, dead key) propagates as usual. Both passes
+ * share one cache object — a signature chunk and a code chunk never collide (the
+ * judged text differs), so a re-run replays either pass for free.
+ */
+export async function jgrepFuncs(question: string, paths: string[], o: Options): Promise<Result> {
+  const sigChunks: Chunk[] = [];
+  for (const file of listFiles(paths)) {
+    const lang = detectLanguage(file);
+    if (!lang) continue; // unsupported language: excluded from --funcs search (documented)
+    const text = readText(file);
+    if (text === null) continue; // binary or >1MB: the same skip chunkPaths applies
+    const sc = signatureChunk(file, text, lang);
+    if (sc) sigChunks.push(sc);
+  }
+  // Pass 1 never tags (--tag stripped): its hits are only a shortlist — never printed
+  // — so tagging them would be a wasted request. Pass 2 tags the real hits.
+  const pass1 = await jgrep(question, sigChunks, { ...o, tag: undefined });
+  const shortlist = [...new Set(pass1.hits.map((h) => h.file))];
+  if (shortlist.length === 0) return pass1;
+  return jgrep(question, chunkPaths(shortlist), o);
 }
 
 // ---- config -----------------------------------------------------------------

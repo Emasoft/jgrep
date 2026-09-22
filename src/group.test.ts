@@ -42,7 +42,13 @@ test("clustering: two signature-identical chunks send exactly ONE question for t
   expect(r.cached).toBe(0); // intra-run dedup is not the cache
   expect(r.hits.map((h) => h.file).sort()).toEqual(["a.ts", "b.ts"]); // both sites present
   expect(new Set(r.hits.map((h) => h.p))).toEqual(new Set([0.9])); // the sibling inherits the head's p
-  expect(Object.keys(cache)).toHaveLength(2); // the sibling still wrote its OWN plain-text cache entry
+  // WI-6: cache keys are whitespace-normalized, so a signature-identical sibling's
+  // write lands on the SAME entry as the head's — one key, both variants served.
+  expect(Object.keys(cache)).toHaveLength(1);
+  const r2 = await jgrep("returns 1", cs, { ...opts(), fetchImpl, cache });
+  expect(calls).toHaveLength(1); // the re-run replays the shared entry — 0 new requests
+  expect(r2.cached).toBe(2);
+  expect(Object.keys(cache)).toHaveLength(1); // no new keys either
 });
 
 test("clustering: two different chunks are two questions (no false clustering)", async () => {
