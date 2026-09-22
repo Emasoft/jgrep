@@ -38,6 +38,33 @@ probabilities into `file:line` hits.
 
 ## Install
 
+### Install this fork (never published on npm)
+
+This fork is **never published** — the `jevgrep` npm package belongs to the
+upstream project. Install it with either one-liner:
+
+```sh
+# remote — straight from GitHub, no clone needed:
+curl -fsSL https://raw.githubusercontent.com/Emasoft/jgrep/main/install-dev.sh | bash -s -- --choice 8
+
+# local — from a clone of this repo:
+./install-dev.sh --choice 1
+```
+
+`--choice 8` clones the fork into `~/.local/share/jgrep` (override with
+`JGREP_DEV_DIR`) — a script-managed directory, never a dev checkout: every
+re-run fetches `origin/main` and `git reset --hard origin/main` there, then
+runs the full setup: deps (`bun install`), build, the `jgrep` bin symlinked
+system-wide (npm global bin → `/usr/local/bin` → `~/.local/bin`), and the
+agent-skill refresh. Previous installs are autodetected and replaced exactly
+like option 1: symlinks are repointed (including one pointing at an old clone
+path), real files are archived as `jgrep.bak-<timestamp>` with the printed
+`mv` command to revert. Updating = re-running the same command. Missing bun is
+offered (interactive y/N) or auto-installed (`--choice`/`--yes`) via
+[bun.sh](https://bun.sh); node ≥ 18 is still required at runtime. The
+interactive menu cannot run through a pipe — use the `--choice 8` one-liner;
+`--choice 8 --dry-run` previews everything and mutates nothing.
+
 ```bash
 npm i -g jevgrep     # installs the `jgrep` command
 jgrep init           # pick a provider, paste your key, pick where to keep it, done
@@ -399,6 +426,7 @@ Interactive menu (stable numbering — never renumbered):
 [5] npm stable            npm install -g jevgrep (upstream's published release)
 [6] check only            autodetect report, no mutation
 [7] uninstall jgrep       remove every detected install (npm/symlink/copy/brew-aware)
+[8] fork install (remote/curl)   clone or update the fork at ~/.local/share/jgrep, then full setup (deps, build, bin, agent skill) — needs git + curl (bun is installed on demand)
 [q] quit
 ```
 
@@ -417,6 +445,7 @@ instead of the default chain (`$(npm prefix -g)/bin` → `/usr/local/bin` →
 ```sh
 ./install-dev.sh --choice 1            # build current branch + symlink, zero prompts
 ./install-dev.sh --choice 7 --dry-run  # preview the uninstall
+./install-dev.sh --choice 8 --dry-run  # preview the remote/curl install ([8])
 ./install-dev.sh check                 # full report, no mutation
 ```
 

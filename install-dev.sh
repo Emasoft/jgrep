@@ -12,11 +12,27 @@
 #   [5] npm stable            npm install -g jevgrep (upstream's published release)
 #   [6] check only            autodetect report, no mutation
 #   [7] uninstall jgrep       remove every detected install (npm/symlink/copy/brew-aware)
+#   [8] fork install (remote/curl)  clone or update the fork at ~/.local/share/jgrep, then
+#                             full setup (deps, build, bin, agent skill)
 #
 # Modes: interactive by default. `--choice N` (or a bare N) runs one option fully
 # non-interactively — zero prompts, everything auto-confirmed, deterministic
 # exit codes — for headless dev boxes. `./install-dev.sh uninstall` is an alias
 # for `--choice 7`. `check` prints the full autodetect report and mutates nothing.
+#
+# Remote/curl mode: `curl -fsSL https://raw.githubusercontent.com/Emasoft/jgrep/main/install-dev.sh | bash -s -- --choice 8`
+# works without any local clone. Option 8 manages its own clone at
+# ~/.local/share/jgrep (override the location with JGREP_DEV_DIR). That
+# directory is SCRIPT-MANAGED: it is never a dev checkout — every re-run does
+# `git fetch origin main` + `git reset --hard origin/main` there, then the full
+# local setup (deps, build, system-wide bin, agent skill). A pre-existing jgrep
+# install — including a symlink pointing at an old clone path — is autodetected
+# and replaced exactly like option 1 does (real files archived as .bak). If bun
+# is missing, [8] offers (interactive) or auto-installs (--choice/--yes) it via
+# https://bun.sh/install; node >= 18 is still required to RUN the bin (missing
+# node only warns). The interactive menu cannot run through a pipe — piped
+# stdin or a script with no repo next to it refuses with the two documented
+# one-liners (exit 2); [8] and help are the only piped-capable modes.
 #
 # Detection: before the menu a `current:` line reports the detected install
 # (type + path + version) and the matching option is marked [CURRENT]. The scan
@@ -32,7 +48,7 @@
 # kyu1204/jgrep), and options 1/2 verify this checkout's package.json name.
 # Mismatches refuse loudly (exit 1, no override).
 #
-# Agent skill: options 1/2/3 also refresh the agent skill from
+# Agent skill: options 1/2/3/8 also refresh the agent skill from
 # skills/jgrep/SKILL.md (it embeds a verbatim copy of `jgrep --help`, so a
 # stale skill means wrong flags for AI agents). Step A runs the vercel `skills`
 # universal installer (`npx -y skills add ./skills -g -y` — every detected
@@ -65,6 +81,7 @@ NPM_PACKAGE="jevgrep"            # the ONLY npm package this script installs/uni
 EXPECTED_NPM_REPO="github.com/kyu1204/jgrep"
 UPSTREAM_SLUG="kyu1204/jgrep"
 FORK_SLUG="Emasoft/jgrep"
+FORK_URL="https://github.com/Emasoft/jgrep.git"   # clone URL for menu [8] (remote/curl)
 
 # ---------------------------------------------------------------------------
 # state
@@ -76,6 +93,7 @@ OPT_YES=0
 OPT_DRY_RUN=0
 OPT_TARGET=""
 MODE_CHECK=0
+DETACHED_MODE=0    # 1 = piped (`curl | bash`) or copied script: no repo next to $0
 
 PLATFORM=""
 NODE_BIN="" NODE_VER=""
@@ -114,6 +132,9 @@ REMOVED_LIST=""
 DEST_DIR=""
 BUILD_SHA=""
 BUILD_OUTPUT=""
+
+# option 8 (remote/curl) bookkeeping
+REMOTE_CLONE_DIR=""   # script-managed fork clone (JGREP_DEV_DIR overrides the default)
 
 TMP_ROOT=""
 WORKTREE_DIR=""
@@ -1009,6 +1030,7 @@ menu_line() {
 	5) printf '  [5] npm stable            — npm install -g %s (upstream'"'"'s published release)' "$NPM_PACKAGE" ;;
 	6) printf '  [6] check only            — autodetect report, no mutation' ;;
 	7) printf '  [7] uninstall jgrep       — remove every detected install (npm/symlink/copy/brew-aware, identity-verified)' ;;
+	8) printf '  [8] fork install (remote/curl) — clone or update the fork at ~/.local/share/jgrep, then full setup (deps, build, bin, agent skill)' ;;
 	esac
 }
 
@@ -1048,6 +1070,22 @@ menu_marker() {
 		fi
 		;;
 	6 | 7) printf '[AVAILABLE]' ;;
+	8)
+		# [8] needs git + curl (it clones/updates the fork itself); bun is
+		# handled inside the option (offered/auto-installed when missing)
+		if ! have git; then
+			printf '[unavailable: git missing]'
+			return 0
+		fi
+		if ! have curl; then
+			printf '[unavailable: curl missing]'
+			return 0
+		fi
+		printf '[AVAILABLE]'
+		if [ -z "$NODE_BIN" ]; then
+			printf ' (warning: node missing — the installed bin will not run)'
+		fi
+		;;
 	esac
 	return 0
 }
@@ -1055,7 +1093,7 @@ menu_marker() {
 print_menu_with_markers() {
 	print_current_line
 	local i line marker pad
-	for i in 1 2 3 4 5 6 7; do
+	for i in 1 2 3 4 5 6 7 8; do
 		line="$(menu_line "$i")"
 		marker="$(menu_marker "$i")"
 		pad=$((101 - ${#line}))
@@ -1077,6 +1115,8 @@ Usage:
   ./install-dev.sh check                 autodetect report, no mutation
   ./install-dev.sh help | --help | -h    usage + menu
   ./install-dev.sh [n|--choice N] [--yes] [--dry-run] [--target DIR]
+  curl -fsSL https://raw.githubusercontent.com/Emasoft/jgrep/main/install-dev.sh | bash -s -- --choice 8
+                                         remote/curl install from GitHub — no clone needed (menu [8])
 
 jgrep dev installer — multi-source, for development checkouts ONLY.
 End users: `npm i -g jevgrep`. Never shipped in the npm package.
@@ -1100,6 +1140,7 @@ Menu (stable numbering — an interface contract, never renumbered):
   [5] npm stable            — npm install -g jevgrep (upstream's published release)
   [6] check only            — autodetect report, no mutation
   [7] uninstall jgrep       — remove every detected install (npm/symlink/copy/brew-aware, identity-verified)
+  [8] fork install (remote/curl) — clone or update the fork at ~/.local/share/jgrep, then full setup (deps, build, bin, agent skill)
 
 Before the menu a `current:` line reports the detected install (type, path,
 version) and the matching option is marked [CURRENT]. The scan covers every
@@ -1109,11 +1150,26 @@ explicit warning. Uninstall is idempotent: "jgrep is not installed — nothing
 to do" when nothing is installed, and it refuses to remove files that are not
 jgrep.
 
+Remote/curl install ([8]): clones this fork into ~/.local/share/jgrep
+(override with JGREP_DEV_DIR) — a SCRIPT-MANAGED directory, never a dev
+checkout: every re-run fetches origin/main and `git reset --hard origin/main`
+there, then runs the full local setup (bun install, build, system-wide `jgrep`
+bin on PATH, agent-skill refresh). A pre-existing install — including a
+symlink to an old clone path — is autodetected and replaced exactly like
+option 1: symlinks are repointed, real files archived as .bak with the printed
+`mv` revert command. Updating = re-running the same command. Works through a
+pipe (`curl … | bash -s -- --choice 8`); the interactive menu does NOT work
+through a pipe (no TTY on stdin → refusal with the two one-liners, exit 2).
+If bun is missing, [8] offers it (interactive y/N) or auto-installs it
+(--choice/--yes) via https://bun.sh/install; node >= 18 is still required at
+runtime (a missing node only warns).
+
 Identity pinning: every npm install/uninstall verifies that the `jevgrep`
 package still points at github.com/kyu1204/jgrep (the npm package `jgrep` is
 UNRELATED — name collision), options 3/4 verify the origin/upstream git
-remotes (Emasoft/jgrep / kyu1204/jgrep), and options 1/2 verify this
-checkout's package.json name. Mismatches refuse loudly; there is no override.
+remotes (Emasoft/jgrep / kyu1204/jgrep), option 8 verifies the clone's origin
+URL, and options 1/2 verify this checkout's package.json name. Mismatches
+refuse loudly; there is no override.
 
 Exit codes: 0 success · 2 usage error · 3 user-declined/aborted · 1 everything else.
 USAGE
@@ -1660,6 +1716,229 @@ refresh_agent_skill_best_effort() {
 }
 
 # ---------------------------------------------------------------------------
+# [8] fork install (remote/curl) — script-managed clone + full local setup
+# ---------------------------------------------------------------------------
+remote_one_liners() {
+	# the two documented install one-liners (used by every refusal message)
+	warn "  remote: curl -fsSL https://raw.githubusercontent.com/Emasoft/jgrep/main/install-dev.sh | bash -s -- --choice 8"
+	warn "  local : ./install-dev.sh --choice 1   (run inside a clone of Emasoft/jgrep)"
+	return 0
+}
+
+refuse_menu_unavailable() {
+	# the interactive menu case (no --choice/check/help/uninstall) cannot run:
+	# $1 = reason (piped/no repo, or non-TTY stdin). Exit 2.
+	warn "$PROG: refusing: the interactive menu cannot run — $1."
+	warn "Use one of the documented one-liners:"
+	remote_one_liners
+	exit 2
+}
+
+refuse_detached_needs_repo() {
+	# piped/copied script + an option that needs a real checkout. Exit 2.
+	warn "$PROG: refusing: $1 needs a real jgrep checkout, but no repo was found next to the script"
+	warn "  (piped 'curl | bash' or a copied install-dev.sh — \$0 is not inside a checkout)."
+	warn "Use one of the documented one-liners:"
+	remote_one_liners
+	exit 2
+}
+
+remote_clone_identity_or_die() {
+	# $1 = clone dir; its origin must point at the fork ($FORK_SLUG) — the same
+	# identity-pinning rule as the option-3 origin remote. A directory that is
+	# NOT the fork is never fetched, reset, or built.
+	local d="$1" url
+	url="$(git -C "$d" remote get-url origin 2>/dev/null || true)"
+	if [ -z "$url" ]; then
+		warn "$PROG: refusing: $d has no 'origin' git remote (not a usable clone)."
+		warn "  hint: point JGREP_DEV_DIR at another directory, or remove $d and re-run."
+		exit 1
+	fi
+	case "$url" in
+	*"$FORK_SLUG"*) return 0 ;;
+	*)
+		warn "$PROG: refusing: $d is not a clone of the fork Emasoft/jgrep."
+		warn "  observed origin: $url"
+		warn "  expected: a URL containing $FORK_SLUG"
+		warn "  hint: point JGREP_DEV_DIR at another directory, or remove $d and re-run."
+		exit 1
+		;;
+	esac
+}
+
+dir_is_empty() {
+	# 0 = $1 has no entries · 1 = has entries (glob-based, no ls dependency)
+	local f
+	for f in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+		if [ -e "$f" ] || [ -L "$f" ]; then
+			return 1
+		fi
+	done
+	return 0
+}
+
+refuse_non_clone_dir() {
+	# $1 = existing dir with no .git that is not empty — never overwritten
+	warn "$PROG: refusing: $1 exists and is not a clone of the fork (no .git, not empty)."
+	warn "  hint: point JGREP_DEV_DIR at another directory, or remove $1 and re-run."
+	exit 1
+}
+
+clone_fork_or_die() {
+	# $1 = destination; shallow-clones the fork and verifies its origin URL
+	if ! git clone --depth 1 "$FORK_URL" "$1"; then
+		warn "$PROG: git clone of $FORK_URL failed (offline? destination unwritable?)."
+		exit 1
+	fi
+	remote_clone_identity_or_die "$1"
+	return 0
+}
+
+ensure_bun_for_remote_install() {
+	# option 8 ONLY: a fresh box may lack bun — confirm (interactive) or
+	# auto-install (--choice/--yes) it via the official installer, then extend
+	# PATH for this run. Options 1-4 keep today's hard unavailability markers;
+	# this never runs for them.
+	[ -n "$BUN_BIN" ] && return 0
+	if ! have curl; then
+		warn "$PROG: 'bun' is required to build and 'curl' is missing — install bun manually: https://bun.sh"
+		exit 1
+	fi
+	local reply=""
+	if [ "$OPT_YES" -eq 1 ]; then
+		log "==> non-interactive: bun is missing — installing it via https://bun.sh/install"
+	else
+		echo
+		printf '%s' "bun is required to build — install it now via https://bun.sh/install? [y/N] "
+		read -r reply || reply=""
+		case "$reply" in
+		y | Y | yes | YES) ;;
+		*)
+			warn "$PROG: declined — bun is required to build; aborting option 8."
+			exit 3
+			;;
+		esac
+	fi
+	log "==> curl -fsSL https://bun.sh/install | bash"
+	if ! curl -fsSL https://bun.sh/install | bash; then
+		warn "$PROG: the bun installer failed — install bun manually: https://bun.sh"
+		exit 1
+	fi
+	export PATH="$HOME/.bun/bin:$PATH"
+	if have bun; then
+		BUN_BIN="$(command -v bun)"
+		BUN_VER="$(bun --version 2>/dev/null || true)"
+		log "==> bun ${BUN_VER:-unknown} installed ($BUN_BIN)"
+		warn "note: this run extended PATH manually — new shells get bun from ~/.bun/bin (the installer updates your shell rc)."
+	else
+		warn "$PROG: bun is still missing after the installer ran — install it manually: https://bun.sh"
+		exit 1
+	fi
+	return 0
+}
+
+opt_remote_install() {
+	log "==> [8] fork install (remote/curl): clone or update the fork, then full setup (deps, build, bin, agent skill)"
+	if ! have git; then
+		warn "$PROG: 'git' is required for option 8 but was not found."
+		exit 1
+	fi
+
+	# 1. the script-managed clone location (JGREP_DEV_DIR overrides it)
+	REMOTE_CLONE_DIR="${JGREP_DEV_DIR:-$HOME/.local/share/jgrep}"
+	log "==> script-managed clone: $REMOTE_CLONE_DIR (override with JGREP_DEV_DIR; re-runs reset it to origin/main)"
+
+	if [ "$OPT_DRY_RUN" -eq 1 ]; then
+		# plan only — no clone, no fetch, no build, no target mutation
+		if [ -e "$REMOTE_CLONE_DIR/.git" ]; then
+			# same identity gate as the real run (refuses in dry-run too,
+			# exactly like the options-3/4 remote identity check)
+			remote_clone_identity_or_die "$REMOTE_CLONE_DIR"
+			log "DRY-RUN: updating script-managed clone at $REMOTE_CLONE_DIR"
+			log "DRY-RUN: git -C $REMOTE_CLONE_DIR fetch origin main   (skipped — dry-run does not mutate .git)"
+			log "DRY-RUN: git -C $REMOTE_CLONE_DIR reset --hard origin/main"
+		elif [ -e "$REMOTE_CLONE_DIR" ]; then
+			if ! dir_is_empty "$REMOTE_CLONE_DIR"; then
+				refuse_non_clone_dir "$REMOTE_CLONE_DIR"
+			fi
+			log "DRY-RUN: git clone --depth 1 $FORK_URL $REMOTE_CLONE_DIR   (into the existing empty directory)"
+		else
+			log "DRY-RUN: mkdir -p $(dirname "$REMOTE_CLONE_DIR")"
+			log "DRY-RUN: git clone --depth 1 $FORK_URL $REMOTE_CLONE_DIR"
+		fi
+		log "DRY-RUN: cd $REMOTE_CLONE_DIR"
+		if [ -z "$BUN_BIN" ]; then
+			log "DRY-RUN: bun missing — a real run would install it via https://bun.sh/install (auto-confirmed with --choice/--yes)"
+		fi
+		log "DRY-RUN: bun install   (deps of the script-managed clone)"
+		log "DRY-RUN: bun run build → $REMOTE_CLONE_DIR/dist/jgrep.js && chmod +x"
+		# reuse install_artifact (option-1 path) so the npm-owned conflict and
+		# the symlink/archive preview render exactly like a real run would
+		install_artifact link "" "" "$DEST_DIR" "$REMOTE_CLONE_DIR/dist/jgrep.js"
+		log "DRY-RUN: would refresh the agent skill from $REMOTE_CLONE_DIR/skills/jgrep via 'npx -y skills add ./skills -g -y' (vercel skills installer -> every detected harness)"
+		log "DRY-RUN: fallback if the installer fails or is offline: copy $REMOTE_CLONE_DIR/skills/jgrep/SKILL.md to $HOME/.agents/skills/jgrep/SKILL.md (only when missing or different)"
+		if [ -z "$NODE_BIN" ]; then
+			warn "DRY-RUN: node missing — a real run would warn that the installed bin needs node >= 18 at runtime"
+		fi
+		log "==> dry-run complete (option 8) — nothing was mutated"
+		return 0
+	fi
+
+	# 2. clone or update the script-managed clone
+	if [ -e "$REMOTE_CLONE_DIR/.git" ]; then
+		remote_clone_identity_or_die "$REMOTE_CLONE_DIR"
+		log "==> updating script-managed clone at $REMOTE_CLONE_DIR"
+		if ! git -C "$REMOTE_CLONE_DIR" fetch origin main; then
+			warn "$PROG: 'git fetch origin main' failed in $REMOTE_CLONE_DIR (offline?)."
+			exit 1
+		fi
+		if ! git -C "$REMOTE_CLONE_DIR" reset --hard origin/main; then
+			warn "$PROG: 'git reset --hard origin/main' failed in $REMOTE_CLONE_DIR."
+			exit 1
+		fi
+	elif [ -e "$REMOTE_CLONE_DIR" ]; then
+		if ! dir_is_empty "$REMOTE_CLONE_DIR"; then
+			refuse_non_clone_dir "$REMOTE_CLONE_DIR"
+		fi
+		log "==> cloning the fork into the empty directory $REMOTE_CLONE_DIR"
+		clone_fork_or_die "$REMOTE_CLONE_DIR"
+	else
+		mkdir -p "$(dirname "$REMOTE_CLONE_DIR")" || {
+			warn "$PROG: cannot create the parent directory of $REMOTE_CLONE_DIR."
+			exit 1
+		}
+		log "==> cloning the fork into $REMOTE_CLONE_DIR"
+		clone_fork_or_die "$REMOTE_CLONE_DIR"
+	fi
+
+	# 3. full local setup inside the clone — the same machinery as option 1
+	#    (identity check, deps, build, symlink install, verification, skill)
+	log "==> cd $REMOTE_CLONE_DIR"
+	cd "$REMOTE_CLONE_DIR" || {
+		warn "$PROG: cannot cd into $REMOTE_CLONE_DIR."
+		exit 1
+	}
+	REPO="$REMOTE_CLONE_DIR"
+	REPO_BRANCH="$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+	REPO_HEAD="$(ref_sha HEAD)"
+	verify_local_checkout_identity
+	ensure_bun_for_remote_install
+	build_local_real
+	install_artifact link "$REPO/dist/jgrep.js" "$REPO/dist/jgrep.js" "$DEST_DIR" "$REPO/dist/jgrep.js"
+	verify_install "$DEST_DIR"
+	refresh_agent_skill_best_effort
+
+	# 4. node is still needed to RUN the bin (bun only builds) — warn, never fail
+	if [ -z "$NODE_BIN" ]; then
+		warn "$PROG: warning: node is not installed — the installed bin needs node >= 18 at runtime."
+		warn "  hint: install node (https://nodejs.org or via your package manager), then run: jgrep --version"
+	fi
+
+	log "==> done — to update later: re-run the curl one-liner (or: git -C $REMOTE_CLONE_DIR pull && ./install-dev.sh --choice 8)"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
 # options
 # ---------------------------------------------------------------------------
 opt_local_symlink() {
@@ -2119,6 +2398,7 @@ run_choice() {
 	5) opt_npm_stable ;;
 	6) opt_check_only ;;
 	7) opt_uninstall ;;
+	8) opt_remote_install ;;
 	*)
 		warn "$PROG: internal error: unknown choice '$1'."
 		exit 2
@@ -2142,7 +2422,7 @@ parse_args() {
 			;;
 		--choice)
 			if [ "$#" -lt 2 ]; then
-				usage_error "--choice requires a menu number (1-7)"
+				usage_error "--choice requires a menu number (1-8)"
 			fi
 			OPT_CHOICE="$2"
 			OPT_YES=1
@@ -2168,7 +2448,7 @@ parse_args() {
 			OPT_CHOICE="7"
 			OPT_YES=1
 			;;
-		[1-7])
+		[1-8])
 			OPT_CHOICE="$1"
 			OPT_YES=1
 			;;
@@ -2181,8 +2461,8 @@ parse_args() {
 
 	if [ -n "$OPT_CHOICE" ]; then
 		case "$OPT_CHOICE" in
-		1 | 2 | 3 | 4 | 5 | 6 | 7) ;;
-		*) usage_error "invalid choice: '$OPT_CHOICE' (expected an integer 1-7)" ;;
+		1 | 2 | 3 | 4 | 5 | 6 | 7 | 8) ;;
+		*) usage_error "invalid choice: '$OPT_CHOICE' (expected an integer 1-8)" ;;
 		esac
 	fi
 	return 0
@@ -2192,18 +2472,42 @@ run_interactive() {
 	log ""
 	print_menu_with_markers
 	local reply=""
-	printf '%s' "Select an option [1-7, q]: "
+	printf '%s' "Select an option [1-8, q]: "
 	read -r reply || reply=""
 	case "$reply" in
 	'' | q | Q)
 		exit 0
 		;;
-	1 | 2 | 3 | 4 | 5 | 6 | 7)
+	1 | 2 | 3 | 4 | 5 | 6 | 7 | 8)
 		log ""
 		run_choice "$reply"
 		;;
 	*)
-		usage_error "unknown option: '$reply' (expected 1-7 or q)"
+		usage_error "unknown option: '$reply' (expected 1-8 or q)"
+		;;
+	esac
+	return 0
+}
+
+run_detached_mode() {
+	# Piped execution (`curl … | bash -s --`) or a copied install-dev.sh: no
+	# repo next to $0. Only menu [8] works here — it manages its own clone and
+	# needs no repo cwd. Every other option needs a real checkout.
+	if [ "$MODE_CHECK" -eq 1 ]; then
+		refuse_detached_needs_repo "'check'"
+	fi
+	case "$OPT_CHOICE" in
+	8)
+		detect_environment
+		resolve_dest_dir
+		scan_installs
+		select_current_install
+		print_current_line
+		log ""
+		run_choice "8"
+		;;
+	*)
+		refuse_detached_needs_repo "choice $OPT_CHOICE (menu [1]-[7])"
 		;;
 	esac
 	return 0
@@ -2214,6 +2518,24 @@ main() {
 
 	# fatal (exit 2) before anything else runs when --target is dangerous
 	validate_target
+
+	# The interactive menu case (no --choice / check / help — help already
+	# exited) cannot run without a repo next to the script (piped or copied)
+	# and cannot read a choice from a non-TTY stdin. Refuse with the two
+	# documented one-liners (exit 2); only [8] and help work through a pipe.
+	if [ -z "$OPT_CHOICE" ] && [ "$MODE_CHECK" -eq 0 ]; then
+		if [ "$DETACHED_MODE" -eq 1 ]; then
+			refuse_menu_unavailable "no jgrep repo found next to the script (piped 'curl | bash' or a copied install-dev.sh)"
+		fi
+		if [ ! -t 0 ]; then
+			refuse_menu_unavailable "stdin is not a TTY (piped stdin can't power the interactive read)"
+		fi
+	fi
+
+	if [ "$DETACHED_MODE" -eq 1 ]; then
+		run_detached_mode
+		return 0
+	fi
 
 	detect_environment
 	collect_repo_state
@@ -2246,23 +2568,29 @@ main() {
 	return 0
 }
 
-# cd to the script's own directory (works from any cwd), then verify the repo.
-# INVOCATION_CWD keeps the caller's cwd so relative --target paths absolutize
-# against where the user ran the script, not against the repo.
+# Repo anchoring. Piped execution (`curl … | bash -s --`) or a copied
+# install-dev.sh has no checkout next to $0 — that is fine for menu [8] (it
+# manages its own clone) and for help, but every other option needs a real
+# repo. DETACHED_MODE=1 selects the restricted argument handling in main().
 INVOCATION_CWD="$(pwd -P)" || {
 	echo "install-dev.sh: cannot determine the current directory." >&2
 	exit 1
 }
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)" || {
-	echo "install-dev.sh: cannot locate the script directory." >&2
-	exit 1
-}
-REPO="$SCRIPT_DIR"
-cd "$REPO" || exit 1
-
-if [ ! -f "$REPO/package.json" ] || [ ! -f "$REPO/src/cli.ts" ]; then
-	echo "install-dev.sh: fatal: this is not the jgrep repo (expected package.json and src/cli.ts in $REPO)" >&2
-	exit 1
+DETACHED_MODE=1
+REPO=""
+case "$0" in
+*/*) script_probe="$0" ;;
+*) script_probe="$INVOCATION_CWD/$0" ;;
+esac
+if [ -f "$script_probe" ]; then
+	SCRIPT_DIR="$(cd "$(dirname "$script_probe")" 2>/dev/null && pwd -P)" || SCRIPT_DIR=""
+	if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/package.json" ] && [ -f "$SCRIPT_DIR/src/cli.ts" ]; then
+		REPO="$SCRIPT_DIR"
+		DETACHED_MODE=0
+	fi
+fi
+if [ "$DETACHED_MODE" -eq 0 ]; then
+	cd "$REPO" || exit 1
 fi
 
 main "$@"

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- install-dev.sh: remote/curl install path — `curl -fsSL https://raw.githubusercontent.com/Emasoft/jgrep/main/install-dev.sh | bash -s -- --choice 8` (new menu `[8]`, appended, never renumbered) clones or updates a script-managed fork clone at `~/.local/share/jgrep` (`JGREP_DEV_DIR` overrides the location), then runs the full local setup (deps, build, system-wide bin symlink, agent-skill refresh), autodetects and replaces previous installs with `.bak` archival exactly like option 1, and auto-installs bun when missing (node stays a runtime requirement); the interactive menu refuses through a pipe (exit 2 with the two documented one-liners), and the fork can never publish npm (`publish.yml` now runs only in the upstream `kyu1204/jgrep` repo).
 - markdown-aware chunking: .md/.mdx files split at headings with section-trail context; fenced code blocks never split — sub-section extraction via -C/--json start-end
 
 ### Fixed

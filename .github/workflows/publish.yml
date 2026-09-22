@@ -11,6 +11,11 @@ on:
 
 jobs:
   publish-npm:
+    # FORK GUARD — this fork (Emasoft/jgrep) is NEVER published to npm: the
+    # `jevgrep` package belongs to the upstream project. The job therefore
+    # only runs in the upstream repo; on the fork it is skipped even if a v*
+    # tag is pushed or the workflow is dispatched manually.
+    if: github.repository == 'kyu1204/jgrep'
     runs-on: ubuntu-latest
     permissions:
       contents: read
