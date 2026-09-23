@@ -57,12 +57,28 @@ test("cli parse: --api accepts any string; main()'s resolveProvider rejects unkn
   for (const choice of ["typesafe", "openrouter", "gateway"]) expect(err.message).toContain(choice);
 });
 
-test("cli parse: numeric validation covers the new numerics (timeout/request-timeout/retries/rate)", () => {
-  for (const flag of ["--timeout", "--request-timeout", "--retries", "--rate"]) {
-    expect(() => parse([flag, "abc", "q"])).toThrow(/numeric option expected/);
-    expect(() => parse([flag, "-1", "q"])).toThrow(/numeric option expected/);
-  }
-  expect(() => parse(["--timeout", "0", "--rate", "0", "--retries", "0", "q"])).not.toThrow(); // 0 is legal (batch is not)
+test("cli parse: per-option numeric ranges (deadline > 0; counts are whole)", () => {
+  // threshold and rate keep the plain finite/non-negative rule (rate 0 = unlimited)
+  expect(() => parse(["--threshold", "abc", "q"])).toThrow(/numeric option expected/);
+  expect(() => parse(["--threshold", "-1", "q"])).toThrow(/numeric option expected/);
+  expect(() => parse(["--rate", "abc", "q"])).toThrow(/numeric option expected/);
+  expect(() => parse(["--rate", "-1", "q"])).toThrow(/numeric option expected/);
+  expect(() => parse(["--rate", "0", "q"])).not.toThrow(); // 0 = unlimited stays legal
+  // a zero deadline is meaningless: both timeouts must be positive
+  expect(() => parse(["--timeout", "0", "q"])).toThrow(/timeout must be a positive number/);
+  expect(() => parse(["--timeout", "-1", "q"])).toThrow(/timeout must be a positive number/);
+  expect(() => parse(["--timeout", "abc", "q"])).toThrow(/timeout must be a positive number/);
+  expect(() => parse(["--timeout", "15", "q"])).not.toThrow();
+  expect(() => parse(["--request-timeout", "0", "q"])).toThrow(/request-timeout must be a positive number/);
+  expect(() => parse(["--request-timeout", "30", "q"])).not.toThrow();
+  // concurrency counts parallel requests: a positive integer
+  expect(() => parse(["-c", "0", "q"])).toThrow(/concurrency must be a positive integer/);
+  expect(() => parse(["-c", "1.5", "q"])).toThrow(/concurrency must be a positive integer/);
+  expect(() => parse(["-c", "1", "q"])).not.toThrow();
+  // retries count tolerated failures: a non-negative integer (0 = no retries)
+  expect(() => parse(["--retries", "-1", "q"])).toThrow(/retries must be a non-negative integer/);
+  expect(() => parse(["--retries", "1.5", "q"])).toThrow(/retries must be a non-negative integer/);
+  expect(() => parse(["--retries", "0", "q"])).not.toThrow();
 });
 
 test("cli parse: --batch must be a positive integer — 0 would spin the batching loop, a fraction overlaps batches", () => {
@@ -70,8 +86,8 @@ test("cli parse: --batch must be a positive integer — 0 would spin the batchin
   expect(() => parse(["--batch", "0", "q"])).toThrow(/batch must be a positive integer/);
   expect(() => parse(["-b", "1.5", "q"])).toThrow(/batch must be a positive integer/);
   expect(() => parse(["-b", "2.5", "q"])).toThrow(/batch must be a positive integer/);
-  expect(() => parse(["-b", "abc", "q"])).toThrow(/numeric option expected/); // still the generic numeric check
-  expect(() => parse(["-b", "-1", "q"])).toThrow(/numeric option expected/); // caught by the >= 0 check first
+  expect(() => parse(["-b", "abc", "q"])).toThrow(/batch must be a positive integer/); // NaN reaches the batch check
+  expect(() => parse(["-b", "-1", "q"])).toThrow(/batch must be a positive integer/); // integer but < 1
   expect(() => parse(["-b", "1", "q"])).not.toThrow();
   expect(() => parse(["-b", "16", "q"])).not.toThrow();
 });

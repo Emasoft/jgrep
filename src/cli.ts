@@ -128,10 +128,17 @@ export function parse(argv: string[]) {
     else if (a.startsWith("-") && a !== "-") throw new Error(`unknown option ${a} (try --help)`);
     else rest.push(a);
   }
-  if (![o.threshold, o.batch, o.concurrency, o.timeout, o.requestTimeout, o.retries, o.rate].every((n) => Number.isFinite(n) && n >= 0))
+  // Per-option numeric validation (review): a zero deadline is meaningless, so the
+  // two timeouts must be positive; concurrency and retries count requests/attempts,
+  // so they must be whole (>= 1 and >= 0); rate 0 = unlimited and the threshold keep
+  // the plain finite/non-negative rule. batch keeps its own check below.
+  if (![o.threshold, o.rate].every((n) => Number.isFinite(n) && n >= 0))
     throw new Error("numeric option expected");
-  // batch < 1 spins the batching loop forever (+= 0) and a fraction overlaps batches;
-  // 0 stays legal for timeout/rate/retries, but never for batch.
+  if (!Number.isFinite(o.timeout) || o.timeout <= 0) throw new Error("timeout must be a positive number");
+  if (!Number.isFinite(o.requestTimeout) || o.requestTimeout <= 0) throw new Error("request-timeout must be a positive number");
+  if (!Number.isInteger(o.concurrency) || o.concurrency < 1) throw new Error("concurrency must be a positive integer");
+  if (!Number.isInteger(o.retries) || o.retries < 0) throw new Error("retries must be a non-negative integer");
+  // batch < 1 spins the batching loop forever (+= 0) and a fraction overlaps batches.
   if (!Number.isInteger(o.batch) || o.batch < 1) throw new Error("batch must be a positive integer");
   return { ...o, question: rest[0], paths: rest.slice(1) };
 }
