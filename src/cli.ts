@@ -95,10 +95,17 @@ export function parse(argv: string[]) {
     else if (a.startsWith("-") && a !== "-") throw new Error(`unknown option ${a} (try --help)`);
     else rest.push(a);
   }
-  if (![o.threshold, o.batch, o.concurrency, o.timeout, o.requestTimeout, o.retries, o.rate].every((n) => Number.isFinite(n) && n >= 0))
+  // Per-option numeric validation (review): a zero deadline is meaningless, so the
+  // two timeouts must be positive; concurrency and retries count requests/attempts,
+  // so they must be whole (>= 1 and >= 0); rate 0 = unlimited and the threshold keep
+  // the plain finite/non-negative rule. batch keeps its own check below.
+  if (![o.threshold, o.rate].every((n) => Number.isFinite(n) && n >= 0))
     throw new Error("numeric option expected");
-  // batch < 1 spins the batching loop forever (+= 0) and a fraction overlaps batches;
-  // 0 stays legal for timeout/rate/retries, but never for batch.
+  if (!Number.isFinite(o.timeout) || o.timeout <= 0) throw new Error("timeout must be a positive number");
+  if (!Number.isFinite(o.requestTimeout) || o.requestTimeout <= 0) throw new Error("request-timeout must be a positive number");
+  if (!Number.isInteger(o.concurrency) || o.concurrency < 1) throw new Error("concurrency must be a positive integer");
+  if (!Number.isInteger(o.retries) || o.retries < 0) throw new Error("retries must be a non-negative integer");
+  // batch < 1 spins the batching loop forever (+= 0) and a fraction overlaps batches.
   if (!Number.isInteger(o.batch) || o.batch < 1) throw new Error("batch must be a positive integer");
   return { ...o, question: rest[0], paths: rest.slice(1) };
 }
@@ -121,9 +128,14 @@ function erroredSuffix(errors: { kind: string }[]): string {
   return ` · ${errors.length} errored (${parts.join(", ")})`;
 }
 
-/** Up to 5 example error lines under the summary, then `… and N more` (stderr, red). */
-function printExamples(lines: string[]) {
-  for (const l of lines.slice(0, 5)) console.error(c("31", l));
+/** Up to 5 example error lines under the summary, then `… and N more` (stderr, red).
+ *  A hint rides under its line as a second grey indented line when the error
+ *  carries one (so partial-failure runs are as actionable as fatal throws). */
+function printExamples(lines: { line: string; hint?: string }[]) {
+  for (const { line, hint } of lines.slice(0, 5)) {
+    console.error(c("31", line));
+    if (hint) console.error(c("90", `    ${hint}`));
+  }
   if (lines.length > 5) console.error(c("31", `  … and ${lines.length - 5} more`));
 }
 
@@ -165,7 +177,7 @@ async function main() {
     const cost = (r.tokens * USD_PER_M_INPUT) / 1e6;
     const summary = `${r.hits.length} hits / ${r.chunks} chunks (${r.cached} cached) · ${r.tokens} tokens · $${cost.toFixed(4)} · ${((Date.now() - t0) / 1000).toFixed(1)}s`;
     console.error(c("90", r.errors.length ? summary + erroredSuffix(r.errors) : summary));
-    printExamples(r.errors.map((e) => `  ${e.kind}: ${e.file}:${e.start}-${e.end} ${e.message.slice(0, 120)}`));
+    printExamples(r.errors.map((e) => ({ line: `  ${e.kind}: ${e.file}:${e.start}-${e.end} ${e.message.slice(0, 120)}` })));
     // grep semantics when clean; 2 when any chunk errored (partial failure).
     process.exitCode = r.errors.length > 0 ? 2 : (r.hits.length > 0 ? 0 : 1);
   } finally {
@@ -198,7 +210,7 @@ async function testsMain(o: ReturnType<typeof parse>) {
     const cost = (r.tokens * USD_PER_M_INPUT) / 1e6;
     const summary = `${r.selected.length} of ${tests.length} tests selected (${r.all.filter((s) => s.reason === "direct" || s.reason === "import").length} by name/import, ${r.cached} cached) · ${r.requests} requests · ${r.tokens} tokens · $${cost.toFixed(4)} · ${((Date.now() - t0) / 1000).toFixed(1)}s`;
     console.error(c("90", r.errors.length ? summary + erroredSuffix(r.errors) : summary));
-    printExamples(r.errors.map((e) => `  ${e.kind}: ${e.file} ${e.message.slice(0, 120)}`));
+    printExamples(r.errors.map((e) => ({ line: `  ${e.kind}: ${e.file} ${e.message.slice(0, 120)}`, hint: e.hint })));
     // grep semantics when clean; 2 when any batch errored (partial failure) — same rule as code mode.
     process.exitCode = r.errors.length > 0 ? 2 : (r.selected.length ? 0 : 1);
   } finally {
@@ -254,7 +266,7 @@ async function rowsMain(o: ReturnType<typeof parse>) {
     const cost = (r.tokens * USD_PER_M_INPUT) / 1e6;
     const summary = `${o.questions ? Object.keys(questions).length + " questions x " : hits + " hits / "}${rows.length} rows (${r.cached} cached) · ${r.requests} requests · ${r.tokens} tokens · $${cost.toFixed(4)} · ${((Date.now() - t0) / 1000).toFixed(1)}s`;
     console.error(c("90", r.errors.length ? summary + erroredSuffix(r.errors) : summary));
-    printExamples(r.errors.map((e) => `  ${e.kind}: row ${e.row} ${e.message.slice(0, 120)}`));
+    printExamples(r.errors.map((e) => ({ line: `  ${e.kind}: row ${e.row} ${e.message.slice(0, 120)}` })));
     if (wrote) console.error(c("90", `wrote ${o.out}`)); // only when a file actually landed
     // grep semantics when clean; 2 when any row errored (partial failure) — same rule as code mode.
     process.exitCode = r.errors.length > 0 ? 2 : (o.questions || hits ? 0 : 1);

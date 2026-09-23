@@ -40,12 +40,28 @@ test("cli parse: reliability flags parse with correct types and defaults", () =>
   expect(o2).toMatchObject({ timeout: 30, requestTimeout: 60, retries: 2, rate: 5, failFast: true, question: "q", paths: ["src/"] });
 });
 
-test("cli parse: numeric validation covers the new numerics (timeout/request-timeout/retries/rate)", () => {
-  for (const flag of ["--timeout", "--request-timeout", "--retries", "--rate"]) {
-    expect(() => parse([flag, "abc", "q"])).toThrow(/numeric option expected/);
-    expect(() => parse([flag, "-1", "q"])).toThrow(/numeric option expected/);
-  }
-  expect(() => parse(["--timeout", "0", "--request-timeout", "0", "--retries", "0", "--rate", "0", "q"])).not.toThrow(); // 0 is legal
+test("cli parse: per-option numeric ranges (deadline > 0; counts are whole)", () => {
+  // threshold and rate keep the plain finite/non-negative rule (rate 0 = unlimited)
+  expect(() => parse(["--threshold", "abc", "q"])).toThrow(/numeric option expected/);
+  expect(() => parse(["--threshold", "-1", "q"])).toThrow(/numeric option expected/);
+  expect(() => parse(["--rate", "abc", "q"])).toThrow(/numeric option expected/);
+  expect(() => parse(["--rate", "-1", "q"])).toThrow(/numeric option expected/);
+  expect(() => parse(["--rate", "0", "q"])).not.toThrow(); // 0 = unlimited stays legal
+  // a zero deadline is meaningless: both timeouts must be positive
+  expect(() => parse(["--timeout", "0", "q"])).toThrow(/timeout must be a positive number/);
+  expect(() => parse(["--timeout", "-1", "q"])).toThrow(/timeout must be a positive number/);
+  expect(() => parse(["--timeout", "abc", "q"])).toThrow(/timeout must be a positive number/);
+  expect(() => parse(["--timeout", "15", "q"])).not.toThrow();
+  expect(() => parse(["--request-timeout", "0", "q"])).toThrow(/request-timeout must be a positive number/);
+  expect(() => parse(["--request-timeout", "30", "q"])).not.toThrow();
+  // concurrency counts parallel requests: a positive integer
+  expect(() => parse(["-c", "0", "q"])).toThrow(/concurrency must be a positive integer/);
+  expect(() => parse(["-c", "1.5", "q"])).toThrow(/concurrency must be a positive integer/);
+  expect(() => parse(["-c", "1", "q"])).not.toThrow();
+  // retries count tolerated failures: a non-negative integer (0 = no retries)
+  expect(() => parse(["--retries", "-1", "q"])).toThrow(/retries must be a non-negative integer/);
+  expect(() => parse(["--retries", "1.5", "q"])).toThrow(/retries must be a non-negative integer/);
+  expect(() => parse(["--retries", "0", "q"])).not.toThrow();
 });
 
 test("cli parse: batch must be a positive integer (0 and fractions rejected)", () => {
@@ -54,8 +70,8 @@ test("cli parse: batch must be a positive integer (0 and fractions rejected)", (
   expect(() => parse(["--batch", "1.5", "q"])).toThrow(/batch must be a positive integer/);
   expect(() => parse(["-b", "1", "q"])).not.toThrow();
   expect(() => parse(["-b", "16", "q"])).not.toThrow();
-  // the other numerics still allow 0 — only batch is guarded
-  expect(() => parse(["--timeout", "0", "--rate", "0", "--retries", "0", "q"])).not.toThrow();
+  // rate 0 and retries 0 stay legal — only batch and the deadlines reject 0
+  expect(() => parse(["--rate", "0", "--retries", "0", "q"])).not.toThrow();
 });
 
 test("cli parse: old and new flags coexist (--diff positional heuristic untouched)", () => {
@@ -196,9 +212,10 @@ test("cli main rows single: --json emits the SHOWN hits {row, p, ...row fields} 
 });
 
 test("cli main rows: partial failure keeps the v0.3.0 shapes — errored rows never crash nor appear", () => {
-  // @a/@b are cached; @c is not, and its pack runs with an already-expired deadline
-  // (--timeout 0: the deadline is checked before any fetch, so the failure is
-  // deterministic and hermetic — zero network). The run is a partial failure:
+  // @a/@b are cached; @c is not, and its pack runs with a 1ms deadline (--timeout
+  // 0.001: the only fetch attempt is aborted within 1ms — no response can arrive —
+  // and the pre-attempt deadline check then rejects the retry, so the failure is
+  // deterministic and parses no provider response). The run is a partial failure:
   // exit 2, and the errored row is absent from the JSON payloads in both modes.
   const questions = { match: { type: "noul", instructions: rowsContractProbe } };
   const qJson = JSON.stringify(questions);
@@ -209,7 +226,7 @@ test("cli main rows: partial failure keeps the v0.3.0 shapes — errored rows ne
   try {
     fs.writeFileSync(path.join(dir, "rows.csv"), "handle\n@a\n@b\n@c\n");
     // single description: errored @c (row 4) cannot be shown — absent, no TypeError
-    const p = runCli(["--rows", "rows.csv", "--json", "--timeout", "0", rowsContractProbe], dir, home);
+    const p = runCli(["--rows", "rows.csv", "--json", "--timeout", "0.001", rowsContractProbe], dir, home);
     expect(p.exitCode).toBe(2); // partial failure
     expect(JSON.parse(p.stdout.toString())).toEqual([
       { row: 2, p: 0.9, handle: "@a" },
@@ -217,7 +234,7 @@ test("cli main rows: partial failure keeps the v0.3.0 shapes — errored rows ne
     ]);
     // questions mode: the errored row keeps its row fields but gains no answer columns
     fs.writeFileSync(path.join(dir, "q.json"), qJson);
-    const p2 = runCli(["--rows", "rows.csv", "--questions", "q.json", "--json", "--timeout", "0"], dir, home);
+    const p2 = runCli(["--rows", "rows.csv", "--questions", "q.json", "--json", "--timeout", "0.001"], dir, home);
     expect(p2.exitCode).toBe(2);
     expect(JSON.parse(p2.stdout.toString())).toEqual([
       { handle: "@a", match: 0.9 },

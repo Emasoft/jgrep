@@ -83,7 +83,7 @@ export function importMatches(changedFiles: string[], tests: TestFile[]): Set<st
   return out;
 }
 
-export interface TestError { file: string; kind: JevErrorKind; message: string }
+export interface TestError { file: string; kind: JevErrorKind; message: string; hint?: string }
 
 export interface SelectOptions {
   threshold: number; batch: number; concurrency: number; apiKey: string;
@@ -184,15 +184,19 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
   for (const r of pool.results) for (const e of r.entries) all[e.testIndex] = { file: tests[e.testIndex].file, p: e.p, reason: "jev" };
   // Not failFast: recorded 401/403s get the same expired-vs-wrong-key distinction. One
   // clean place — mutate the JevProviderError's hint in pool.errors BEFORE mapping onto
-  // tests (TestError carries only kind+message; the hint stays on the provider error
-  // that pool-level consumers see).
+  // tests, so the amended hint is what TestError carries down to the CLI.
   if (pool.hadSuccess) {
     for (const e of pool.errors) {
       if (e.error.kind === "invalid_api_key") e.error.hint = [e.error.hint, KEY_WORKED_EARLIER_HINT].filter(Boolean).join(" ");
     }
   }
   const errors: TestError[] = pool.errors.flatMap((e) =>
-    batches[e.index].map((ti) => ({ file: tests[ti].file, kind: e.error.kind, message: e.error.message })));
+    batches[e.index].map((ti) => ({
+      file: tests[ti].file, kind: e.error.kind, message: e.error.message,
+      // The provider error's actionable hint rides along (cli.ts prints it under the
+      // error line) — incl. the KEY_WORKED_EARLIER_HINT amended above.
+      ...(e.error.hint !== undefined ? { hint: e.error.hint } : {}),
+    })));
   // A 200 that answered only some tests of a batch: the unanswered tests are recorded
   // per test here (the batch itself succeeded, so the pool saw no error).
   for (const r of pool.results)
