@@ -12,6 +12,7 @@ jgrep "catches an error and silently ignores it" src/
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![deps](https://img.shields.io/badge/runtime%20deps-0-brightgreen)](package.json)
 [![model](https://img.shields.io/badge/powered%20by-Jev%20%C2%B7%20TypeSafe-8a2be2)](https://docs.typesafe.ai)
+[![openrouter](https://img.shields.io/badge/also%20via-OpenRouter-6467f2)](https://openrouter.ai/typesafe)
 
 *No index. No embeddings. No LLM round-trips. A whole `src/` tree in ~2 s for about a cent.*
 
@@ -30,7 +31,8 @@ jgrep "catches an error and silently ignores it" src/
 | "endpoint with no auth check" *in my diff* | ❌             | ❌          | ✅ $$   | ✅ **¢**   |
 | needs an index / vector DB                 | no            | yes        | no     | **no**    |
 
-jgrep runs on [Jev](https://docs.typesafe.ai), a *System One* model: it never
+jgrep runs on [Jev](https://docs.typesafe.ai), through TypeSafe or
+[OpenRouter](https://openrouter.ai/typesafe), a *System One* model: it never
 generates text, it answers typed yes/no questions with calibrated
 probabilities, in parallel, at $0.042 per million input tokens with output free.
 jgrep packs 16 code chunks and 16 questions into one request and turns the
@@ -40,12 +42,13 @@ probabilities into `file:line` hits.
 
 ```bash
 npm i -g jevgrep     # installs the `jgrep` command
-jgrep init           # paste your TypeSafe key, pick where to keep it, done
+jgrep init           # paste a TypeSafe or OpenRouter key, pick where to keep it, done
 ```
 
 `jgrep init` verifies the key against the API, stores it with `chmod 600`,
 and optionally teaches Claude Code / Codex to use jgrep. Get a key at
-[console.typesafe.ai](https://console.typesafe.ai).
+[console.typesafe.ai](https://console.typesafe.ai), or use an OpenRouter key
+([openrouter.ai/keys](https://openrouter.ai/keys)); see [Other endpoints](#other-endpoints).
 
 <details>
 <summary>Prefer not to run init?</summary>
@@ -54,8 +57,30 @@ and optionally teaches Claude Code / Codex to use jgrep. Get a key at
 export TYPESAFE_API_KEY=...                                   # env
 echo 'TYPESAFE_API_KEY=...' >> .env                           # per project
 mkdir -p ~/.config/jgrep && echo 'TYPESAFE_API_KEY=...' > ~/.config/jgrep/env   # global
+export OPENROUTER_API_KEY=sk-or-...                           # or an OpenRouter key
 ```
 </details>
+
+### Other endpoints
+
+Got Jev through OpenRouter instead of TypeSafe? Set `OPENROUTER_API_KEY`
+(sk-or-... — `jgrep init` detects it) instead of `TYPESAFE_API_KEY`; jgrep
+sends requests to OpenRouter's System One endpoint with the matching model
+id. Answers are cached by logical model name, so results are shared with the
+TypeSafe endpoint.
+
+```bash
+export OPENROUTER_API_KEY=sk-or-...
+jgrep "reads a CSV file" src/
+```
+
+`JGREP_ENDPOINT` overrides the URL for either key — point it at a local stub
+for tests or CI, without touching typesafe.ai or openrouter.ai:
+
+```bash
+export TYPESAFE_API_KEY=test-key JGREP_ENDPOINT=http://127.0.0.1:8765
+jgrep "reads a CSV file" src/
+```
 
 ## Use
 
@@ -83,7 +108,7 @@ would turn an outage or an expired secret into a passing check.
 ```yaml
 - run: npm i -g jevgrep
 - name: no unauthenticated endpoints
-  env: { TYPESAFE_API_KEY: "${{ secrets.TYPESAFE_API_KEY }}" }
+  env: { TYPESAFE_API_KEY: "${{ secrets.TYPESAFE_API_KEY }}" }   # or OPENROUTER_API_KEY
   run: |
     set +e
     jgrep --diff "origin/${{ github.base_ref }}" "adds an HTTP endpoint that has no auth check"

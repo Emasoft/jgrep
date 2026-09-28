@@ -8,7 +8,7 @@ import {
   classifyStatus, classifyTransport, jitteredDelayMs, parseRetryAfter, JevProviderError,
   RETRY_AFTER_MAX_MS, type JevErrorKind,
 } from "./errors";
-import { ENDPOINT } from "./jgrep";
+import { ENDPOINT, type Usage } from "./jgrep";
 
 /** Ambient monotonic clock — the token bucket must not jump when the wall clock is adjusted. */
 declare const performance: { now(): number };
@@ -142,6 +142,7 @@ export interface PostOpts {
   maxRetries?: number;                   // default 4 (=> 5 total attempts)
   sleep?: (ms: number) => Promise<void>; // DI for tests
   limiter?: RateLimiter;                 // shared token bucket
+  endpoint?: string;                     // override the default TypeSafe ENDPOINT (issue #7: OpenRouter / JGREP_ENDPOINT)
 }
 
 const headersFor = (apiKey: string): Record<string, string> => ({
@@ -161,13 +162,13 @@ const detailOf = (err: unknown): string => {
 
 /** Actionable hint per error kind (§1.5); bad_request's depends on the snippet.
  *  Provider-generic — the slim PR-1 cut has a single provider and no registry, so
- *  hints name only what exists upstream (TYPESAFE_API_KEY, `jgrep init`, flags). */
+ *  hints name only what exists upstream (TYPESAFE_API_KEY / OPENROUTER_API_KEY, `jgrep init`, flags). */
 function hintFor(kind: JevErrorKind, snippet: string): string | undefined {
   switch (kind) {
     case "insufficient_credits":
       return "top up credits or check your plan with the provider";
     case "invalid_api_key":
-      return "check TYPESAFE_API_KEY or run `jgrep init`";
+      return "check TYPESAFE_API_KEY or OPENROUTER_API_KEY, or run `jgrep init`";
     case "model_unavailable":
       return "the provider does not serve this model — check the provider's model list or status page";
     case "bad_request":
@@ -198,7 +199,7 @@ function transportHint(kind: JevErrorKind, err: unknown): string {
 function statusMessage(kind: JevErrorKind, status: number, snippet: string): string {
   const base = snippet ? `the provider ${status}: ${snippet}` : `the provider ${status}`;
   // The env var belongs in the message itself — it is the first thing to check on 401/403.
-  return kind === "invalid_api_key" ? `${base} — is TYPESAFE_API_KEY a valid key?` : base;
+  return kind === "invalid_api_key" ? `${base} — is TYPESAFE_API_KEY / OPENROUTER_API_KEY a valid key?` : base;
 }
 
 function malformedResponseError(snippet: string): JevProviderError {
@@ -216,7 +217,7 @@ export async function postSystemOne(
   body: unknown,
   apiKey: string,
   opts: PostOpts = {},
-): Promise<{ answers: Record<string, any>; usage?: { input_tokens: number } }> {
+): Promise<{ answers: Record<string, any>; usage?: Usage }> {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const maxRetries = opts.maxRetries ?? 4;
   const requestTimeoutMs = opts.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
@@ -256,7 +257,7 @@ export async function postSystemOne(
     let retryAfterRaw: string | null = null;
 
     try {
-      const res = await fetchImpl(ENDPOINT, {
+      const res = await fetchImpl(opts.endpoint ?? ENDPOINT, {
         method: "POST",
         headers: headersFor(apiKey),
         body: json,
@@ -288,7 +289,7 @@ export async function postSystemOne(
           throw malformedResponseError(text.slice(0, SNIPPET_MAX));
         }
         const p = parsed as Record<string, any>;
-        const usage = p.usage !== null && typeof p.usage === "object" ? (p.usage as { input_tokens: number }) : undefined;
+        const usage = p.usage !== null && typeof p.usage === "object" ? (p.usage as Usage) : undefined;
         return {
           answers: p.answers as Record<string, any>,
           usage,

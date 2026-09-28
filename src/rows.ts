@@ -8,7 +8,7 @@ import { runPool, type PoolResult } from "./pool";
 import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
 import {
   DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, KEY_WORKED_EARLIER_HINT,
-  MODEL, type Cache, type Fetch,
+  MODEL, costOf, type Cache, type Fetch,
 } from "./jgrep";
 
 export type Row = Record<string, string>;
@@ -66,7 +66,7 @@ export function loadQuestions(fileOrText: string): Questions {
 // ---- request ----------------------------------------------------------------
 export const MAX_QUESTIONS_PER_REQUEST = 64;
 
-export function buildRowsRequest(rows: Row[], questions: Questions) {
+export function buildRowsRequest(rows: Row[], questions: Questions, model: string = MODEL) {
   const state = { rows: rows.map((r, i) => ({ id: `r${i}`, ...r })) };
   const qs: Record<string, unknown> = {};
   rows.forEach((_, i) => {
@@ -74,13 +74,14 @@ export function buildRowsRequest(rows: Row[], questions: Questions) {
       qs[`r${i}.${name}`] = { ...spec, instructions: `Look only at the row with id "r${i}". ${spec.instructions}` };
     }
   });
-  return { model: MODEL, state, questions: qs };
+  return { model, state, questions: qs };
 }
 
 const key = (qJson: string, r: Row) => createHash("sha1").update(`${MODEL}\0rows\0${qJson}\0${JSON.stringify(r)}`).digest("hex");
 
 export interface RowsOptions {
   batch: number; concurrency: number; apiKey: string;
+  endpoint?: string; model?: string;
   timeoutSec?: number;         // per-batch deadline, retries included (defaults shared with jgrep)
   requestTimeoutSec?: number;  // per attempt
   maxRetries?: number;         // failed attempts tolerated before the final error
@@ -92,7 +93,7 @@ export interface RowsOptions {
 export interface RowError { row: number; kind: JevErrorKind; message: string }
 /** answers is position-aligned with the input rows and DENSE: an errored row maps to null,
  *  never a hole (a holey array would desync `map` consumers from the row indices). */
-export interface RowsResult { answers: (Record<string, Answer> | null)[]; tokens: number; cached: number; requests: number; errors: RowError[] }
+export interface RowsResult { answers: (Record<string, Answer> | null)[]; tokens: number; cost: number; cached: number; requests: number; errors: RowError[] }
 
 /** One request-pack's outcome; runPool results are completion-ordered, so the pack
  *  index rides along and `answers` is re-associated after the pool settles. */
@@ -119,17 +120,19 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
     maxRetries: o.maxRetries ?? DEFAULT_MAX_RETRIES,
     limiter: o.ratePerSec && o.ratePerSec > 0 ? new RateLimiter(o.ratePerSec, Math.max(1, o.concurrency)) : undefined,
   };
-  let tokens = 0;
+  let tokens = 0, cost = 0;
   // Run-level success flag, same rule as jgrep(): drives the invalid_api_key
   // expired-vs-wrong-key hint. Tracked HERE (not PoolResult) because failFast
   // throws the pool result away.
   let hadSuccess = false;
   const worker = async (b: number[], index: number): Promise<PackOutcome> => {
-    const res = await postSystemOne(buildRowsRequest(b.map((i) => rows[i]), questions), o.apiKey, {
+    const res = await postSystemOne(buildRowsRequest(b.map((i) => rows[i]), questions, o.model), o.apiKey, {
       ...post,
+      endpoint: o.endpoint,
       deadlineMs: Date.now() + timeoutMs, // per-batch deadline, retries included
     });
     tokens += res.usage?.input_tokens ?? 0;
+    cost += costOf(res.usage);
     const rowResults = b.map((ri, j) => {
       const a: Record<string, Answer> = {};
       for (const name of Object.keys(questions)) a[name] = res.answers[`r${j}.${name}`] ?? { type: "missing" };
@@ -179,7 +182,7 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
   }
   // `requests` counts only packs the breaker actually attempted; packs it never
   // dispatched are not requests.
-  return { answers, tokens, cached: rows.length - todo.length, requests: batches.length - (pool.aborted ? pool.unprocessed : 0), errors };
+  return { answers, tokens, cost, cached: rows.length - todo.length, requests: batches.length - (pool.aborted ? pool.unprocessed : 0), errors };
 }
 
 // ---- output -----------------------------------------------------------------

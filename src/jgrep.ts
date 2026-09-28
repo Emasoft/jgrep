@@ -12,7 +12,17 @@ import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
 
 export const ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 export const MODEL = "jev-latest";
+// OpenRouter serves Jev at the same request/response shape, billed to an OpenRouter key.
+// Model id + alias per https://openrouter.ai/docs/guides/community/jev ("Model ID:
+// typesafe/jev-1.13. The ~typesafe/jev-latest alias tracks the newest release.").
+export const OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/systemone";
+export const OPENROUTER_MODEL = "~typesafe/jev-latest";
 export const USD_PER_M_INPUT = 0.042;
+
+export interface Usage { input_tokens?: number; cost?: number }
+/** Provider-reported cost when present (OpenRouter sends usage.cost), else list price x input tokens. */
+export const costOf = (u?: Usage): number =>
+  typeof u?.cost === "number" ? u.cost : ((u?.input_tokens ?? 0) * USD_PER_M_INPUT) / 1e6;
 
 export interface Chunk { file: string; start: number; end: number; text: string }
 export interface Hit extends Chunk { p: number }
@@ -117,7 +127,7 @@ export function chunkPaths(paths: string[]): Chunk[] {
 }
 
 // ---- Jev --------------------------------------------------------------------
-export function buildRequest(question: string, chunks: Chunk[], kind: Kind = "code") {
+export function buildRequest(question: string, chunks: Chunk[], kind: Kind = "code", model: string = MODEL) {
   const state = { chunks: chunks.map((c, i) => ({ id: `c${i}`, file: c.file, lines: `${c.start}-${c.end}`, [kind]: c.text })) };
   const what = kind === "diff"
     ? "Does that diff hunk (lines starting with + were added, - removed) match this description"
@@ -126,7 +136,7 @@ export function buildRequest(question: string, chunks: Chunk[], kind: Kind = "co
   chunks.forEach((_, i) => {
     questions[`c${i}`] = { type: "noul", instructions: `Look only at the chunk with id "c${i}". ${what}: ${question}` };
   });
-  return { model: MODEL, state, questions };
+  return { model, state, questions };
 }
 
 // ---- cache ------------------------------------------------------------------
@@ -153,6 +163,7 @@ export const DEFAULT_MAX_RETRIES = 4;          // => 5 total attempts
 
 export interface Options {
   threshold: number; batch: number; concurrency: number; apiKey: string; kind?: Kind;
+  endpoint?: string; model?: string; // provider routing (resolveProvider); default TypeSafe
   timeoutSec?: number;         // per-batch deadline, retries included
   requestTimeoutSec?: number;  // per attempt
   maxRetries?: number;         // failed attempts tolerated before the final error
@@ -161,7 +172,7 @@ export interface Options {
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
 export interface ChunkError { file: string; start: number; end: number; kind: JevErrorKind; message: string }
-export interface Result { hits: Hit[]; all: Hit[]; chunks: number; tokens: number; cached: number; errors: ChunkError[] }
+export interface Result { hits: Hit[]; all: Hit[]; chunks: number; tokens: number; cost: number; cached: number; errors: ChunkError[] }
 
 /** What one batch worker hands back; runPool results are completion-ordered, so the
  *  batch index rides along and `all` is re-associated after the pool settles. A
@@ -199,16 +210,18 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
     maxRetries: o.maxRetries ?? DEFAULT_MAX_RETRIES,
     limiter: o.ratePerSec && o.ratePerSec > 0 ? new RateLimiter(o.ratePerSec, Math.max(1, o.concurrency)) : undefined,
   };
-  let tokens = 0;
+  let tokens = 0, cost = 0;
   // Run-level success flag: drives the invalid_api_key expired-vs-wrong-key hint.
   // Tracked HERE (not PoolResult) because failFast throws the pool result away.
   let hadSuccess = false;
   const worker = async (b: number[], index: number): Promise<BatchOutcome> => {
-    const res = await postSystemOne(buildRequest(question, b.map((i) => chunks[i]), kind), o.apiKey, {
+    const res = await postSystemOne(buildRequest(question, b.map((i) => chunks[i]), kind, o.model), o.apiKey, {
       ...post,
+      endpoint: o.endpoint,
       deadlineMs: Date.now() + timeoutMs, // per-batch deadline, retries included
     });
     tokens += res.usage?.input_tokens ?? 0;
+    cost += costOf(res.usage);
     // Finite p-values go straight into the in-memory cache object: cli.ts persists it in
     // a finally, so answers paid for survive even when other batches fail. A chunk the
     // provider did not answer (missing or non-finite p on a 200) is skipped here and
@@ -271,38 +284,72 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
   const hits: Hit[] = [];
   const ordered: Hit[] = [];
   for (const h of all) if (h) { ordered.push(h); if (h.p >= o.threshold) hits.push(h); }
-  return { hits, all: ordered, chunks: chunks.length, tokens, cached, errors };
+  return { hits, all: ordered, chunks: chunks.length, tokens, cost, cached, errors };
 }
 
 // ---- config -----------------------------------------------------------------
 export const CONFIG_FILE = path.join(os.homedir(), ".config", "jgrep", "env");
 
-export function resolveApiKey(env = process.env): string {
-  if (env.TYPESAFE_API_KEY?.trim()) return env.TYPESAFE_API_KEY.trim();
+/** Reads one env var from the same three sources jgrep has always read TYPESAFE_API_KEY
+ *  from: the environment, ./.env, then ~/.config/jgrep/env. */
+function readVar(name: string, env = process.env): string | undefined {
+  if (env[name]?.trim()) return env[name]!.trim();
   for (const file of [path.join(process.cwd(), ".env"), CONFIG_FILE]) {
     try {
-      const m = fs.readFileSync(file, "utf8").match(/^\s*(?:export\s+)?TYPESAFE_API_KEY\s*=\s*["']?([^"'\r\n#]+)/m);
+      const m = fs.readFileSync(file, "utf8").match(new RegExp(`^\\s*(?:export\\s+)?${name}\\s*=\\s*["']?([^"'\\r\\n#]+)`, "m"));
       if (m) return m[1].trim();
     } catch { /* next */ }
   }
-  throw new Error("No TypeSafe API key. Run `jgrep init` (or export TYPESAFE_API_KEY).");
+  return undefined;
+}
+
+export interface Provider { apiKey: string; endpoint: string; model: string }
+
+/** JGREP_ENDPOINT carries the API key's Authorization header wherever it points — reject
+ *  plain http:// except to loopback (local stubs) so a key is never handed to a
+ *  cleartext remote endpoint (e.g. one read from a project's own untrusted ./.env). */
+function checkEndpoint(url: string): string {
+  const u = new URL(url);
+  if (u.protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includes(u.hostname))
+    throw new Error(`JGREP_ENDPOINT must be https:// (or a loopback http:// stub): ${url}`);
+  return url;
+}
+
+/** Endpoint + wire model id picked from whichever key is present (TYPESAFE_API_KEY wins
+ *  when both are set); JGREP_ENDPOINT overrides the URL only, keeping the key's model.
+ *  See issue #7. */
+export function resolveProvider(env = process.env): Provider {
+  const rawOverride = readVar("JGREP_ENDPOINT", env);
+  const override = rawOverride === undefined ? undefined : checkEndpoint(rawOverride);
+  const typesafe = readVar("TYPESAFE_API_KEY", env);
+  if (typesafe) return { apiKey: typesafe, endpoint: override ?? ENDPOINT, model: MODEL };
+  const openrouter = readVar("OPENROUTER_API_KEY", env);
+  if (openrouter) return { apiKey: openrouter, endpoint: override ?? OPENROUTER_ENDPOINT, model: OPENROUTER_MODEL };
+  throw new Error("No API key. Run `jgrep init` (or export TYPESAFE_API_KEY or OPENROUTER_API_KEY).");
+}
+
+/** Thin wrapper over resolveProvider for callers that only need the key. */
+export function resolveApiKey(env = process.env): string {
+  return resolveProvider(env).apiKey;
 }
 
 /** Cheapest possible request; true when the key is accepted. */
-export async function verifyApiKey(apiKey: string, f: typeof fetch = fetch): Promise<{ ok: boolean; status: number; model?: string }> {
-  const res = await f(ENDPOINT, {
+export async function verifyApiKey(
+  apiKey: string, f: typeof fetch = fetch, endpoint: string = ENDPOINT, model: string = MODEL,
+): Promise<{ ok: boolean; status: number; model?: string }> {
+  const res = await f(endpoint, {
     method: "POST",
     headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: MODEL, state: "ping", questions: { ok: { type: "noul", instructions: "Is the state the word ping?" } } }),
+    body: JSON.stringify({ model, state: "ping", questions: { ok: { type: "noul", instructions: "Is the state the word ping?" } } }),
     signal: AbortSignal.timeout(abortDelayMs(15_000)), // literal int — floored for uniformity (Node integer contract)
   });
-  const model = res.ok ? ((await res.json()) as { model?: string }).model : undefined;
-  return { ok: res.ok, status: res.status, model };
+  const respModel = res.ok ? ((await res.json()) as { model?: string }).model : undefined;
+  return { ok: res.ok, status: res.status, model: respModel };
 }
 
-export function saveApiKey(apiKey: string): string {
+export function saveApiKey(apiKey: string, varName: "TYPESAFE_API_KEY" | "OPENROUTER_API_KEY" = "TYPESAFE_API_KEY"): string {
   fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(CONFIG_FILE, `TYPESAFE_API_KEY=${apiKey}\n`, { mode: 0o600 });
+  fs.writeFileSync(CONFIG_FILE, `${varName}=${apiKey}\n`, { mode: 0o600 });
   return CONFIG_FILE;
 }
 
