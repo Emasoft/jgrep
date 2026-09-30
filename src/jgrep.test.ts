@@ -100,6 +100,53 @@ test("installSkills copies SKILL.md only into agent homes that exist", async () 
   expect(fs.readFileSync(path.join(dirs[0], "SKILL.md"), "utf8")).toContain("name: jgrep");
 });
 
+test("installSkills replaces dangling and live symlinks with a real dir without touching the link target", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { installSkills } = await import("./jgrep");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-"));
+  const src = path.join(home, "SKILL.md");
+  fs.writeFileSync(src, "new");
+  const repo = path.join(home, "repo-skill");
+  fs.mkdirSync(repo);
+  fs.writeFileSync(path.join(repo, "SKILL.md"), "old");
+  fs.mkdirSync(path.join(home, ".claude", "skills"), { recursive: true });
+  fs.mkdirSync(path.join(home, ".codex", "skills"), { recursive: true });
+  fs.symlinkSync(path.join(home, "gone"), path.join(home, ".claude", "skills", "jgrep"));
+  fs.symlinkSync(repo, path.join(home, ".codex", "skills", "jgrep"));
+  const dirs = installSkills(src, home, ["claude", "codex"]);
+  for (const d of dirs) {
+    expect(fs.lstatSync(d).isSymbolicLink()).toBe(false);
+    expect(fs.readFileSync(path.join(d, "SKILL.md"), "utf8")).toBe("new");
+  }
+  expect(fs.readFileSync(path.join(repo, "SKILL.md"), "utf8")).toBe("old");
+});
+
+test("installSkills stops instead of copying through a symlink it could not remove", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { installSkills } = await import("./jgrep");
+  if (process.getuid?.() === 0) return; // root ignores the read-only dir
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-"));
+  const src = path.join(home, "SKILL.md");
+  fs.writeFileSync(src, "new");
+  const repo = path.join(home, "repo-skill");
+  fs.mkdirSync(repo);
+  fs.writeFileSync(path.join(repo, "SKILL.md"), "old");
+  const skills = path.join(home, ".claude", "skills");
+  fs.mkdirSync(skills, { recursive: true });
+  fs.symlinkSync(repo, path.join(skills, "jgrep"));
+  fs.chmodSync(skills, 0o555);
+  try {
+    expect(() => installSkills(src, home, ["claude"])).toThrow();
+  } finally {
+    fs.chmodSync(skills, 0o755);
+  }
+  expect(fs.readFileSync(path.join(repo, "SKILL.md"), "utf8")).toBe("old");
+});
+
 test("rows: csv parser handles quotes, commas and newlines inside quotes", async () => {
   const { parseCsv } = await import("./rows");
   const r = parseCsv('handle,bio\n@a,"skincare, daily ""GRWM""\nSeoul"\n@b,makeup\n');
