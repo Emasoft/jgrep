@@ -12,7 +12,6 @@ import {
 } from "./jgrep";
 
 export const REPO_URL = "https://github.com/kyu1204/jgrep";
-const CONSOLE_URL = "https://console.typesafe.ai";
 
 /** OpenRouter keys are prefixed `sk-or-`; everything else is treated as a TypeSafe key. */
 export const varNameFor = (key: string): "TYPESAFE_API_KEY" | "OPENROUTER_API_KEY" =>
@@ -57,7 +56,7 @@ export async function init() {
   let model: string | undefined;
   while (!apiKey) {
     const typed = guard(await p.password({
-      message: `Paste your TypeSafe or OpenRouter API key (${CONSOLE_URL})`,
+      message: "Paste a TypeSafe key (console.typesafe.ai) or an OpenRouter key (openrouter.ai/keys)",
       validate: (v) => (v?.trim() ? undefined : "The key is required: jgrep cannot run without it."),
     })).trim();
     const v = varNameFor(typed);

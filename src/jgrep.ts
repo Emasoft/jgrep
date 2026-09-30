@@ -19,6 +19,20 @@ export const OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/systemone";
 export const OPENROUTER_MODEL = "~typesafe/jev-latest";
 export const USD_PER_M_INPUT = 0.042;
 
+/** Dry-run sink: each request that WOULD be sent adds 1 request and its JSON body length. */
+export interface Estimate { requests: number; chars: number }
+// Fit to 4 live requests (1/3/10/30 chunks, 673-38538 body chars, 2026-09-28): the provider
+// bills input_tokens = ~236 + 0.30 * body chars (real 438/728/2759/11805), i.e. a fixed
+// per-request overhead plus ~3.3 chars/token, not chars/4. Re-measure if the model changes.
+export const EST_TOKENS_PER_REQUEST = 240;
+export const EST_TOKENS_PER_CHAR = 0.3;
+export const estimateTokens = (e: Estimate) => Math.ceil(e.requests * EST_TOKENS_PER_REQUEST + e.chars * EST_TOKENS_PER_CHAR);
+/** Cost at list price. */
+export const estimateLine = (e: Estimate) => {
+  const tokens = estimateTokens(e);
+  return `estimate: ${e.requests} requests · ~${tokens} input tokens · ~$${(tokens * USD_PER_M_INPUT / 1e6).toFixed(4)} (list price, cached chunks free; nothing was sent)`;
+};
+
 export interface Usage { input_tokens?: number; cost?: number }
 /** Provider-reported cost when present (OpenRouter sends usage.cost), else list price x input tokens. */
 export const costOf = (u?: Usage): number =>
@@ -169,6 +183,7 @@ export interface Options {
   maxRetries?: number;         // failed attempts tolerated before the final error
   ratePerSec?: number;         // token-bucket pacing across all requests; 0/undefined = unlimited
   failFast?: boolean;          // rethrow the first fatal error instead of isolating it
+  estimate?: Estimate;         // dry run: count requests/chars into this sink, never call the provider
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
 export interface ChunkError { file: string; start: number; end: number; kind: JevErrorKind; message: string }
@@ -215,7 +230,9 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
   // Tracked HERE (not PoolResult) because failFast throws the pool result away.
   let hadSuccess = false;
   const worker = async (b: number[], index: number): Promise<BatchOutcome> => {
-    const res = await postSystemOne(buildRequest(question, b.map((i) => chunks[i]), kind, o.model), o.apiKey, {
+    const req = buildRequest(question, b.map((i) => chunks[i]), kind, o.model);
+    if (o.estimate) { o.estimate.requests++; o.estimate.chars += JSON.stringify(req).length; return { index, entries: [], malformed: [] }; }
+    const res = await postSystemOne(req, o.apiKey, {
       ...post,
       endpoint: o.endpoint,
       deadlineMs: Date.now() + timeoutMs, // per-batch deadline, retries included
