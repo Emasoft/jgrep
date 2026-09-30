@@ -119,6 +119,19 @@ would turn an outage or an expired secret into a passing check.
     esac
 ```
 
+#### GitHub Action
+
+The same gate as a one-liner. For test selection use `mode: tests` instead
+(see [jgrep-action](https://github.com/kyu1204/jgrep-action)).
+
+
+```yaml
+- uses: actions/checkout@v5
+  with: { fetch-depth: 0 }
+- uses: kyu1204/jgrep-action@v1
+  with: { mode: diff, rule: "adds an HTTP endpoint that has no auth check", api-key: "${{ secrets.TYPESAFE_API_KEY }}" }
+```
+
 ### Run only the tests a change can affect
 
 ```bash
