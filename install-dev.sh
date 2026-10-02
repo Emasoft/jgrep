@@ -28,7 +28,8 @@
 # local setup (deps, build, system-wide bin, agent skill). A pre-existing jgrep
 # install — including a symlink pointing at an old clone path — is autodetected
 # and replaced exactly like option 1 does (real files archived as .bak). If bun
-# is missing, [8] offers (interactive) or auto-installs (--choice/--yes) it via
+# is missing, [8] asks before installing it (installs without asking only with an
+# explicit --yes; --choice alone does not imply that) via
 # https://bun.sh/install; node >= 18 is still required to RUN the bin (missing
 # node only warns). The interactive menu cannot run through a pipe — piped
 # stdin or a script with no repo next to it refuses with the two documented
@@ -53,7 +54,7 @@
 # Agent skill: options 1/2/3/8 also refresh the agent skill from
 # skills/jgrep/SKILL.md (it embeds a verbatim copy of `jgrep --help`, so a
 # stale skill means wrong flags for AI agents). Step A runs the vercel `skills`
-# universal installer (`npx -y skills add ./skills -g -y` — every detected
+# universal installer (`npx -y skills@<SKILLS_PKG pin> add ./skills -g -y` — every detected
 # harness); Step B falls back to copying it into the standard dir
 # ~/.agents/skills/jgrep only when missing or different. Best-effort: a failed
 # refresh warns but NEVER fails the install (exit code stays the install's).
@@ -86,6 +87,13 @@ EXPECTED_NPM_REPO="github.com/kyu1204/jgrep"
 UPSTREAM_SLUG="kyu1204/jgrep"
 FORK_SLUG="Emasoft/jgrep"
 FORK_URL="https://github.com/Emasoft/jgrep.git"   # clone URL for menu [8] (remote/curl)
+# The vercel `skills` installer, pinned: `npx -y skills` ran whatever version npm served
+# that day (remote code at install time, audit). Bump deliberately after reviewing a release.
+SKILLS_PKG="skills@1.7.0"
+# Marker written into the script-managed clone's git dir at clone time. Option 8 runs
+# `git reset --hard origin/main` there, so it refuses any directory without it (audit
+# MAJOR: JGREP_DEV_DIR pointed at a real dev checkout would have lost uncommitted work).
+MANAGED_MARKER="jgrep-managed"
 
 # ---------------------------------------------------------------------------
 # state
@@ -94,6 +102,7 @@ REPO=""
 INVOCATION_CWD=""
 OPT_CHOICE=""
 OPT_YES=0
+OPT_YES_EXPLICIT=0   # --yes given literally (--choice N implies OPT_YES but not this): gates the bun auto-install
 OPT_DRY_RUN=0
 OPT_TARGET=""
 MODE_CHECK=0
@@ -1144,7 +1153,10 @@ Options:
   --choice N   run menu item N fully non-interactively: zero prompts, everything
                auto-confirmed, deterministic exit codes (implies --yes) — for
                headless dev boxes. Accepts --choice=N; a bare N works the same.
-  --yes        auto-confirm all prompts (implied by --choice N / bare N).
+               One exception: installing a missing bun (option 8) runs a remote
+               installer, so it still asks unless --yes is given explicitly.
+  --yes        auto-confirm all prompts (implied by --choice N / bare N, except
+               the bun install above, which needs --yes itself).
   --dry-run    do everything except the final target mutation; would-be commands
                are printed with DRY-RUN: prefixes; always exits 0.
   --target DIR install into DIR instead of the default target chain
@@ -1179,8 +1191,9 @@ option 1: symlinks are repointed, real files archived as .bak with the printed
 `mv` revert command. Updating = re-running the same command. Works through a
 pipe (`curl … | bash -s -- --choice 8`); the interactive menu does NOT work
 through a pipe (no TTY on stdin → refusal with the two one-liners, exit 2).
-If bun is missing, [8] offers it (interactive y/N) or auto-installs it
-(--choice/--yes) via https://bun.sh/install; node >= 18 is still required at
+If bun is missing, [8] asks (y/N, through /dev/tty when piped) before
+installing it via https://bun.sh/install, and installs without asking only
+with an explicit --yes; node >= 18 is still required at
 runtime (a missing node only warns).
 
 Identity pinning: every npm install/uninstall verifies that the `jevgrep`
@@ -1694,19 +1707,19 @@ refresh_agent_skill() {
 		return 0
 	fi
 	if [ "$OPT_DRY_RUN" -eq 1 ]; then
-		log "DRY-RUN: would refresh the agent skill via 'npx -y skills add ./skills -g -y' (vercel skills installer -> every detected harness)"
+		log "DRY-RUN: would refresh the agent skill via 'npx -y $SKILLS_PKG add ./skills -g -y' (vercel skills installer -> every detected harness)"
 		log "DRY-RUN: fallback if the installer fails or is offline: copy skills/jgrep/SKILL.md to $HOME/.agents/skills/jgrep/SKILL.md (only when missing or different)"
 		return 0
 	fi
 	if have npx; then
 		# Step A — universal installer (cwd is the repo; installs the skill
 		# into every detected harness's standard skill dir)
-		if npx -y skills add ./skills -g -y; then
+		if npx -y "$SKILLS_PKG" add ./skills -g -y; then
 			log "==> agent skill refreshed via the vercel skills installer (all detected harnesses)"
 			log "hint: harnesses managing skills outside the standard dirs need a manual re-sync (late cli reads ~/.agents/skills soon)"
 			return 0
 		fi
-		warn "$PROG: warning: 'npx -y skills add ./skills -g -y' failed — falling back to the ~/.agents/skills copy."
+		warn "$PROG: warning: 'npx -y $SKILLS_PKG add ./skills -g -y' failed — falling back to the ~/.agents/skills copy."
 	else
 		warn "$PROG: warning: npx not found — falling back to the ~/.agents/skills copy."
 	fi
@@ -1722,7 +1735,7 @@ refresh_agent_skill() {
 		log "hint: harnesses managing skills outside the standard dirs need a manual re-sync (late cli reads ~/.agents/skills soon)"
 		return 0
 	fi
-	warn "$PROG: warning: could not update $dest — refresh it manually: npx skills add ./skills -g"
+	warn "$PROG: warning: could not update $dest — refresh it manually: npx $SKILLS_PKG add ./skills -g"
 	return 1
 }
 
@@ -1767,9 +1780,10 @@ refuse_detached_needs_repo() {
 }
 
 remote_clone_identity_or_die() {
-	# $1 = clone dir; its origin must point at the fork ($FORK_SLUG) — the same
-	# identity-pinning rule as the option-3 origin remote. A directory that is
-	# NOT the fork is never fetched, reset, or built.
+	# $1 = clone dir; its origin must BE the fork ($FORK_SLUG) — https or ssh form,
+	# exact. A substring match also accepted Emasoft/jgrep-sync or any dev
+	# checkout whose URL merely contained the slug (audit MAJOR). A directory that
+	# is NOT the fork is never fetched, reset, or built.
 	local d="$1" url
 	url="$(git -C "$d" remote get-url origin 2>/dev/null || true)"
 	if [ -z "$url" ]; then
@@ -1778,15 +1792,46 @@ remote_clone_identity_or_die() {
 		exit 1
 	fi
 	case "$url" in
-	*"$FORK_SLUG"*) return 0 ;;
+	"https://github.com/$FORK_SLUG" | "https://github.com/$FORK_SLUG.git" | \
+		"git@github.com:$FORK_SLUG" | "git@github.com:$FORK_SLUG.git" | \
+		"ssh://git@github.com/$FORK_SLUG" | "ssh://git@github.com/$FORK_SLUG.git")
+		return 0
+		;;
 	*)
 		warn "$PROG: refusing: $d is not a clone of the fork Emasoft/jgrep."
 		warn "  observed origin: $url"
-		warn "  expected: a URL containing $FORK_SLUG"
+		warn "  expected exactly: https://github.com/$FORK_SLUG(.git) or git@github.com:$FORK_SLUG(.git)"
 		warn "  hint: point JGREP_DEV_DIR at another directory, or remove $d and re-run."
 		exit 1
 		;;
 	esac
+}
+
+remote_clone_resettable_or_die() {
+	# $1 = clone dir that passed the identity check. `git reset --hard origin/main`
+	# destroys local work, so it only runs on a clone this script created (the
+	# marker), with no uncommitted changes to tracked files, checked out on main.
+	# Untracked files are not counted: reset --hard leaves them alone.
+	local d="$1" gitdir branch
+	gitdir="$(git -C "$d" rev-parse --absolute-git-dir 2>/dev/null || true)"
+	if [ -z "$gitdir" ] || [ ! -f "$gitdir/$MANAGED_MARKER" ]; then
+		warn "$PROG: refusing: $d was not created by this script (no $MANAGED_MARKER marker in its git dir), so it is never reset."
+		warn "  hint: point JGREP_DEV_DIR elsewhere. If $d IS the clone an older install-dev.sh created"
+		warn "        and holds no work of yours, adopt it: touch \"${gitdir:-$d/.git}/$MANAGED_MARKER\" and re-run."
+		exit 1
+	fi
+	if [ -n "$(git -C "$d" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+		warn "$PROG: refusing: $d has uncommitted changes — 'git reset --hard' would destroy them."
+		warn "  hint: commit or stash them (git -C $d stash), then re-run."
+		exit 1
+	fi
+	branch="$(git -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+	if [ "$branch" != "main" ]; then
+		warn "$PROG: refusing: $d is not on main (HEAD: ${branch:-unknown}) — resetting it would move that branch."
+		warn "  hint: git -C $d checkout main, then re-run."
+		exit 1
+	fi
+	return 0
 }
 
 dir_is_empty() {
@@ -1808,18 +1853,35 @@ refuse_non_clone_dir() {
 }
 
 clone_fork_or_die() {
-	# $1 = destination; shallow-clones the fork and verifies its origin URL
+	# $1 = destination; shallow-clones the fork, verifies its origin URL and marks
+	# it script-managed (the only kind of directory option 8 ever resets).
 	if ! git clone --depth 1 "$FORK_URL" "$1"; then
 		warn "$PROG: git clone of $FORK_URL failed (offline? destination unwritable?)."
 		exit 1
 	fi
 	remote_clone_identity_or_die "$1"
+	printf '%s\n' "created by install-dev.sh option 8 — this clone is reset to origin/main on every re-run" >"$(git -C "$1" rev-parse --absolute-git-dir)/$MANAGED_MARKER"
 	return 0
 }
 
+bun_install_decision() {
+	# echo yes | ask | no — may option 8 install a missing bun? Only an EXPLICIT
+	# --yes installs without asking (--choice N alone no longer does: that ran a
+	# remote `curl | bash` installer unattended, audit). Otherwise ask on a
+	# terminal (stdin, or /dev/tty when the script itself arrives through a pipe);
+	# with no terminal at all, refuse.
+	if [ "$OPT_YES_EXPLICIT" -eq 1 ]; then
+		echo yes
+	elif [ -t 0 ] || { [ -r /dev/tty ] && [ -w /dev/tty ] && (: </dev/tty) 2>/dev/null; }; then
+		echo ask
+	else
+		echo no
+	fi
+}
+
 ensure_bun_for_remote_install() {
-	# option 8 ONLY: a fresh box may lack bun — confirm (interactive) or
-	# auto-install (--choice/--yes) it via the official installer, then extend
+	# option 8 ONLY: a fresh box may lack bun — ask (or, with an explicit --yes,
+	# install without asking) via the official installer, then extend
 	# PATH for this run. Options 1-4 keep today's hard unavailability markers;
 	# this never runs for them.
 	[ -n "$BUN_BIN" ] && return 0
@@ -1827,13 +1889,14 @@ ensure_bun_for_remote_install() {
 		warn "$PROG: 'bun' is required to build and 'curl' is missing — install bun manually: https://bun.sh"
 		exit 1
 	fi
-	local reply=""
-	if [ "$OPT_YES" -eq 1 ]; then
-		log "==> non-interactive: bun is missing — installing it via https://bun.sh/install"
-	else
+	local reply="" decision
+	decision="$(bun_install_decision)"
+	if [ "$decision" = "yes" ]; then
+		log "==> --yes: bun is missing — installing it via https://bun.sh/install"
+	elif [ "$decision" = "ask" ]; then
 		echo
 		printf '%s' "bun is required to build — install it now via https://bun.sh/install? [y/N] "
-		read -r reply || reply=""
+		if [ -t 0 ]; then read -r reply || reply=""; else read -r reply </dev/tty || reply=""; fi
 		case "$reply" in
 		y | Y | yes | YES) ;;
 		*)
@@ -1841,6 +1904,9 @@ ensure_bun_for_remote_install() {
 			exit 3
 			;;
 		esac
+	else
+		warn "$PROG: bun is missing and there is no terminal to ask — re-run with --yes to install it via https://bun.sh/install, or install bun yourself."
+		exit 3
 	fi
 	log "==> curl -fsSL https://bun.sh/install | bash"
 	if ! curl -fsSL https://bun.sh/install | bash; then
@@ -1877,6 +1943,7 @@ opt_remote_install() {
 			# same identity gate as the real run (refuses in dry-run too,
 			# exactly like the options-3/4 remote identity check)
 			remote_clone_identity_or_die "$REMOTE_CLONE_DIR"
+			remote_clone_resettable_or_die "$REMOTE_CLONE_DIR"
 			log "DRY-RUN: updating script-managed clone at $REMOTE_CLONE_DIR"
 			log "DRY-RUN: git -C $REMOTE_CLONE_DIR fetch origin main   (skipped — dry-run does not mutate .git)"
 			log "DRY-RUN: git -C $REMOTE_CLONE_DIR reset --hard origin/main"
@@ -1891,14 +1958,18 @@ opt_remote_install() {
 		fi
 		log "DRY-RUN: cd $REMOTE_CLONE_DIR"
 		if [ -z "$BUN_BIN" ]; then
-			log "DRY-RUN: bun missing — a real run would install it via https://bun.sh/install (auto-confirmed with --choice/--yes)"
+			case "$(bun_install_decision)" in
+			yes) log "DRY-RUN: bun missing — a real run would install bun without asking (--yes) via https://bun.sh/install" ;;
+			ask) log "DRY-RUN: bun missing — a real run would ask before installing bun via https://bun.sh/install (--yes skips the question)" ;;
+			*) log "DRY-RUN: bun missing and no terminal — a real run would refuse (exit 3) unless --yes is given" ;;
+			esac
 		fi
 		log "DRY-RUN: bun install   (deps of the script-managed clone)"
 		log "DRY-RUN: bun run build → $REMOTE_CLONE_DIR/dist/jgrep.js && chmod +x"
 		# reuse install_artifact (option-1 path) so the npm-owned conflict and
 		# the symlink/archive preview render exactly like a real run would
 		install_artifact link "" "" "$DEST_DIR" "$REMOTE_CLONE_DIR/dist/jgrep.js"
-		log "DRY-RUN: would refresh the agent skill from $REMOTE_CLONE_DIR/skills/jgrep via 'npx -y skills add ./skills -g -y' (vercel skills installer -> every detected harness)"
+		log "DRY-RUN: would refresh the agent skill from $REMOTE_CLONE_DIR/skills/jgrep via 'npx -y $SKILLS_PKG add ./skills -g -y' (vercel skills installer -> every detected harness)"
 		log "DRY-RUN: fallback if the installer fails or is offline: copy $REMOTE_CLONE_DIR/skills/jgrep/SKILL.md to $HOME/.agents/skills/jgrep/SKILL.md (only when missing or different)"
 		if [ -z "$NODE_BIN" ]; then
 			warn "DRY-RUN: node missing — a real run would warn that the installed bin needs node >= 18 at runtime"
@@ -1910,6 +1981,7 @@ opt_remote_install() {
 	# 2. clone or update the script-managed clone
 	if [ -e "$REMOTE_CLONE_DIR/.git" ]; then
 		remote_clone_identity_or_die "$REMOTE_CLONE_DIR"
+		remote_clone_resettable_or_die "$REMOTE_CLONE_DIR"
 		log "==> updating script-managed clone at $REMOTE_CLONE_DIR"
 		if ! git -C "$REMOTE_CLONE_DIR" fetch origin main; then
 			warn "$PROG: 'git fetch origin main' failed in $REMOTE_CLONE_DIR (offline?)."
@@ -2456,7 +2528,10 @@ parse_args() {
 			OPT_CHOICE="${1#--choice=}"
 			OPT_YES=1
 			;;
-		--yes) OPT_YES=1 ;;
+		--yes)
+			OPT_YES=1
+			OPT_YES_EXPLICIT=1
+			;;
 		--dry-run) OPT_DRY_RUN=1 ;;
 		--target)
 			if [ "$#" -lt 2 ]; then

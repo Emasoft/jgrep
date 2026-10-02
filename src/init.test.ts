@@ -134,9 +134,9 @@ test("outroLine: mentions the model in play via the chosen provider", () => {
 
 test("skillsInstallCommand: exact installer argv, path with spaces stays one argv element", () => {
   expect(skillsInstallCommand("/repo/skills"))
-    .toEqual(["npx", "-y", "skills", "add", "/repo/skills", "-g", "-y"]);
+    .toEqual(["npx", "-y", "skills@1.7.0", "add", "/repo/skills", "-g", "-y"]); // pinned (audit), same pin as install-dev.sh
   const spaced = "/Users/me/My Code/jgrep/skills";
-  expect(skillsInstallCommand(spaced)).toEqual(["npx", "-y", "skills", "add", spaced, "-g", "-y"]);
+  expect(skillsInstallCommand(spaced)).toEqual(["npx", "-y", "skills@1.7.0", "add", spaced, "-g", "-y"]);
   expect(skillsInstallCommand(spaced)[4]).toBe(spaced); // never re-split: spawned with shell:false
 });
 

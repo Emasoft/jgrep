@@ -121,13 +121,18 @@ export function mergeLegacyEnv(existing: string | null, keyEnv: string, key: str
   return [...kept, `${keyEnv}=${key}`].join("\n") + "\n";
 }
 
+/** The vercel `skills` installer, pinned (audit: `npx -y skills` ran whatever version npm
+ *  served that day — remote code at install time). Bump deliberately after a review; the
+ *  dev installer (install-dev.sh SKILLS_PKG) pins the same version. */
+export const SKILLS_PKG = "skills@1.7.0";
+
 /** Argv for the vercel `skills` universal installer (github.com/vercel-labs/skills):
  *  `-g` installs to user scope (`~/<agent>/skills/`, all detected agent harnesses —
  *  Claude Code, Codex, OpenCode, Cursor, +75 more), `-y` skips every prompt. Returned
  *  as an argv array and spawned with shell:false, so a skill path containing spaces is
  *  passed through verbatim instead of being re-interpreted by a shell. */
 export function skillsInstallCommand(skillDir: string): string[] {
-  return ["npx", "-y", "skills", "add", skillDir, "-g", "-y"];
+  return ["npx", "-y", SKILLS_PKG, "add", skillDir, "-g", "-y"];
 }
 
 /** Canonical standard skills folder (`~/.agents/skills/jgrep`) — where harnesses
@@ -328,10 +333,10 @@ export async function init(argv: string[] = []) {
       const [cmd, ...args] = skillsInstallCommand(skillsRoot);
       const r = spawnSync(cmd, args, { stdio: "inherit", shell: false });
       if (!r.error && r.status === 0) {
-        p.log.success("Skill installed to all detected agents (manage later with `npx skills list`).");
+        p.log.success(`Skill installed to all detected agents (manage later with \`npx ${SKILLS_PKG} list\`).`);
       } else {
         installToAgentsDir(SKILL_SRC, os.homedir());
-        p.log.warn(`fallback: copied the skill to ~/.agents/skills/jgrep (supported by late cli; run 'npx skills add ${skillsRoot} -g' to target specific agents)`);
+        p.log.warn(`fallback: copied the skill to ~/.agents/skills/jgrep (supported by late cli; run 'npx ${SKILLS_PKG} add ${skillsRoot} -g' to target specific agents)`);
       }
     }
     if (legacySkillCopies(os.homedir()).length) {
