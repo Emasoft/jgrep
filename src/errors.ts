@@ -37,7 +37,10 @@ export const NON_RETRYABLE_STATUSES: ReadonlySet<number> = new Set([400, 401, 40
 export const FATAL_KINDS: ReadonlySet<JevErrorKind> = new Set([
   "insufficient_credits", "invalid_api_key", "model_unavailable", "server_unreachable", "tls_error",
 ]);
-export const MODEL_NOT_FOUND_RE = /model not found|no endpoints found/i;
+// "Model X does not exist" is OpenRouter's real answer for a missing model — as HTTP 400,
+// not 404 (live 2026-10-02). Without it a bad --model became a non-fatal bad_request on
+// every batch instead of one fatal model_unavailable with the pin-a-version hint.
+export const MODEL_NOT_FOUND_RE = /model not found|no endpoints found|\bmodel\b[^"]*\bdoes not exist/i;
 
 // ---- classification ----------------------------------------------------------
 

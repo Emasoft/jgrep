@@ -486,3 +486,18 @@ test("verifyApiKey: 401 -> ok:false with the status; transport throw -> status 0
   expect(r2.status).toBe(0);
   expect(r2.model).toBeUndefined();
 });
+
+// ---- OpenRouter review follow-ups (live bodies captured 2026-10-02) ----------------
+
+/** OpenRouter's real answer for a missing model: HTTP 400, an `error.message`, and a
+ *  top-level `user_id` (redacted here) that must never reach jgrep's error output. */
+const OR_MISSING_MODEL = { error: { message: "Model ~typesafe/jev-1.13 does not exist", code: 400 }, user_id: "user_REDACTED123" };
+
+test("M2: OpenRouter 400 'Model X does not exist' -> model_unavailable (fatal), one call", async () => {
+  const { calls, fetchImpl } = scriptedFetch(() => resp(400, OR_MISSING_MODEL));
+  const e = await errOf(postSystemOne({}, BACKENDS.openrouter, "k", { fetchImpl }));
+  expect(e.kind).toBe("model_unavailable");
+  expect(e.hint).toContain("typesafe/jev-1.13");
+  expect(calls.length).toBe(1);
+});
+
