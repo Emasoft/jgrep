@@ -98,8 +98,11 @@ jobs:
       LIMIT: ${{ inputs.limit }}
     steps:
       # Same setup steps as ci.yml (checkout, setup-bun, frozen install).
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      # SHA-pinned (third-party tags are mutable); no token left in .git for the bench steps
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - run: bun install --frozen-lockfile
 
       # ---- typesafe ------------------------------------------------------------
@@ -121,8 +124,10 @@ jobs:
           # cannot auto-pick (or even see) the other provider's key.
           TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
         run: |
+          # inputs.limit is free text and is word-split into argv below: accept digits only
+          case "$LIMIT" in ''|*[!0-9]*) echo "::error::limit must be a whole number (got '$LIMIT')"; exit 1 ;; esac
           ARGS=""
-          if [ -n "$LIMIT" ] && [ "$LIMIT" != "0" ]; then
+          if [ "$LIMIT" != "0" ]; then
             ARGS="--limit $LIMIT"
           fi
           {
@@ -164,8 +169,10 @@ jobs:
           # cannot auto-pick (or even see) the other provider's key.
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
+          # inputs.limit is free text and is word-split into argv below: accept digits only
+          case "$LIMIT" in ''|*[!0-9]*) echo "::error::limit must be a whole number (got '$LIMIT')"; exit 1 ;; esac
           ARGS=""
-          if [ -n "$LIMIT" ] && [ "$LIMIT" != "0" ]; then
+          if [ "$LIMIT" != "0" ]; then
             ARGS="--limit $LIMIT"
           fi
           {
@@ -195,7 +202,7 @@ jobs:
         if: >-
           (matrix.provider == 'typesafe' && env.HAS_TYPESAFE_KEY == 'true') ||
           (matrix.provider == 'openrouter' && env.HAS_OPENROUTER_KEY == 'true')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bench-results-${{ matrix.provider }}
           path: bench/results/*.json

@@ -33,15 +33,18 @@ jobs:
       contents: write   # create the tag + GitHub Release
       id-token: write   # npm Trusted Publishing (OIDC), no token secret
     steps:
-      - uses: actions/checkout@v4
+      # SHA-pinned (third-party tags are mutable). The release step uses GH_TOKEN, not git,
+      # so no credentials need to persist in .git.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.event.pull_request.merge_commit_sha }}
-      - uses: oven-sh/setup-bun@v2
-      - uses: actions/setup-node@v4
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
-      - run: npm install -g npm@latest   # trusted publishing needs npm >= 11.5.1
+      - run: npm install -g npm@12.2.0   # pinned (was @latest); trusted publishing needs npm >= 11.5.1
       - run: bun install --frozen-lockfile
       - run: bun test src/
       - run: bun run build
