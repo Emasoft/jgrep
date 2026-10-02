@@ -1,5 +1,11 @@
 # Implementation Plan — jgrep v0.4.0 (Issue #1: WI-11 + WI-12 + WI-1 + WI-8)
 
+> **HISTORICAL DOCUMENT — not current behaviour.** This is the v0.4.0 design plan, kept for
+> the record. The code has moved on since (see CHANGELOG.md): notably the OpenRouter startup
+> probe and the `--no-probe` flag described in the original plan were removed — the first
+> batch's error goes through the typed classifier instead — and those passages are struck
+> below. For current flags run `jgrep --help`.
+
 Source of truth: **Emasoft/jgrep issue #1** ("Proposal: OpenRouter support + closing the gaps vs the line-based jgrep"). This plan implements the issue's own first milestone:
 
 > `v0.4.0`: **WI-11** (timeouts/backoff/retry) + **WI-12** (error taxonomy, circuit breaker, partial-failure isolation) + **WI-1** (multi-provider layer) + **WI-8** (accuracy benchmark harness) — "a robust provider layer comes first — nothing else matters if requests fail opaquely".
@@ -35,7 +41,7 @@ src/pool.ts        NEW  runPool(): shared worker pool with partial-failure isola
 src/jgrep.ts       EDIT becomes orchestration: chunking, diff, buildRequest(model),
                         cache (key uses backend.model), batch deadline wiring, Result{...,errors,cost}
 src/rows.ts        EDIT same rewiring; rows key uses model; pool isolation
-src/cli.ts         EDIT new flags, provider resolution + openrouter startup probe,
+src/cli.ts         EDIT new flags, provider resolution (no startup probe — removed),
                         errors[] in --json, summary with error breakdown, exit codes, cache in finally
 src/init.ts        EDIT per-provider key setup
 bench/             NEW  fixtures + accuracy.ts + code_selection.ts + results/
@@ -92,7 +98,7 @@ export interface Result {
 
 **New env vars:** `JEV_API`, `JEV_MODEL`, `JEV_PRICE_PER_MTOK` (default `0.042`, replaces hardcoded `USD_PER_M_INPUT`), `JEV_GATEWAY_URL`, `JEV_GATEWAY_API_KEY`.
 
-**New CLI flags:** `--api {typesafe,openrouter,gateway}` · `--model ID` · `--timeout SECONDS` (per-batch deadline **including retries**, default **15**, per issue) · `--request-timeout SECONDS` (per attempt, default **30**) · `--retries N` (default **4** → 5 total attempts) · `--rate REQ/SEC` (token-bucket global pacing, default 0 = unlimited) · `--fail-fast` (abort on first fatal = today's behavior) · `--no-probe` (skip the OpenRouter startup probe).
+**New CLI flags:** `--api {typesafe,openrouter,gateway}` · `--model ID` · `--timeout SECONDS` (per-batch deadline **including retries**, default **15**, per issue) · `--request-timeout SECONDS` (per attempt, default **30**) · `--retries N` (default **4** → 5 total attempts) · `--rate REQ/SEC` (token-bucket global pacing, default 0 = unlimited) · `--fail-fast` (abort on first fatal = today's behavior). (`--no-probe` was planned here and later removed together with the probe.)
 
 ### 1.5 Error mapping (WI-12 taxonomy)
 
@@ -121,7 +127,7 @@ export interface Result {
 
 1. **Per-chunk deadline adapted to batching.** The issue's `--timeout 15` is defined per chunk in the sibling tool; here one request judges up to 16 chunks, so the deadline is enforced **per batch** (all retries included). When it expires, every chunk in the batch is recorded as `timeout` and the worker moves on. Per-attempt signal = `min(--request-timeout, remaining deadline)`.
 2. **`--json` becomes an object** `{ hits: [...], errors: [...] }` (a bare array cannot "gain" `errors[]`). Documented as a breaking change in the README (pre-1.0, acceptable). Rows mode `--json` becomes `{ answers: [...], errors: [...] }` symmetrically.
-3. **Startup probe only for `openrouter` by default** (the issue flags the `alpha` surface as the risk): one cheap `verifyApiKey` ping before the run; `--no-probe` skips it; probe failure is fatal with the pin-version / `--api typesafe` hint. typesafe/gateway skip the probe (stable/known surfaces). Rationale: a probe on every run for every provider would add latency for no protection.
+3. ~~Startup probe for `openrouter`~~ — **removed.** OpenRouter moved to the stable `/api/v1/systemone` path and a billed ping misreported 401/402/transient failures; there is no probe and no `--no-probe` flag.
 4. **Cache keys use `backend.model`** (not a global `MODEL` const): sha1 of `` `${model}\0${kind}\0${q}\0${c.text}` ``. typesafe and gateway both default to `jev-latest` and intentionally share cache entries (same underlying model); openrouter's `~typesafe/jev-latest` keys differ.
 5. **Key storage is backward compatible:** existing `~/.config/jgrep/env` (written by today's `jgrep init`) keeps working; new init writes per-provider `<name>.key` files. `chmod 600` is a no-op on Windows → warn (per issue amendment).
 6. **Env naming follows the issue exactly** (`JEV_*`), even though the repo also has `JGREP_NO_MAIN`; `JGREP_NO_MAIN` is a test-only guard and stays as is.
@@ -205,7 +211,7 @@ Each step = exactly one `coder` subagent invocation. Steps are dependency-ordere
 
 - [ ] **Step 7: `src/cli.ts` — flags, provider resolution, output, exit codes**
   - *Context*: The user-facing surface of WI-1 + WI-12.
-  - *Instruction*: `parse()` (44-74) gains: `--api <name>` (validated; unknown → error listing `typesafe, openrouter, gateway`), `--model <id>`, `--timeout <s>` (default 15), `--request-timeout <s>` (default 30), `--retries <n>` (default 4), `--rate <req/s>`, `--fail-fast`, `--no-probe`; extend the numeric-validation at line 72 to the new numerics. `main()` (76-107): `resolveProvider(o.api)` → if backend is `openrouter` and `!o.noProbe`, run `verifyApiKey` once and turn failure into a fatal with the pin-model/`--api typesafe` hint; `model = o.model ?? env.JEV_MODEL ?? backend.model`; pass `{...o, backend, model, timeoutSec, ...}` into both `jgrep()` and `scoreRows`; **wrap the run in `try/finally` and `saveCache` in `finally`** (replaces line 90); render: `--json` emits `{ hits, errors }` (rows mode: `{ answers, errors }`); grep-style output unchanged for hits, plus after the summary line, when `errors.length > 0`, print to stderr a red breakdown; summary line becomes `` `${hits} hits / ${chunks} chunks (${cached} cached) · ${tokens} tokens · $${cost} · ${secs}s` `` where `cost` = provider-reported `result.cost` if present else `tokens * resolvePricePerMtok() / 1e6` (replaces cli.ts:104 math), appended with ` · ${errors.length} errored (${kindCounts})` when errors exist; error hints: when the caught/thrown error is `JevProviderError` kind `invalid_api_key`, prepend `hadSuccess ? "key worked earlier this run (expired/revoked?)" : "check you're using <provider>'s key"`. Exit codes: **2 when `errors.length > 0` or a fatal was thrown; else 0/1 grep semantics** (update the USAGE exit-status text). Update the `USAGE` string (7-39) with all new flags + provider precedence one-liner. Tests: `--api unknown` error text lists choices; `--timeout`/`--rate` numeric validation; `--model`/`--api` parsed; `JGREP_NO_MAIN` import pattern still works.
+  - *Instruction*: `parse()` (44-74) gains: `--api <name>` (validated; unknown → error listing `typesafe, openrouter, gateway`), `--model <id>`, `--timeout <s>` (default 15), `--request-timeout <s>` (default 30), `--retries <n>` (default 4), `--rate <req/s>`, `--fail-fast`; extend the numeric-validation at line 72 to the new numerics. `main()` (76-107): `resolveProvider(o.api)` (the planned OpenRouter probe was later removed); `model = o.model ?? env.JEV_MODEL ?? backend.model`; pass `{...o, backend, model, timeoutSec, ...}` into both `jgrep()` and `scoreRows`; **wrap the run in `try/finally` and `saveCache` in `finally`** (replaces line 90); render: `--json` emits `{ hits, errors }` (rows mode: `{ answers, errors }`); grep-style output unchanged for hits, plus after the summary line, when `errors.length > 0`, print to stderr a red breakdown; summary line becomes `` `${hits} hits / ${chunks} chunks (${cached} cached) · ${tokens} tokens · $${cost} · ${secs}s` `` where `cost` = provider-reported `result.cost` if present else `tokens * resolvePricePerMtok() / 1e6` (replaces cli.ts:104 math), appended with ` · ${errors.length} errored (${kindCounts})` when errors exist; error hints: when the caught/thrown error is `JevProviderError` kind `invalid_api_key`, prepend `hadSuccess ? "key worked earlier this run (expired/revoked?)" : "check you're using <provider>'s key"`. Exit codes: **2 when `errors.length > 0` or a fatal was thrown; else 0/1 grep semantics** (update the USAGE exit-status text). Update the `USAGE` string (7-39) with all new flags + provider precedence one-liner. Tests: `--api unknown` error text lists choices; `--timeout`/`--rate` numeric validation; `--model`/`--api` parsed; `JGREP_NO_MAIN` import pattern still works.
 
 - [ ] **Step 8: `src/init.ts` — per-provider key setup**
   - *Context*: `jgrep init` must provision any of the three backends.
