@@ -1,7 +1,7 @@
 import { test, expect } from "bun:test";
 import path from "node:path";
 import os from "node:os";
-import { findTestFiles, signature, directMatches, changedFilesOf, compactDiff, selectTests } from "./tests";
+import { findTestFiles, signature, directMatches, changedFilesOf, compactDiff, compactDiffParts, selectTests } from "./tests";
 import { BACKENDS } from "./providers";
 
 test("findTestFiles matches common layouts across stacks", () => {
@@ -20,15 +20,23 @@ test("directMatches pairs changed sources with same-stem tests and includes chan
   expect([...directMatches(changed, tests)].sort()).toEqual(["src/cli.test.ts", "src/rows.test.ts", "tests/test_parser.py"]);
 });
 
-test("compactDiff lists changed files, keeps changed lines only, drops lockfiles/docs, caps per file", () => {
+test("compactDiff lists changed files, keeps changed lines only, drops lockfiles/docs, never truncates", () => {
   const diff = "diff --git a/x.ts b/x.ts\n--- a/x.ts\n+++ b/x.ts\n@@ -1,3 +1,3 @@\n ctx\n-old\n+new\n ctx2\n+++ b/package-lock.json\n+" + "j".repeat(5000) + "\n+++ b/README.md\n+docs\n";
   const c = compactDiff(diff);
   expect(c.startsWith("changed files:\n  x.ts\n")).toBe(true);
   expect(c).toContain("+++ x.ts\n@@ -1,3 +1,3 @@\n-old\n+new");
   expect(c).not.toContain("package-lock"); expect(c).not.toContain("README");
   const big = "+++ b/a.ts\n+" + "a".repeat(5000) + "\n+++ b/b.ts\n+bbb\n";
-  const cb = compactDiff(big, 3000);
-  expect(cb).toContain("(truncated)"); expect(cb).toContain("+++ b.ts\n+bbb"); // b survives a's size
+  const cb = compactDiff(big);
+  expect(cb).not.toContain("(truncated)"); expect(cb).toContain("+" + "a".repeat(5000)); expect(cb).toContain("+++ b.ts\n+bbb"); // all of a, and b
+  // over the part budget: split into parts (USER: split, never truncate) — every byte of a still sent, b too
+  const parts = compactDiffParts(big, 2000);
+  expect(parts.length).toBeGreaterThan(1);
+  expect(parts.every((p) => p.startsWith("changed files:\n  a.ts\n  b.ts"))).toBe(true);
+  expect(parts.map((p) => p.split("\n").filter((l) => /^\+?a+$/.test(l)).join("")).join("").replace(/\+/g, "").length).toBeGreaterThanOrEqual(5000);
+  expect(parts.some((p) => p.includes("+++ b.ts\n+bbb"))).toBe(true);
+  // content lines that look like headers are kept: "+--flag" and an empty "+" line
+  expect(compactDiff("+++ b/c.sh\n@@ -1 +1,2 @@\n+--flag\n+\n")).toContain("+--flag\n+");
   expect(changedFilesOf(diff)).toEqual(["x.ts", "package-lock.json", "README.md"]);
 });
 

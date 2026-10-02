@@ -13,7 +13,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, KEY_WORKED_EARLIER_HINT,
-  BudgetMeter, diffHeaderPath, listFiles, settledCost, withinSize, type Cache, type Estimate, type ListOptions,
+  BudgetMeter, MAX_REQUEST_BYTES, byteLen, diffHeaderPath, fitChunk, lineWindows, listFiles, packBatches, settledCost, splitLongLine, withinSize, type Cache, type Estimate, type ListOptions,
 } from "./jgrep";
 import { BACKENDS, DEFAULT_PRICE_PER_MTOK, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
 import { runPool, type PoolResult } from "./pool";
@@ -35,8 +35,10 @@ export function findTestFiles(files: string[]): string[] {
 /** Imports plus test/describe names: enough for Jev to know what the file exercises, ~5% of its tokens. */
 export function signature(file: string, text = fs.readFileSync(file, "utf8")): string {
   const keep = /^\s*(}\s*from\s+["']|export .+ from |.*\bimport\(\s*["']|import |from .+ import |const .+ = require\(|require\(|use |using |package |describe\(|it\(|test\(|it\.each|test\.each|def test_|async def test_|func Test|fn test_|#\[test\]|@Test|class .*Test|context\(|scenario\(|feature\()/;
-  const lines = text.split("\n").filter((l) => keep.test(l)).map((l) => l.trim().slice(0, 160));
-  return lines.slice(0, 60).join("\n");
+  // Every matching line, whole (USER 2026-10-02: never truncate to fit the context — the
+  // old 60-line / 160-char clip dropped the test names of big suites). selectTests splits
+  // an oversized signature into parts and takes the best part's verdict.
+  return text.split("\n").filter((l) => keep.test(l)).map((l) => l.trim()).join("\n");
 }
 
 const stem = (f: string) => path.basename(f).replace(/[._](test|spec|tst|test-d)\.[cm]?[jt]sx?$|_(test|spec)\.(py|go|rb|exs)$|^test_|\.[^.]+$/g, "").toLowerCase();
@@ -58,7 +60,10 @@ const NOISE_RE = /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lock
 
 /** Keep only what Jev needs from a diff: source files only, changed lines only, a per-file cap so one
  *  large file cannot starve the others, and the full changed-file list up front. */
-export function compactDiff(diff: string, maxChars = 8000, perFile = 2000): string {
+/** Changed source files and their changed lines (hunk headers, `+` and `-` lines), lockfiles
+ *  and docs dropped (NOISE_RE). A `+`/`-` content line is never mistaken for a `+++`/`---`
+ *  file header (the old `[+-][^+-]` filter dropped real lines such as `+--flag` and `+`). */
+function diffFilesOf(diff: string): { name: string; lines: string[] }[] {
   const files: { name: string; lines: string[] }[] = [];
   let cur: { name: string; lines: string[] } | null = null;
   for (const l of diff.split("\n")) {
@@ -68,18 +73,44 @@ export function compactDiff(diff: string, maxChars = 8000, perFile = 2000): stri
       if (cur) files.push(cur);
       continue;
     }
-    if (cur && /^(@@ |[+-][^+-])/.test(l)) cur.lines.push(l);
+    if (cur && (l.startsWith("@@ ") || (l.startsWith("+") && !l.startsWith("+++ ")) || (l.startsWith("-") && !l.startsWith("--- ")))) cur.lines.push(l);
   }
+  return files;
+}
+
+/** The whole compact diff: the changed-file list, then every changed line per file. Never
+ *  truncated (USER 2026-10-02) — compactDiffParts splits it to fit the context. */
+export function compactDiff(diff: string): string {
+  const files = diffFilesOf(diff);
   const header = "changed files:\n" + files.map((f) => "  " + f.name).join("\n") + "\n\n";
-  const budget = Math.max(1000, maxChars - header.length);
-  const per = Math.min(perFile, Math.floor(budget / Math.max(1, files.length)));
-  let body = "";
-  for (const f of files) {
-    let chunk = `+++ ${f.name}\n` + f.lines.join("\n");
-    if (chunk.length > per) chunk = chunk.slice(0, per) + "\n... (truncated)";
-    body += chunk + "\n";
+  return (header + files.map((f) => `+++ ${f.name}\n` + f.lines.join("\n")).join("\n")).trim();
+}
+
+/** Bytes of compact diff per request part, leaving room for a pack of test signatures. */
+export const DIFF_PART_BYTES = 16_000;
+
+/** The compact diff in context-sized PARTS (USER: split, never truncate): every part repeats
+ *  the changed-file list; the per-file bodies are cut at line boundaries with a small
+ *  overlap, a part that starts inside a file re-states its `+++ name (continued)` line,
+ *  and a giant single line is cut by characters. A small diff is ONE part, equal to
+ *  compactDiff(). ponytail: a changed-file list alone over the budget is not split. */
+export function compactDiffParts(diff: string, maxBytes: number = DIFF_PART_BYTES): string[] {
+  const files = diffFilesOf(diff);
+  const header = "changed files:\n" + files.map((f) => "  " + f.name).join("\n") + "\n\n";
+  const body: { file: string; text: string }[] = files.flatMap((f) => [{ file: f.name, text: `+++ ${f.name}` }, ...f.lines.map((text) => ({ file: f.name, text }))]);
+  const whole = (header + body.map((b) => b.text).join("\n")).trim();
+  if (byteLen(whole) <= maxBytes) return [whole];
+  const budget = Math.max(1000, maxBytes - byteLen(header) - 300); // 300: room for a "(continued)" line
+  const parts: string[] = [];
+  for (const [i, j] of lineWindows(body.map((b) => b.text), budget)) {
+    const lead = body[i].text.startsWith("+++ ") ? [] : [`+++ ${body[i].file} (continued)`];
+    if (j === i + 1 && byteLen(body[i].text) + 1 > budget) {
+      for (const piece of splitLongLine(body[i].text, budget)) parts.push((header + [...lead, piece].join("\n")).trim());
+      continue;
+    }
+    parts.push((header + [...lead, ...body.slice(i, j).map((b) => b.text)].join("\n")).trim());
   }
-  return (header + body).trim();
+  return parts;
 }
 
 /** Tests whose import lines reference a changed source file (by path segment or stem): selected in code, no Jev. */
@@ -179,11 +210,13 @@ export interface SelectOptions {
 export interface SelectResult { selected: Selected[]; all: Selected[]; tokens: number; cost?: number; requests: number; cached: number; errors: TestError[] }
 
 /** One request-pack's outcome; runPool results are completion-ordered, so the batch
- *  index rides along and `all` is re-associated after the pool settles. A partial 200
- *  (the provider answered some tests but not others) is NOT an answer: unanswered test
- *  indices come back in `malformed` and become malformed_response errors — never a
- *  p:NaN entry in all/selected. */
-interface BatchOutcome { index: number; entries: { testIndex: number; p: number }[]; malformed: number[] }
+ *  index rides along. Entries and malformed refer to UNIT indices (see selectTests). A
+ *  partial 200 (some units unanswered) is NOT an answer: those units come back in
+ *  `malformed` and their tests become malformed_response errors — never p:NaN. */
+interface BatchOutcome { index: number; entries: { unit: number; p: number }[]; malformed: number[] }
+
+/** A test signature over this many bytes is judged in parts (best part wins). */
+export const SIG_PART_BYTES = 8_000;
 
 export async function selectTests(diff: string, tests: TestFile[], o: SelectOptions): Promise<SelectResult> {
   // Same resolution as scoreRows(): explicit backend wins, else typesafe; --model > $JEV_MODEL > the backend's default.
@@ -193,30 +226,52 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
   const apiKeyOf = (): string => { apiKey ??= resolveApiKey(backend); return apiKey; };
   const f = o.fetchImpl ?? fetch;
   const cache = o.cache ?? {};
-  const compact = compactDiff(diff);
   const changed = changedFilesOf(diff);
   const direct = directMatches(changed, tests.map((t) => t.file));
   const viaImport = importMatches(changed, tests);
   const viaPackage = packageMatches(changed, tests);
-  const diffHash = createHash("sha1").update(compact).digest("hex");
+  // USER 2026-10-02: never truncate to fit the context — split, and a per-FILE verdict is
+  // the best part's ("consider the highest scored chunk"). The compact diff is cut into
+  // context-sized parts and an oversized signature into parts; every (diff part, signature
+  // part) pair of a test is one UNIT, judged on its own; the test's p is the max over its
+  // units. A small diff and signature are one unit: the old one-question-per-test shape.
+  const parts = compactDiffParts(diff);
+  const partHash = parts.map((d) => createHash("sha1").update(d).digest("hex"));
+  const sigParts = (t: TestFile) => (t.signature ? fitChunk({ file: t.file, start: 1, end: 1, text: t.signature }, "code", SIG_PART_BYTES).map((c) => c.text) : [""]);
   // Model-scoped keys (same rule as jgrep()/rows): a different model re-judges.
-  const key = (t: TestFile) => createHash("sha1").update(`${model}\0tests\0${diffHash}\0${t.file}\0${t.signature}`).digest("hex");
+  const key = (file: string, part: number, sig: string) => createHash("sha1").update(`${model}\0tests\0${partHash[part]}\0${file}\0${sig}`).digest("hex");
 
   const all: (Selected | undefined)[] = new Array(tests.length); // errored tests stay unset
-  const todo: number[] = [];
+  const units: { test: number; part: number; sig: string; key: string }[] = [];
+  const best = new Map<number, number>();      // test -> best p so far (cached + answered units)
+  const pending = new Map<number, number>();   // test -> units still to be judged
+  let fromCache = 0;
   tests.forEach((t, i) => {
-    if (direct.has(t.file)) all[i] = { file: t.file, p: 1, reason: "direct" };
-    else if (viaImport.has(t.file)) all[i] = { file: t.file, p: 1, reason: "import" };
-    else if (viaPackage.has(t.file)) all[i] = { file: t.file, p: 1, reason: "package" };
-    else if (typeof cache[key(t)] === "number") all[i] = { file: t.file, p: cache[key(t)], reason: "cached" };
-    else todo.push(i);
+    if (direct.has(t.file)) { all[i] = { file: t.file, p: 1, reason: "direct" }; return; }
+    if (viaImport.has(t.file)) { all[i] = { file: t.file, p: 1, reason: "import" }; return; }
+    if (viaPackage.has(t.file)) { all[i] = { file: t.file, p: 1, reason: "package" }; return; }
+    let open = 0;
+    for (let k = 0; k < parts.length; k++) for (const sig of sigParts(t)) {
+      const ck = key(t.file, k, sig);
+      const p = cache[ck];
+      if (typeof p === "number" && Number.isFinite(p)) best.set(i, Math.max(best.get(i) ?? -Infinity, p));
+      else { units.push({ test: i, part: k, sig, key: ck }); open++; }
+    }
+    if (open === 0) { all[i] = { file: t.file, p: best.get(i)!, reason: "cached" }; fromCache++; }
+    else pending.set(i, open);
   });
   // Defensive normalization (same rule as jgrep()/scoreRows()): a 0/fractional batch
   // would spin the batching loop forever (+= 0) or overlap batches. parse() rejects
   // those; library callers get floored and clamped at 1 instead.
   const batch = Math.max(1, Math.floor(o.batch));
+  // One request carries ONE diff part: group the units by part, then pack each group by
+  // count AND bytes (diff part + signatures within MAX_REQUEST_BYTES).
+  const QUESTION_BYTES = 320; // the per-test instruction text, generously
   const batches: number[][] = [];
-  for (let i = 0; i < todo.length; i += batch) batches.push(todo.slice(i, i + batch));
+  for (let k = 0; k < parts.length; k++) {
+    const ofPart = units.map((u, ui) => (u.part === k ? ui : -1)).filter((ui) => ui >= 0);
+    batches.push(...packBatches(ofPart, batch, MAX_REQUEST_BYTES - byteLen(parts[k]) - 200, (ui) => byteLen(JSON.stringify({ id: "t00", file: tests[units[ui].test].file, signature: units[ui].sig })) + QUESTION_BYTES));
+  }
   // Same defaults and PostOpts wiring as jgrep()/scoreRows() — resolved once, read-only in the worker.
   const timeoutMs = (o.timeoutSec ?? DEFAULT_TIMEOUT_SEC) * 1000;
   const post: PostOpts = {
@@ -237,7 +292,7 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
   // meter as jgrep()/scoreRows(); no budget = no meter.
   const meter = o.meter ?? (o.budget !== undefined ? new BudgetMeter(o.budget, price) : undefined);
   const worker = async (b: number[], index: number): Promise<BatchOutcome> => {
-    const state = { diff: compact, tests: b.map((i, j) => ({ id: `t${j}`, file: tests[i].file, signature: tests[i].signature })) };
+    const state = { diff: parts[units[b[0]].part], tests: b.map((ui, j) => ({ id: `t${j}`, file: tests[units[ui].test].file, signature: units[ui].sig })) };
     const questions: Record<string, unknown> = {};
     b.forEach((_, j) => {
       questions[`t${j}`] = { type: "noul", instructions: `Look only at the test file with id "t${j}". Given the diff, is this test plausibly affected by the change: it imports or exercises a changed module or function, or asserts behaviour the diff alters? Unrelated tests should be no.` };
@@ -254,14 +309,14 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
     cost = (cost ?? 0) + settledCost(res, price);
     // Finite p-values go straight into the in-memory cache object: cli.ts persists it in
     // a finally, so answers paid for survive even when other batches fail.
-    const entries: { testIndex: number; p: number }[] = [];
+    const entries: { unit: number; p: number }[] = [];
     const malformed: number[] = [];
-    b.forEach((ti, j) => {
+    b.forEach((ui, j) => {
       const p = res.answers[`t${j}`]?.noul;
       if (Number.isFinite(p)) {
-        cache[key(tests[ti])] = p;
-        entries.push({ testIndex: ti, p });
-      } else malformed.push(ti);
+        cache[units[ui].key] = p;
+        entries.push({ unit: ui, p });
+      } else malformed.push(ui);
     });
     hadSuccess = true; // this batch's request succeeded — set before returning
     return { index, entries, malformed };
@@ -281,7 +336,13 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
       e.hint = [e.hint, KEY_WORKED_EARLIER_HINT].filter(Boolean).join(" ");
     throw e;
   }
-  for (const r of pool.results) for (const e of r.entries) all[e.testIndex] = { file: tests[e.testIndex].file, p: e.p, reason: "jev" };
+  // A test's verdict needs ALL its units: then p = the best unit's (max over parts).
+  for (const r of pool.results) for (const e of r.entries) {
+    const t = units[e.unit].test;
+    best.set(t, Math.max(best.get(t) ?? -Infinity, e.p));
+    pending.set(t, pending.get(t)! - 1);
+  }
+  for (const [t, open] of pending) if (open === 0) all[t] = { file: tests[t].file, p: best.get(t)!, reason: "jev" };
   // Not failFast: recorded 401/403s get the same expired-vs-wrong-key distinction. One
   // clean place — mutate the JevProviderError's hint in pool.errors BEFORE mapping onto
   // tests, so the amended hint is what TestError carries down to the CLI.
@@ -290,36 +351,36 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
       if (e.error.kind === "invalid_api_key") e.error.hint = [e.error.hint, KEY_WORKED_EARLIER_HINT].filter(Boolean).join(" ");
     }
   }
-  const errors: TestError[] = pool.errors.flatMap((e) =>
-    batches[e.index].map((ti) => ({
-      file: tests[ti].file, kind: e.error.kind, message: e.error.message,
+  // One error per test (a test judged in several units may fail in several packs).
+  const errors: TestError[] = [];
+  const failed = new Set<number>();
+  const fail = (t: number, err: Omit<TestError, "file">) => { if (failed.has(t)) return; failed.add(t); errors.push({ file: tests[t].file, ...err }); };
+  for (const e of pool.errors)
+    for (const ui of batches[e.index])
       // The provider error's actionable hint rides along (cli.ts prints it under the
       // error line) — incl. the KEY_WORKED_EARLIER_HINT amended above.
-      ...(e.error.hint !== undefined ? { hint: e.error.hint } : {}),
-    })));
+      fail(units[ui].test, { kind: e.error.kind, message: e.error.message, ...(e.error.hint !== undefined ? { hint: e.error.hint } : {}) });
   // A 200 that answered only some tests of a batch: the unanswered tests are recorded
   // per test here (the batch itself succeeded, so the pool saw no error).
   for (const r of pool.results)
-    for (const ti of r.malformed)
-      errors.push({ file: tests[ti].file, kind: "malformed_response", message: "provider returned no usable answer for this test" });
+    for (const ui of r.malformed) fail(units[ui].test, { kind: "malformed_response", message: "provider returned no usable answer for this test" });
   if (pool.aborted) {
     // Batches that were dispatched all reported (success or their own error); whatever
     // was never attempted is reported as a breaker error. No cache entries, no answers.
     const settled = new Set<number>(pool.results.map((r) => r.index).concat(pool.errors.map((e) => e.index)));
     for (let bi = 0; bi < batches.length; bi++) {
       if (settled.has(bi)) continue;
-      for (const ti of batches[bi]) errors.push({ file: tests[ti].file, kind: "circuit_breaker_open", message: "not attempted: provider failing consistently (circuit breaker open)" });
+      for (const ui of batches[bi]) fail(units[ui].test, { kind: "circuit_breaker_open", message: "not attempted: provider failing consistently (circuit breaker open)" });
     }
   }
   // Errored tests never enter all/selected (same rule as jgrep()'s errored chunks);
   // they surface through the returned errors and the caller's exit code.
   const answered = all.filter((s): s is Selected => s !== undefined);
   const selected = answered.filter((s) => s.p >= o.threshold).sort((a, b) => b.p - a.p);
-  const byCode = answered.filter((s) => s.reason === "direct" || s.reason === "import" || s.reason === "package").length;
   // `requests` counts only packs actually sent (same rule as scoreRows): packs the breaker
   // never dispatched and packs --budget refused before sending are not requests.
   const budgetRefused = pool.errors.filter((e) => e.error.kind === "budget_exhausted").length;
-  return { selected, all: answered, tokens, ...(cost !== undefined ? { cost } : {}), requests: batches.length - (pool.aborted ? pool.unprocessed : 0) - budgetRefused, cached: tests.length - byCode - todo.length, errors };
+  return { selected, all: answered, tokens, ...(cost !== undefined ? { cost } : {}), requests: batches.length - (pool.aborted ? pool.unprocessed : 0) - budgetRefused, cached: fromCache, errors };
 }
 
 export function loadTests(paths: string[] = ["."], opts: ListOptions = {}): TestFile[] {

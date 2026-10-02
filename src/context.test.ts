@@ -136,3 +136,46 @@ test("--rows: ONE row over the context is judged in parts; noul = best part, cho
   expect(r.answers[0]!.topic.choice).toBe("beauty"); // label of the most confident part (0.9 > 0.6)
 });
 
+test("--tests: a big diff is never truncated — it is split into parts, and a test's p is its best part", async () => {
+  const fileA = Array.from({ length: 2000 }, (_, i) => `+export const a${i} = ${i}; // filler line`).join("\n");
+  const diff = `diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1,2000 @@\n${fileA}\ndiff --git a/src/b.ts b/src/b.ts\n--- a/src/b.ts\n+++ b/src/b.ts\n@@ -1 +1 @@\n+export const NEEDLE = 1;\n`;
+  expect(compactDiff(diff)).not.toContain("(truncated)"); // before: capped at 8000 chars / 2000 per file
+  const bodies: string[] = [];
+  const fetchImpl = (async (_u: unknown, init: { body: string }) => {
+    bodies.push(init.body);
+    const body = JSON.parse(init.body);
+    const answers: Record<string, unknown> = {};
+    for (const t of body.state.tests) answers[t.id] = { type: "noul", noul: body.state.diff.includes("NEEDLE") ? 0.9 : 0.1 };
+    return new Response(JSON.stringify({ answers, usage: { input_tokens: 1 } }), { status: 200 });
+  }) as unknown as Fetch;
+  const tests = [{ file: "spec/x.test.ts", signature: 'describe("x")' }];
+  const r = await selectTests(diff, tests, { threshold: 0.5, batch: 16, concurrency: 2, apiKey: "k", fetchImpl, cache: {} });
+  const sentDiff = bodies.map((b) => JSON.parse(b).state.diff).join("\n");
+  for (const l of fileA.split("\n")) expect(sentDiff.includes(l)).toBe(true); // every changed line reached the provider
+  for (const b of bodies) expect(bytes(b)).toBeLessThanOrEqual(MAX_REQUEST_BYTES);
+  expect(r.selected.map((s) => s.file)).toEqual(["spec/x.test.ts"]); // NEEDLE was in a later part: max over parts
+  expect(r.selected[0].p).toBe(0.9);
+});
+
+test("--tests: a big suite's signature is never clipped — it is judged in parts and the best part decides", async () => {
+  const { signature } = await import("./tests");
+  const src = [`import { other } from "./other";`, ...Array.from({ length: 400 }, (_, i) => `it("case number ${i} does a perfectly ordinary thing", () => {});`), `it("handles the NEEDLE path", () => {});`].join("\n");
+  const sig = signature("spec/big.test.ts", src);
+  expect(sig.split("\n")).toHaveLength(402); // before: clipped to the first 60 lines, NEEDLE gone
+  expect(sig).toContain("NEEDLE");
+  const bodies: string[] = [];
+  const fetchImpl = (async (_u: unknown, init: { body: string }) => {
+    bodies.push(init.body);
+    const body = JSON.parse(init.body);
+    const answers: Record<string, unknown> = {};
+    for (const t of body.state.tests) answers[t.id] = { type: "noul", noul: t.signature.includes("NEEDLE") ? 0.8 : 0.2 };
+    return new Response(JSON.stringify({ answers, usage: { input_tokens: 1 } }), { status: 200 });
+  }) as unknown as Fetch;
+  const diff = "diff --git a/src/w.ts b/src/w.ts\n--- a/src/w.ts\n+++ b/src/w.ts\n@@ -1 +1 @@\n+export const w = 1;\n";
+  const r = await selectTests(diff, [{ file: "spec/big.test.ts", signature: sig }], { threshold: 0.5, batch: 16, concurrency: 1, apiKey: "k", fetchImpl, cache: {} });
+  const sentSigs = bodies.flatMap((b) => JSON.parse(b).state.tests.map((t: { signature: string }) => t.signature)).join("\n");
+  for (const l of sig.split("\n")) expect(sentSigs.includes(l)).toBe(true);
+  for (const b of bodies) expect(bytes(b)).toBeLessThanOrEqual(MAX_REQUEST_BYTES);
+  expect(r.selected).toHaveLength(1);
+  expect(r.selected[0].p).toBe(0.8); // the best part's verdict, not the first part's 0.2
+});
