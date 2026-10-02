@@ -446,7 +446,9 @@ full.
   search only on the files whose signatures matched, so the search cost tracks
   the shortlist instead of the whole tree. Files in unsupported languages (see
   `funcs.ts` for the extension map) and files with no extractable signatures are
-  skipped in `--funcs` mode — pass 1 cannot shortlist what it never saw.
+  skipped in `--funcs` mode — pass 1 cannot shortlist what it never saw. A file
+  whose signature request failed is reported as an error (exit 2) rather than
+  silently left out, and the summary counts both passes' tokens and cost.
 - `--tag "best-effort cleanup,real bug"` classifies the standing hits with one
   `choice` question per hit (batched like the search, at most 16 hits per
   request): the winning category prints after the `p` column (`[real bug]`) and

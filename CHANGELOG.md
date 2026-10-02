@@ -47,7 +47,9 @@ isolation), and WI-12 (benchmarks); markdown chunking ships here too.
   signature chunk per file (tree-sitter is a future upgrade; the regexes are
   the documented fallback) and judges those first; pass 2 runs the normal
   chunk search only on the shortlisted files. Files in unsupported languages
-  and files with no extractable signatures are skipped.
+  and files with no extractable signatures are skipped. A file whose
+  signature request failed is reported as an error (exit 2), pass-1 tokens and
+  cost are counted in the summary, and both passes share one `--budget`.
 - **Cost controls & SARIF** (WI-7): `--estimate` text output gains a per-file
   chunk table above the estimated requests/tokens/cost line (one dry-run
   implementation for every mode, see the upstream entry above); `--budget <usd>` is an opt-in hard spend

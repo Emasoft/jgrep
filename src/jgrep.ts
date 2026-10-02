@@ -468,6 +468,7 @@ export interface Options {
   envelopes?: boolean;         // --envelopes (WI-9): append each chunk's numbers ("[numbers: 42, 7]") to the judged text
   budget?: number;             // --budget (WI-7): once metered cost exceeds this many dollars, un-run chunks error budget_exhausted
   pricePerMtok?: number;       // $/Mtok for the --budget meter when the provider reports no cost (default DEFAULT_PRICE_PER_MTOK)
+  meter?: BudgetMeter;         // internal: a meter shared across runs (jgrepFuncs' two passes); else built from budget
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
 export interface ChunkError { file: string; start: number; end: number; kind: JevErrorKind; message: string; hint?: string }
@@ -560,7 +561,7 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
   let tokens = 0;
   let cost: number | undefined; // stays undefined unless a provider reports a cost
   // --budget (B1): one meter for the main, verify and tag passes; none without a budget.
-  const meter = o.budget !== undefined ? new BudgetMeter(o.budget, o.pricePerMtok ?? DEFAULT_PRICE_PER_MTOK) : undefined;
+  const meter = o.meter ?? (o.budget !== undefined ? new BudgetMeter(o.budget, o.pricePerMtok ?? DEFAULT_PRICE_PER_MTOK) : undefined);
   /** Every provider request of this run goes through here: per-batch deadline (retries
    *  included, §1.6.1), lazy key, and the budget reservation when a budget is set. */
   const send = (req: unknown) => {
@@ -836,10 +837,13 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
  *
  * Files in unsupported languages (funcs.detectLanguage → null) and supported files
  * with no extractable signatures are SKIPPED entirely — pass 1 cannot shortlist
- * what it never saw (documented). The returned Result is pass 2's (real-code
- * file:line hits); when nothing is shortlisted, pass 1's Result comes back with
- * 0 hits. Pass-1 chunk errors stay pass-1-internal (they only shrink the
- * shortlist); a fatal throw (fail-fast, dead key) propagates as usual. Both passes
+ * what it never saw (documented). The returned Result carries pass 2's hits
+ * (real-code file:line); when nothing is shortlisted, pass 1's Result comes back
+ * with 0 hits. Pass-1 errors, tokens, cost, chunks and cached counts are MERGED into
+ * the returned Result (B3): a file whose signature batch failed was never searched,
+ * so dropping its error made a partial run look clean (exit 0/1, pass-1 spend
+ * unreported). A fatal throw (fail-fast, dead key) propagates as usual. With
+ * --budget both passes share ONE meter, so pass 2 cannot spend a fresh budget. Both passes
  * share one cache object — a signature chunk and a code chunk never collide (the
  * judged text differs), so a re-run replays either pass for free.
  */
@@ -855,10 +859,20 @@ export async function jgrepFuncs(question: string, paths: string[], o: Options):
   }
   // Pass 1 never tags (--tag stripped): its hits are only a shortlist — never printed
   // — so tagging them would be a wasted request. Pass 2 tags the real hits.
-  const pass1 = await jgrep(question, sigChunks, { ...o, tag: undefined });
+  const meter = o.meter ?? (o.budget !== undefined ? new BudgetMeter(o.budget, o.pricePerMtok ?? DEFAULT_PRICE_PER_MTOK) : undefined);
+  const pass1 = await jgrep(question, sigChunks, { ...o, tag: undefined, meter });
   const shortlist = [...new Set(pass1.hits.map((h) => h.file))];
   if (shortlist.length === 0) return pass1;
-  return jgrep(question, chunkPaths(shortlist), o);
+  const pass2 = await jgrep(question, chunkPaths(shortlist), { ...o, meter });
+  const cost = pass1.cost === undefined && pass2.cost === undefined ? undefined : (pass1.cost ?? 0) + (pass2.cost ?? 0);
+  return {
+    ...pass2,
+    chunks: pass1.chunks + pass2.chunks,
+    tokens: pass1.tokens + pass2.tokens,
+    cached: pass1.cached + pass2.cached,
+    errors: [...pass1.errors, ...pass2.errors],
+    ...(cost !== undefined ? { cost } : {}),
+  };
 }
 
 // ---- config -----------------------------------------------------------------

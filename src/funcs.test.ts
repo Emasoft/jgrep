@@ -18,7 +18,7 @@ import {
   MAX_SIGNATURES, SIGNATURE_CHUNK_MAX_CHARS, type Signature,
 } from "./funcs";
 import type { Fetch } from "./providers";
-import { jgrepFuncs } from "./jgrep";
+import { estimateTokens, jgrepFuncs } from "./jgrep";
 
 // ---- detectLanguage: the extension map ----------------------------------------
 
@@ -383,6 +383,87 @@ test("jgrepFuncs: signature pass batches 16 files per request — 20 files = 2 s
     expect(calls).toHaveLength(3);
     expect(calls[2].state.chunks.every((c) => c.file === path.join(dir, "f0.ts"))).toBe(true);
     expect(r.hits.map((h) => h.file)).toEqual([path.join(dir, "f0.ts")]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- B3: a failed signature batch must not vanish ------------------------------
+// Realistic failure: the provider answers 500 for bad.ts's signature request on every
+// attempt, so the REAL retry path (postSystemOne, maxRetries 1 => 2 attempts, real
+// jittered backoff) exhausts and the pool records server_unreachable for that batch.
+const b3Dir = () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-funcs-b3-"));
+  fs.writeFileSync(path.join(dir, "good.ts"), "export function retryRequest(url: string) {\n  return fetch(url);\n}\n");
+  fs.writeFileSync(path.join(dir, "bad.ts"), "export function retryUpload(file: string) {\n  return upload(file);\n}\n");
+  return dir;
+};
+const b3Fetch = () => {
+  const st = { attempts: 0, badAttempts: 0, billed: 0 };
+  const fetchImpl = (async (_u: unknown, init: { body: string }) => {
+    st.attempts++;
+    const body = JSON.parse(init.body);
+    if (body.state.chunks.some((c: { file: string }) => c.file.endsWith("bad.ts"))) {
+      st.badAttempts++;
+      return new Response("upstream exploded", { status: 500 });
+    }
+    st.billed += 100;
+    const answers: Record<string, unknown> = {};
+    for (const id of Object.keys(body.questions)) answers[id] = { type: "noul", noul: 0.9 };
+    return new Response(JSON.stringify({ answers, usage: { input_tokens: 100 } }), { status: 200 });
+  }) as unknown as Fetch;
+  return { st, fetchImpl };
+};
+
+test("B3 jgrepFuncs: a signature batch that fails after its retries surfaces as an error with pass-1 spend counted", async () => {
+  const dir = b3Dir();
+  try {
+    const { st, fetchImpl } = b3Fetch();
+    const r = await jgrepFuncs("retries a request", [dir], {
+      threshold: 0.7, batch: 1, concurrency: 2, maxRetries: 1, timeoutSec: 30, apiKey: "k", fetchImpl, cache: {},
+    });
+    expect(st.badAttempts).toBe(2); // the real retry path ran: 1 try + 1 retry
+    expect(r.hits.map((h) => path.basename(h.file))).toEqual(["good.ts"]);
+    const bad = r.errors.filter((e) => e.file.endsWith("bad.ts"));
+    expect(bad).toHaveLength(1); // the failed file is reported, so the CLI exits 2
+    expect(bad[0].kind).toBe("server_unreachable");
+    expect(r.tokens).toBe(st.billed); // pass-1 good.ts signature tokens + pass-2 tokens
+    expect(r.tokens).toBe(200);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}, 20_000);
+
+test("B3 jgrepFuncs --budget: pass 2 continues the pass-1 meter instead of starting a fresh budget", async () => {
+  const dir = b3Dir();
+  try {
+    fs.rmSync(path.join(dir, "bad.ts"));
+    const PRICE = 1000; // $/Mtok; the fake bills exactly the estimator's tokens for each body
+    const billing = () => {
+      const costs: number[] = [];
+      const fetchImpl = (async (_u: unknown, init: { body: string }) => {
+        const tokens = estimateTokens({ requests: 1, chars: init.body.length });
+        costs.push((tokens * PRICE) / 1e6);
+        const body = JSON.parse(init.body);
+        const answers: Record<string, unknown> = {};
+        for (const id of Object.keys(body.questions)) answers[id] = { type: "noul", noul: 0.9 };
+        return new Response(JSON.stringify({ answers, usage: { input_tokens: tokens } }), { status: 200 });
+      }) as unknown as Fetch;
+      return { costs, fetchImpl };
+    };
+    const free = billing();
+    await jgrepFuncs("retries a request", [dir], { threshold: 0.7, batch: 1, concurrency: 1, apiKey: "k", fetchImpl: free.fetchImpl, cache: {}, pricePerMtok: PRICE });
+    const [cSig, cCode] = free.costs; // pass-1 signature request, pass-2 code request
+    expect(free.costs).toHaveLength(2);
+    // Enough for either request alone, not for both: a fresh pass-2 budget would send it.
+    const budget = cSig + cCode * 0.99;
+    expect(budget).toBeGreaterThanOrEqual(cCode);
+    const b = billing();
+    const r = await jgrepFuncs("retries a request", [dir], {
+      threshold: 0.7, batch: 1, concurrency: 1, budget, pricePerMtok: PRICE, apiKey: "k", fetchImpl: b.fetchImpl, cache: {},
+    });
+    expect(b.costs).toHaveLength(1);
+    expect(r.errors.map((e) => e.kind)).toEqual(["budget_exhausted"]);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
