@@ -207,9 +207,10 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
       for (const row of batches[bi]) errors.push({ row, kind: "circuit_breaker_open", message: "not attempted: provider failing consistently (circuit breaker open)" });
     }
   }
-  // `requests` counts only packs the breaker actually attempted; packs it never
-  // dispatched are not requests.
-  return { answers, tokens, cached: rows.length - todo.length, requests: batches.length - (pool.aborted ? pool.unprocessed : 0), errors, ...(cost !== undefined ? { cost } : {}) };
+  // `requests` counts only packs actually sent: packs the breaker never dispatched and
+  // packs --budget refused before sending (B4) are not requests.
+  const budgetRefused = pool.errors.filter((e) => e.error.kind === "budget_exhausted").length;
+  return { answers, tokens, cached: rows.length - todo.length, requests: batches.length - (pool.aborted ? pool.unprocessed : 0) - budgetRefused, errors, ...(cost !== undefined ? { cost } : {}) };
 }
 
 // ---- output -----------------------------------------------------------------

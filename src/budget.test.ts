@@ -117,6 +117,7 @@ test("B4 --rows --budget: packs reserve before sending; spend stays under the bu
   const r = await scoreRows(rowsOf(40), Q, { batch: 1, concurrency: 8, budget, pricePerMtok: PRICE, apiKey: "k", fetchImpl, cache: {} });
   expect(st.spent).toBeLessThanOrEqual(budget + 1e-12);
   expect(st.requests).toBe(3);
+  expect(r.requests).toBe(3); // the summary's request count excludes packs the budget never sent
   expect(r.errors).toHaveLength(37);
   expect(r.errors.every((e) => e.kind === "budget_exhausted" && e.hint === "raise --budget")).toBe(true);
 });
