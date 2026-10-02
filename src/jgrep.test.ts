@@ -192,3 +192,28 @@ test("--estimate --json prints the estimate object for code, --tests and --rows,
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("B5 --rows --estimate prices rows x questions packs, not the files of the current directory", () => {
+  const fs = require("node:fs"), os = require("node:os"), path = require("node:path");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-est-rows-"));
+  const env = { PATH: process.env.PATH ?? "", HOME: home }; // no key, empty cache
+  const cli = path.resolve(import.meta.dir, "cli.ts");
+  try {
+    const csv = path.join(home, "rows.csv");
+    fs.writeFileSync(csv, "handle,bio\n" + Array.from({ length: 40 }, (_, i) => `@u${i},bio ${i}`).join("\n") + "\n");
+    const qf = path.join(home, "q.json");
+    fs.writeFileSync(qf, JSON.stringify({
+      beauty: { type: "noul", instructions: "beauty content" },
+      cars: { type: "noul", instructions: "car content" },
+      food: { type: "noul", instructions: "food content" },
+    }));
+    fs.writeFileSync(path.join(home, "unrelated.ts"), "export const x = 1;\n"); // cwd file the old estimator chunked
+    const p = Bun.spawnSync(["bun", cli, "--rows", csv, "--questions", qf, "-b", "4", "--estimate"], { env, cwd: home });
+    expect(p.exitCode).toBe(0);
+    const out = p.stdout.toString();
+    expect(out).not.toContain("unrelated.ts");
+    expect(out).toMatch(/^estimated: 10 requests, ~\d+ input tokens/m); // 40 rows / 4 per pack, 3 questions each
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
