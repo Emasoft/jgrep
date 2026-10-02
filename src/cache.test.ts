@@ -301,3 +301,24 @@ test("votes=1: a corrupt cache value (null / string) is re-judged, never served 
   expect(r.cached).toBe(0);
   expect(r.all.every((h) => typeof h.p === "number" && Number.isFinite(h.p))).toBe(true);
 });
+
+test("saveCache: a failed save warns once on stderr instead of failing silently", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-cache-ro-"));
+  try {
+    const blocker = path.join(dir, "not-a-dir");
+    fs.writeFileSync(blocker, "x"); // the cache's parent "directory" is a file: mkdir/write fail
+    const err = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      saveCache({ k: 0.5 }, path.join(blocker, "cache.json"));
+      expect(err).toHaveBeenCalledTimes(1);
+      expect(String(err.mock.calls[0][0])).toContain("could not save the jgrep cache");
+    } finally { err.mockRestore(); }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("cacheFilePath: honours an absolute XDG_CACHE_HOME, ignores a relative one", async () => {
+  const { cacheFilePath } = await import("./jgrep");
+  expect(cacheFilePath({ XDG_CACHE_HOME: "/var/xdg" }, "/home/u")).toBe(path.join("/var/xdg", "jgrep", "cache.json"));
+  expect(cacheFilePath({ XDG_CACHE_HOME: "rel/dir" }, "/home/u")).toBe(path.join("/home/u", ".cache", "jgrep", "cache.json"));
+  expect(cacheFilePath({}, "/home/u")).toBe(path.join("/home/u", ".cache", "jgrep", "cache.json"));
+});

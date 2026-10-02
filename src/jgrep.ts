@@ -244,7 +244,13 @@ export function numberEnvelope(text: string): string {
 
 // ---- cache ------------------------------------------------------------------
 // One JSON file for now; move to sqlite if it grows past a few MB.
-const CACHE_FILE = path.join(os.homedir(), ".cache", "jgrep", "cache.json");
+/** `$XDG_CACHE_HOME/jgrep/cache.json`, else `~/.cache/jgrep/cache.json`. Per the XDG base-dir
+ *  spec a relative XDG_CACHE_HOME is invalid and ignored. */
+export function cacheFilePath(env: Record<string, string | undefined> = process.env, home: string = os.homedir()): string {
+  const xdg = env.XDG_CACHE_HOME?.trim();
+  return path.join(xdg && path.isAbsolute(xdg) ? xdg : path.join(home, ".cache"), "jgrep", "cache.json");
+}
+const CACHE_FILE = cacheFilePath();
 export type Cache = Record<string, any>;
 
 /** WI-6 size cap: at most this many entries survive a save; the OLDEST-inserted
@@ -297,8 +303,9 @@ export function loadCache(file: string = CACHE_FILE): Cache {
  *  `${file}.tmp-<pid>` in the SAME directory and fs.renameSync it over the target —
  *  a same-directory rename is atomic, so concurrent jgrep processes never observe a
  *  half-written cache and the worst case is a lost save, never a corrupted file.
- *  Any failure skips the save silently (as before) and removes the tmp file
- *  best-effort. The `file` parameter is a test seam; production callers rely on the
+ *  A failure skips the save with ONE stderr warning (audit: a silent EACCES/ENOSPC
+ *  made every later run re-bill every chunk with no clue why) and removes the tmp
+ *  file best-effort; the run itself still succeeds. The `file` parameter is a test seam; production callers rely on the
  *  default CACHE_FILE. */
 export function saveCache(c: Cache, file: string = CACHE_FILE) {
   const tmp = `${file}.tmp-${process.pid}`;
@@ -307,8 +314,9 @@ export function saveCache(c: Cache, file: string = CACHE_FILE) {
     evict(c);
     fs.writeFileSync(tmp, JSON.stringify({ v: 1, entries: c, order: Object.keys(c) }));
     fs.renameSync(tmp, file);
-  } catch {
-    try { fs.rmSync(tmp, { force: true }); } catch { /* cache is best-effort */ }
+  } catch (e) {
+    console.error(`warning: could not save the jgrep cache to ${file} (${(e as Error).message}) — the next run re-bills these answers`);
+    try { fs.rmSync(tmp, { force: true }); } catch { /* tmp cleanup is best-effort */ }
   }
 }
 // In-run signature: the same indent-aware rule as the cache key (B2, see
