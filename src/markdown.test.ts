@@ -94,10 +94,11 @@ test("chunkMarkdown on the repo SKILL.md: the fenced help block is ONE chunk —
   expect(help.every((c) => c.end - c.start + 1 <= 60 || /^```/m.test(c.text))).toBe(true);
   const block = help.filter((c) => c.text.split("\n").some((l) => /^\s*```/.test(l)));
   expect(block).toHaveLength(1); // the full fenced help block rides in this one chunk
-  expect(block[0].text).toContain("-t, --threshold <p>   print chunks with probability >= p (default 0.7)");
+  expect(block[0].text).toContain("-t, --threshold <p>   print chunks with p >= this (default 0.7; 0.5 with --tests)");
   expect(block[0].text).toContain("exit status: 0 when something matched, 1 when nothing did");
-  expect(block[0].text).toContain('OPENROUTER_API_KEY=sk-or-... jgrep --api openrouter "swallows errors" src/');
-  expect(block[0].text).toContain("pipe into your runner:  bun test $(jgrep --tests origin/main)"); // upstream's --tests lines ride along
+  expect(block[0].text).toContain('jgrep --api openrouter "swallows errors" src/');
+  expect(block[0].text).toContain("bun test $(jgrep --tests origin/main)"); // upstream's --tests lines ride along
+  expect(block[0].text).toContain("jgrep --api gateway --model <name> \"<rule>\" src/"); // last USAGE line: the whole help is one chunk
   expect(block[0].text.split("\n").filter((l) => /^\s*```/.test(l))).toEqual(["```", "```"]); // fence open + close intact
 });
 

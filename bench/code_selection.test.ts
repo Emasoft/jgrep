@@ -80,9 +80,9 @@ test("validateCases rejects malformed fixtures with actionable messages", () => 
 
 test("parse: defaults, flags, --limit/--cases alias, numeric validation, stray positionals", () => {
   expect(parse([])).toMatchObject({ limit: 0, api: "", model: "", out: "", rate: 0, retries: 4, timeout: 15, failFast: false });
-  expect(parse(["--limit", "3", "--api", "openrouter", "--model", "~typesafe/jev-1.13",
+  expect(parse(["--limit", "3", "--api", "openrouter", "--model", "typesafe/jev-1.13",
     "--rate", "5", "--retries", "1", "--timeout", "30", "--fail-fast", "--out", "/tmp/r"]))
-    .toMatchObject({ limit: 3, api: "openrouter", model: "~typesafe/jev-1.13",
+    .toMatchObject({ limit: 3, api: "openrouter", model: "typesafe/jev-1.13",
       rate: 5, retries: 1, timeout: 30, failFast: true, out: "/tmp/r" });
   expect(parse(["--cases", "2"]).limit).toBe(2);
   expect(parse(["--cases", "2", "--limit", "5"]).limit).toBe(5); // last occurrence wins

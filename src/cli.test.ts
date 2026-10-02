@@ -39,9 +39,9 @@ test("cli parse: new flags parse with correct types and defaults", () => {
   expect(typeof o.failFast).toBe("boolean");
   expect(typeof o.estimate).toBe("boolean");
 
-  const o2 = parse(["--api", "openrouter", "--model", "~typesafe/jev-1.13", "--timeout", "30", "--request-timeout", "60", "--retries", "2", "--rate", "5", "--fail-fast", "--estimate", "q", "src/"]);
+  const o2 = parse(["--api", "openrouter", "--model", "typesafe/jev-1.13", "--timeout", "30", "--request-timeout", "60", "--retries", "2", "--rate", "5", "--fail-fast", "--estimate", "q", "src/"]);
   expect(o2).toMatchObject({
-    api: "openrouter", model: "~typesafe/jev-1.13", timeout: 30, requestTimeout: 60,
+    api: "openrouter", model: "typesafe/jev-1.13", timeout: 30, requestTimeout: 60,
     retries: 2, rate: 5, failFast: true, estimate: true, question: "q", paths: ["src/"],
   });
 });

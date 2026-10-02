@@ -9,7 +9,7 @@
 jgrep "catches an error and silently ignores it" src/
 ```
 
-[![npm](https://img.shields.io/npm/v/jevgrep?color=0a0&label=npm)](https://www.npmjs.com/package/jevgrep)
+[![upstream npm](https://img.shields.io/npm/v/jevgrep?color=0a0&label=upstream%20npm)](https://www.npmjs.com/package/jevgrep)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![deps](https://img.shields.io/badge/runtime%20deps-0-brightgreen)](package.json)
 [![model](https://img.shields.io/badge/powered%20by-Jev%20%C2%B7%20TypeSafe-8a2be2)](https://docs.typesafe.ai)
@@ -20,8 +20,9 @@ jgrep "catches an error and silently ignores it" src/
 *On five OSS repos, `--tests` picked 12% of the test files and still caught over 90% of the
 tests each commit's author changed, for $0.11 across 60 commits ([bench](bench/tests/README.md)).*
 
-<sub>Not [dzhng/jevgrep](https://github.com/dzhng/jevgrep) (`jg`), a separate code-discovery CLI.
-This project is `jgrep`, published on npm as `jevgrep`.</sub>
+<sub>This is Emasoft's fork of [kyu1204/jgrep](https://github.com/kyu1204/jgrep), the original
+project by kyu1204, published on npm as `jevgrep`; this fork is installed from GitHub and is never
+published to npm. Not [dzhng/jevgrep](https://github.com/dzhng/jevgrep) (`jg`), a separate code-discovery CLI.</sub>
 
 <img src="docs/demo.gif" alt="jgrep demo: semantic search over src/ and a git diff" width="900">
 
@@ -47,17 +48,28 @@ probabilities into `file:line` hits.
 
 ## Install
 
-### Install this fork (never published on npm)
+```sh
+curl -fsSL https://raw.githubusercontent.com/Emasoft/jgrep/main/install-dev.sh | bash -s -- --choice 8
+```
 
-This fork is **never published** — the `jevgrep` npm package belongs to the
-upstream project. Install it with either one-liner:
+Then give jgrep a key the way you give it to every other tool: export
+`OPENROUTER_API_KEY` or `TYPESAFE_API_KEY` (or `JEV_GATEWAY_API_KEY` with
+`JEV_GATEWAY_URL`) in your shell profile. jgrep detects it; there is nothing to
+pass on the command line, and an OpenRouter key alone selects OpenRouter. Get a
+key at [openrouter.ai/keys](https://openrouter.ai/keys) or
+[console.typesafe.ai](https://console.typesafe.ai). No env var? `jgrep init`
+is the fallback (below). `jgrep --estimate ...` shows what a run would cost
+without sending anything or needing a key.
+
+### This fork is never published to npm
+
+`package.json` is `"private": true` and the publish workflow runs only in the
+upstream repository, so nothing from this fork ever reaches npm. The `jevgrep`
+package on npm is upstream's release (`npm i -g jevgrep` installs that, not this
+fork). Install the fork with the one-liner above, or from a clone:
 
 ```sh
-# remote — straight from GitHub, no clone needed:
-curl -fsSL https://raw.githubusercontent.com/Emasoft/jgrep/main/install-dev.sh | bash -s -- --choice 8
-
-# local — from a clone of this repo:
-./install-dev.sh --choice 1
+./install-dev.sh --choice 1     # local: build this checkout, symlink the jgrep bin
 ```
 
 `--choice 8` clones the fork into `~/.local/share/jgrep` (override with
@@ -74,39 +86,22 @@ offered (interactive y/N) or auto-installed (`--choice`/`--yes`) via
 interactive menu cannot run through a pipe — use the `--choice 8` one-liner;
 `--choice 8 --dry-run` previews everything and mutates nothing.
 
-```bash
-npm i -g jevgrep     # installs the `jgrep` command
-jgrep init           # pick a provider, paste your key, pick where to keep it, done
-```
-
-`jgrep init` first asks **which provider** — TypeSafe, OpenRouter, or a
-self-hosted gateway — verifies the key against it, stores it with `chmod 600`,
-and optionally installs the jgrep skill into your AI agents (every harness,
-via the vercel `skills` installer). Get a key at
-[console.typesafe.ai](https://console.typesafe.ai) or
-[openrouter.ai/keys](https://openrouter.ai/keys).
-`jgrep --estimate ...` shows what a run would cost before spending anything
-(no key needed).
-
-Install this fork from source:
+Or by hand from a clone (no npm release involved):
 
 ```sh
 git clone https://github.com/Emasoft/jgrep && cd jgrep
 bun install && bun run build
-npm i -g .        # installs the `jgrep` bin from this folder, no npm release needed
+npm i -g .        # installs the `jgrep` bin from this folder
 ```
 
-the published `jevgrep` package on npm belongs to the upstream project — installing from source avoids any version collision with it.
+### No key in your environment? `jgrep init`
 
-<details>
-<summary>Prefer not to run init?</summary>
-
-```bash
-export OPENROUTER_API_KEY=...                                            # env
-echo 'OPENROUTER_API_KEY=...' >> .env                                    # per project
-mkdir -p ~/.config/jgrep && echo '...' > ~/.config/jgrep/openrouter.key  # global, one file per provider
-```
-</details>
+`jgrep init` is only for people who do not export a key. It asks **which
+provider** — TypeSafe, OpenRouter, or a self-hosted gateway — verifies the key
+against it, stores it with `chmod 600` in `~/.config/jgrep/<provider>.key` (or
+the legacy `~/.config/jgrep/env`, or the project's `./.env`), and optionally
+installs the jgrep skill into your AI agents (every harness, via the vercel
+`skills` installer).
 
 ## Providers
 
@@ -119,19 +114,21 @@ find a key.
 | `openrouter` | `https://openrouter.ai/api/v1/systemone`                    | `~typesafe/jev-latest`                   | `OPENROUTER_API_KEY`   |
 | `gateway`    | `$JEV_GATEWAY_URL` (full System One endpoint, e.g. LiteLLM) | `jev-latest` (override with `--model`)   | `JEV_GATEWAY_API_KEY`  |
 
-Provider precedence: `--api` > `$JEV_API` > first backend with a key (typesafe
-first). Key lookup, per provider: env var > `~/.config/jgrep/<name>.key` (mode
-600, written by `jgrep init`) > the legacy `~/.config/jgrep/env` > `./.env` in
-the project (warned on stderr when it isn't gitignored; `chmod 600` is a no-op
-on Windows — init warns there too).
+Provider precedence: `--api` > `$JEV_API` > the first backend with a key, in
+the order typesafe, openrouter, gateway. So with only `OPENROUTER_API_KEY`
+exported, OpenRouter is selected automatically; with both keys exported,
+TypeSafe wins unless you pass `--api openrouter` or set `JEV_API=openrouter`.
+Key lookup, per provider: env var > `~/.config/jgrep/<name>.key` (mode 600,
+written by `jgrep init`) > the legacy `~/.config/jgrep/env` > `./.env` in the
+project (warned on stderr when it isn't gitignored; `chmod 600` is a no-op on
+Windows — init warns there too).
 
 ```bash
-OPENROUTER_API_KEY=sk-or-... jgrep "swallows errors" src/   # key found, provider auto-selected
-jgrep --api openrouter "swallows errors" src/               # forced
-JEV_GATEWAY_URL=https://gw.example.com/v1/systemone JEV_GATEWAY_API_KEY=... \
-  jgrep --api gateway "swallows errors" src/                # any System One-speaking endpoint
+jgrep "swallows errors" src/                    # exported key found, provider auto-selected
+jgrep --api openrouter "swallows errors" src/   # forced
+jgrep --api gateway "swallows errors" src/      # JEV_GATEWAY_URL (+ JEV_GATEWAY_API_KEY) exported
 JEV_GATEWAY_URL=http://127.0.0.1:11434/v1/systemone \
-  jgrep --api gateway --model nimble --tests HEAD~1         # a local server (e.g. Ollama): no key needed
+  jgrep --api gateway --model nimble --tests HEAD~1   # a local server (e.g. Ollama): no key needed
 ```
 
 The gateway URL must be `https://`, except a loopback `http://` server
@@ -147,19 +144,79 @@ Requests to openrouter.ai carry OpenRouter's app-attribution headers
 `X-OpenRouter-Categories: cli-agent`); no other endpoint gets them. Answers are
 cached per model id, so switching models never reuses another model's answers.
 
+## Examples
+
+Every example from `jgrep --help`, runnable as written from this repo's root:
+
+```bash
+jgrep "catches an error and silently ignores it" src/
+jgrep -C -t 0.9 "builds an SQL string by concatenation" .
+jgrep -a -t 0 "retries failed HTTP requests" src/ | head
+jgrep --funcs "parses command-line arguments" src/
+jgrep --diff --staged "leaves debug output such as console.log"
+jgrep --diff origin/main --sarif "adds an endpoint without an auth check"
+jgrep --tag "real bug,best-effort cleanup" "swallows an exception" src/
+jgrep --json "spawns a child process" src/ | jq -r '.[].file'
+bun test $(jgrep --tests origin/main)
+jgrep --rows examples/creators.csv "beauty is the main content of this account"
+jgrep --rows examples/creators.csv --questions examples/beauty.json --out scored.csv
+jgrep --estimate "swallows errors" src/
+jgrep --budget 0.05 "swallows errors" .
+jgrep --api openrouter "swallows errors" src/
+```
+
+## Use cases
+
+| you want to… | run |
+| --- | --- |
+| find where X happens in an unfamiliar repo | `jgrep -C "validates the webhook signature" .` |
+| triage a big diff or PR: rank the hunks, then label them | `jgrep --diff origin/main --tag "bug,refactor" "changes error handling"` |
+| pick the tests to run in CI | `jgrep --tests origin/main \| xargs bun test` |
+| classify CSV / JSONL rows with typed questions | `jgrep --rows data.csv --questions q.json --out scored.csv` |
+| cap spending: price the run first, then set a hard cap | `jgrep --estimate "<rule>" src/ && jgrep --budget 0.02 "<rule>" src/` |
+| SARIF for code scanning in CI | `jgrep --diff origin/main --sarif "<rule>" > jgrep.sarif` |
+| a local or Ollama System One server, no key, no code leaves the machine | `JEV_GATEWAY_URL=http://localhost:11434/v1/systemone jgrep --api gateway --model <name> "<rule>" src/` |
+
+## Cost
+
 Cost is the provider's reported number when it sends one (OpenRouter), else
-`tokens × $JEV_PRICE_PER_MTOK` (default `$0.042` per million input tokens,
-output free).
+`input tokens × $JEV_PRICE_PER_MTOK` (default `$0.042` per million input
+tokens, output free).
+
+- **`--estimate`** is a dry run for every mode (code, `--diff`, `--rows`,
+  `--tests`): it builds every request the run would send, counts cached chunks
+  as free, prints a per-file chunk table and
+  `estimated: N requests, ~T input tokens, ~$X`, sends nothing, needs no key,
+  and exits 0 (`--json` prints `{requests,tokens,usd,estimate:true}`). With
+  `--funcs` it prices the plain search, an overestimate: pass 2 depends on
+  answers a dry run never gets.
+- **`--budget <usd>`** is a hard cap, and it is **opt-in: there is no cap
+  unless you set one** (`--budget`, or `JEV_BUDGET`; the flag wins). Before a
+  request is sent, its estimated cost is *reserved* against the budget; a
+  request that does not fit in what is left is never sent and its chunks error
+  `budget_exhausted` (exit 2, with a `raise --budget` hint). Each response
+  replaces its reservation with the real cost. Because concurrent requests
+  reserve before they are sent, a wave of parallel workers cannot overshoot.
+  It covers the search, `--verify`, `--tag`, both `--funcs` passes and
+  `--rows`, not `--tests`. Hits and cached answers already in hand are kept.
+  `--budget 0` sends nothing.
+- **The cap's ceiling is the estimator's accuracy.** A reservation is
+  estimated input tokens × `$JEV_PRICE_PER_MTOK`; the estimate lands within
+  about 15% of billed tokens (e.g. 186,987 estimated vs 187,344 billed on this
+  repo's `src/`), so the requests in flight can push the final spend past the
+  limit by up to that margin.
+  If `JEV_PRICE_PER_MTOK` is set far below what the provider really charges,
+  every reservation is under-priced and the cap overshoots in proportion.
 
 ## Use
 
 ### Find code by behavior
 
 ```bash
-jgrep "reads user input without validating it" app/
+jgrep "reads user input without validating it" src/
 jgrep -C "parses a JWT or decodes a base64 token payload" src/     # -C prints the chunk
 jgrep -t 0.9 "builds an SQL string by concatenation" .            # stricter
-jgrep -a -t 0 "is dead code nothing calls" lib/ | head            # everything, best first
+jgrep -a -t 0 "is dead code nothing calls" src/ | head            # everything, best first
 ```
 
 ### Lint a change with rules written in English
@@ -176,7 +233,7 @@ CI keep the three apart: a plain `!` would turn an outage or an expired secret
 into a passing check.
 
 ```yaml
-- run: npm i -g jevgrep
+- run: curl -fsSL https://raw.githubusercontent.com/Emasoft/jgrep/main/install-dev.sh | bash -s -- --choice 8
 - name: no unauthenticated endpoints
   env: { TYPESAFE_API_KEY: "${{ secrets.TYPESAFE_API_KEY }}" }   # or OPENROUTER_API_KEY
   run: |
@@ -238,8 +295,8 @@ Every row becomes one state. One description works like grep; a JSON file of
 Jev questions (noul, choice, score) adds one answer column per question.
 
 ```bash
-jgrep --rows creators.csv "beauty is the main content of this account"
-jgrep --rows creators.csv --questions beauty.json --out scored.csv
+jgrep --rows examples/creators.csv "beauty is the main content of this account"
+jgrep --rows examples/creators.csv --questions examples/beauty.json --out scored.csv
 ```
 
 ```json
@@ -267,15 +324,17 @@ list of ranges instead of whole files. On a 115 KB module the agent read
 6 KB of matching chunks instead of everything.
 
 ```bash
-jgrep init                   # offers installing the skill into your AI agents
 jgrep --json "spawns a child process" src/ | jq '.[].file'             # bare array (v0.3.0 shape)
 jgrep --json-errors "spawns a child process" src/ | jq '.hits[].file'  # opt-in object, errors included
 ```
 
-`jgrep init` installs the skill into every agent-skills harness (Claude Code,
-Codex, OpenCode, Cursor, +75 more) via the vercel `skills` installer, falling
-back to the standard `~/.agents/skills/jgrep` folder. Manually:
-`npx skills add <pkg-root>/skills -g` (from a repo checkout: `npx skills add ./skills -g`).
+The agent skill is `skills/jgrep/SKILL.md`; it embeds `jgrep --help` verbatim
+(a test keeps the two identical). Every install path ships that same file: the
+curl install (and `install-dev.sh` options 1-3) refreshes it in every
+agent-skills harness (Claude Code, Codex, OpenCode, Cursor, +75 more) via the
+vercel `skills` installer, falling back to the standard `~/.agents/skills/jgrep`
+folder; `jgrep init` offers the same install; manually:
+`npx skills add ./skills -g` from a checkout.
 
 Or install the skill as a Claude Code plugin (the `jgrep` command must be installed too):
 
@@ -327,6 +386,7 @@ carries a typed kind with a hint on stderr:
 | `tls_error`            | certificate problem, message quoted verbatim |
 | `timeout`              | raise `--timeout` or `--request-timeout` |
 | `circuit_breaker_open` | provider failing consistently — the chunk was never attempted |
+| `budget_exhausted`     | the request did not fit in what was left of `--budget` and was never sent — raise `--budget` |
 
 **`--json` is backward-compatible**: code mode is byte-identical to 0.3.0
 (`[{file,start,end,p,text}]`); rows mode is a flattened answer array with
@@ -346,7 +406,10 @@ failed batch is retried as a whole: keeping per-answer results from a failed
 batch depends on the provider returning per-question answers alongside errors,
 which is still to be verified on OpenRouter.
 
-New in 0.7.0. Cache keys hash the **normalized** chunk text (trailing
+### Cache
+
+Answers are cached in `~/.cache/jgrep/` by (model, question, chunk), so the same
+query again is free. New in 0.7.0: cache keys hash the **normalized** chunk text (trailing
 whitespace stripped, blank lines dropped, line endings unified) rather than the
 raw bytes, so trailing spaces, blank-line churn and CRLF/LF changes do not
 re-bill; any change in content or in leading indentation still does
@@ -360,60 +423,151 @@ concurrent jgrep processes can never see a half-written cache.
 
 ## All options
 
-```
-jgrep init                               interactive setup (provider, key, agent skills)
-jgrep [options] "<description>" [path ...]
-jgrep [options] --diff [ref] "<description>"
-jgrep [options] --rows <file.csv|.jsonl> "<description>"
-jgrep [options] --rows <file> --questions <q.json> [--out scored.csv]
-jgrep [options] --tests [ref] [--staged] [path ...]
+`jgrep --help`, verbatim:
 
-  -t, --threshold <p>   print chunks with probability >= p (default 0.7)
-  -C, --show            print the matching chunk body under each hit
+```
+jgrep 0.7.0 — semantic grep powered by Jev
+
+usage: jgrep init                       interactive setup (provider, key, agent skills)
+       jgrep [options] "<description>" [path ...]
+       jgrep [options] --diff [ref] "<description>"
+       jgrep [options] --tests [ref] [--staged] [path ...]
+       jgrep [options] --rows <file.csv|.jsonl> "<description>"
+       jgrep [options] --rows <file> --questions <q.json> [--out scored.csv]
+
+Describe the code in English; jgrep asks Jev one yes/no question per chunk and
+prints the chunks that match as file:line ranges with a probability p.
+Key: export OPENROUTER_API_KEY or TYPESAFE_API_KEY (or JEV_GATEWAY_API_KEY) in your
+shell profile; jgrep detects it. No env var? `jgrep init` stores a key file instead.
+
+search
+  -t, --threshold <p>   print chunks with p >= this (default 0.7; 0.5 with --tests)
   -a, --all             print every chunk with its probability, best first
-      --group/--votes <n>/--verify   grouped verdicts, N-vote medians, strict re-ask
-      --budget <usd>/--sarif/--envelopes   spend cap (off unless set), SARIF, envelopes
-      --funcs           two-phase navigation: shortlist files by function signatures, then search only those
-      --tag <list>      classify hits: one choice question per hit; the winning category prints as [tag]
-      --json            machine-readable output: hits as a JSON array
-                        (v0.3.0-compatible: [{file,start,end,p,text}]; rows:
-                        [flattened answer objects, null for errored rows])
-      --json-errors     with --json: a JSON object instead — code mode
-                        {hits:[...], errors:[{file,start,end,kind,message}]};
-                        rows mode {answers:[...], errors:[{row,kind,message}]}
-      --diff [ref]      grep git diff hunks instead of files
-                        (working tree by default, or against <ref>)
+  -C, --show            print the matching chunk body under each hit
+      --diff [ref]      judge git diff hunks instead of files (working tree, or vs <ref>)
       --staged          with --diff / --tests: staged changes only
-      --tests [ref]     predictive test selection: print the test files a diff
-                        plausibly affects (working tree, or against <ref>);
-                        pipe into your runner:  bun test $(jgrep --tests origin/main)
-      --rows <file>     grep rows of a CSV / JSONL file instead of code
-      --questions <f>   with --rows: JSON of Jev questions (noul/choice/score)
-                        asked of every row; prints the table with answer columns
-      --out <file>      with --questions: write the CSV here instead of stdout
-                        (with --json: the JSON output goes to the file)
+
+input and chunking
+  paths default to "."; files come from git ls-files (else a walk, max 5000 files);
+  binaries and files over 1 MB are skipped; code splits into 5-60 line chunks,
+  Markdown at its headings, and every diff hunk is one chunk
   -b, --batch <n>       chunks per request (default 16)
-  -c, --concurrency <n> parallel requests (default 16)
-      --api <name>      provider: typesafe | openrouter | gateway
-                        precedence: --api > $JEV_API > first key found (typesafe first)
-      --model <id>      model id override (default: the provider's default; or $JEV_MODEL)
+      --no-cache        ignore and do not write ~/.cache/jgrep
+
+output
+      --json            hits as a JSON array [{file,start,end,p,text}] (v0.3.0 shape);
+                        --rows: flattened answer objects, null for an errored row
+      --json-errors     implies --json and prints an object instead: code mode
+                        {hits, errors:[{file,start,end,kind,message}]},
+                        rows mode {answers, errors:[{row,kind,message}]}
+      --sarif           SARIF 2.1.0 instead of text: one rule per description, one
+                        result per hit (GitHub code scanning)
+      --out <file>      with --rows: write the CSV (or, with --json, the JSON) here
+
+modes
+      --funcs           two passes: shortlist files by their function signatures,
+                        then search only those (code search; ignored with --diff)
+      --group           print one group per near-identical signature with its sites
+                        (each family is judged once; --json adds "groups")
+      --votes <n>       ask every chunk n times (1-5); the median probability wins
+      --verify          re-ask every hit strictly; it stands at p >= 0.6 x threshold
+      --envelopes       append each chunk's numbers to its text (steadier counting)
+      --tag <a,b,...>   classify each hit into one of 2+ categories, printed as [tag]
+      --tests [ref]     print the test files a diff plausibly affects (by name, by
+                        import, then by Jev); pipe the list into your test runner
+      --rows <file>     judge the rows of a CSV / JSONL file instead of code
+      --questions <f>   with --rows: JSON of Jev questions (noul/choice/score) asked
+                        of every row; prints the table with one column per question
+  --group, --votes, --verify, --envelopes and --tag apply to code and --diff search
+
+provider and keys
+      --api <name>      typesafe | openrouter | gateway; precedence: --api > $JEV_API
+                        > the first provider with a key (typesafe, openrouter, gateway),
+                        so an OpenRouter key alone selects OpenRouter automatically
+      --model <id>      model id (default: the provider's; env JEV_MODEL, JGREP_MODEL)
+  key lookup per provider: env var > ~/.config/jgrep/<provider>.key (jgrep init)
+  > ~/.config/jgrep/env > ./.env of the project
+
+environment
+  TYPESAFE_API_KEY      TypeSafe key
+  OPENROUTER_API_KEY    OpenRouter key
+  JEV_GATEWAY_URL       gateway: full System One endpoint, https:// or a loopback
+                        http:// server that needs no key (alias JGREP_ENDPOINT;
+                        read from the process env only, never from ./.env)
+  JEV_GATEWAY_API_KEY   gateway key
+  JEV_API               default provider (--api wins)
+  JEV_MODEL             default model id (alias JGREP_MODEL; --model wins)
+  JEV_BUDGET            default --budget in dollars (the flag wins)
+  JEV_PRICE_PER_MTOK    dollars per million input tokens for --estimate, --budget and
+                        the cost line when the provider reports none (default 0.042)
+  NO_COLOR              plain output (also plain when stdout is not a terminal)
+
+reliability
       --timeout <s>     per-batch deadline, retries included (default 15)
       --request-timeout <s>  per-attempt HTTP timeout (default 30)
       --retries <n>     failed attempts tolerated per batch (default 4)
+  -c, --concurrency <n> parallel requests (default 16)
       --rate <req/s>    global request pacing (token bucket); 0 = unlimited
       --fail-fast       abort on the first fatal error instead of isolating it
-      --estimate        dry run: print requests, tokens and cost; send nothing (no key)
-      --no-cache        ignore and do not write ~/.cache/jgrep
-  -v, --version         print version
+
+cost (no cap unless you set one)
+      --estimate        dry run: requests, input tokens and cost; sends nothing and
+                        needs no key (with --funcs it prices the plain search)
+      --budget <usd>    hard spend cap: each request reserves its estimated cost and
+                        is not sent when it does not fit (search, --verify, --tag,
+                        --funcs, --rows; not --tests); 0 sends nothing
+
+  -h, --help            print this help
+  -v, -V, --version     print version
+
+exit status: 0 when something matched, 1 when nothing did, 2 on error or when any
+chunk errored (partial failure: hits and errors are both reported; every failed
+chunk carries a typed kind — timeout, rate_limited, budget_exhausted, ... — with
+an actionable hint on stderr). --estimate exits 0. In CI test for 1, never use !:
+  jgrep --diff origin/main "adds an endpoint without an auth check"; [ $? -eq 1 ]
+
+examples:
+  jgrep "catches an error and silently ignores it" src/
+  jgrep -C -t 0.9 "builds an SQL string by concatenation" .
+  jgrep -a -t 0 "retries failed HTTP requests" src/ | head
+  jgrep --funcs "parses command-line arguments" src/
+  jgrep --diff --staged "leaves debug output such as console.log"
+  jgrep --diff origin/main --sarif "adds an endpoint without an auth check"
+  jgrep --tag "real bug,best-effort cleanup" "swallows an exception" src/
+  jgrep --json "spawns a child process" src/ | jq -r '.[].file'
+  bun test $(jgrep --tests origin/main)
+  jgrep --rows examples/creators.csv "beauty is the main content of this account"
+  jgrep --rows examples/creators.csv --questions examples/beauty.json --out scored.csv
+  jgrep --estimate "swallows errors" src/
+  jgrep --budget 0.05 "swallows errors" .
+  jgrep --api openrouter "swallows errors" src/
+
+use cases:
+  find where X happens in an unfamiliar repo
+      jgrep -C "validates the webhook signature" .
+  triage a big diff or PR: rank the hunks, then label them
+      jgrep --diff origin/main --tag "bug,refactor" "changes error handling"
+  pick the tests to run in CI
+      jgrep --tests origin/main | xargs bun test
+  classify CSV / JSONL rows with typed questions
+      jgrep --rows data.csv --questions q.json --out scored.csv
+  cap spending: price the run first, then set a hard cap
+      jgrep --estimate "<rule>" src/ && jgrep --budget 0.02 "<rule>" src/
+  SARIF for code scanning in CI
+      jgrep --diff origin/main --sarif "<rule>" > jgrep.sarif
+  a local or Ollama System One server, no key, no code leaves the machine
+      JEV_GATEWAY_URL=http://localhost:11434/v1/systemone \
+        jgrep --api gateway --model <name> "<rule>" src/
 ```
 
 ### Judging, cost controls, and machine-readable output
 
-The `--help` screen lists every flag on one line; these are the same flags in
+The `--help` screen gives each flag one line; these are the same flags in
 full.
 
-- `--group` folds chunks with the same whitespace signature into one verdict and,
-  with `--json`, adds a `"groups"` array.
+- `--group` prints one group per normalized (indent-aware) chunk signature —
+  near-identical code at several sites is judged once — and, with `--json`,
+  adds a `"groups"` array.
 - `--votes N` (1–5, default 1) judges every chunk N times; the median probability
   wins.
 - `--verify` re-asks every hit strictly; the hit stands only at
@@ -422,20 +576,7 @@ full.
   chunk text, steadying Jev's counting of quantities (off by default; cache keys
   stay keyed on the normalized chunk text, so an envelope re-run
   replays for free).
-- `--estimate` is a dry run: the run builds every request it would send (cached
-  chunks are free) and prints per-file chunk counts plus the estimated requests,
-  input tokens and cost — nothing is sent, no key is needed. It covers code,
-  `--diff`, `--rows` and `--tests`; with `--funcs` it prices the plain search (an
-  overestimate: pass 2 depends on answers a dry run never gets).
-- `--budget <usd>` is a hard spend cap, off unless you set it (`$JEV_BUDGET` is
-  the env form; the flag wins). Before each request is sent, its estimated cost
-  (the `--estimate` token model × `$/Mtok`) is reserved against the budget; a
-  request that does not fit in what is left is never sent, and its chunks error
-  kind `budget_exhausted` with a `raise --budget` hint. Each response then
-  replaces its reservation with the real cost (provider-reported, else billed
-  tokens × `$/Mtok`). It covers the search, its `--verify` and `--tag`
-  passes, and `--rows`; hits and cached answers are kept. `0` sends nothing. The cap is as
-  exact as the estimate, which is within about 15% of billed tokens.
+- `--estimate` and `--budget <usd>`: see [Cost](#cost).
 - `--sarif` prints SARIF 2.1.0 instead of text: one rule per description, one
   result per hit (file uri + region.startLine) — ingestible by GitHub code
   scanning.
@@ -532,12 +673,12 @@ It never runs in CI: the suite is double-gated on the opt-in `JGREP_E2E_LIVE=1`
 env var AND on `CI` being unset (GitHub Actions always sets `CI`), so no CI run
 can trigger spend. Without the flag, `bun test` reports these tests as skipped.
 
-### install-dev.sh (dev only)
+### install-dev.sh
 
-`install-dev.sh` is strictly a development installer for this checkout —
-it installs, inspects, and uninstalls every flavor of the `jgrep` bin.
-**End users should not use it: install via npm (`npm i -g jevgrep`).**
-It is never shipped in the npm package.
+`install-dev.sh` is this fork's installer: it installs, inspects, and
+uninstalls every flavor of the `jgrep` bin. End users run option `[8]` through
+the curl one-liner in [Install](#install); the other options serve
+development from a checkout.
 
 Interactive menu (stable numbering — never renumbered):
 
@@ -601,6 +742,13 @@ Fool-proofing, by design:
   alternative is unchanged: `npx skills add ./skills -g`.
 
 The menu numbers are a stable contract: they will never be renumbered.
+
+## Credits
+
+jgrep was created by kyu1204 ([kyu1204/jgrep](https://github.com/kyu1204/jgrep),
+npm `jevgrep`). This fork adds the multi-provider, reliability, budget and
+roadmap work and merges upstream releases; the upstream project owns the npm
+package and the GitHub Action.
 
 If jgrep saved you a file-hunting session, a ⭐ on GitHub is the best thanks.
 

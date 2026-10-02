@@ -126,7 +126,7 @@ test("init storage wiring: writeKeyFile(keyFilePath(...)) roundtrips and resolve
 
 test("outroLine: mentions the model in play via the chosen provider", () => {
   expect(outroLine(BACKENDS.typesafe)).toBe("Ready (jev-latest via typesafe).");
-  expect(outroLine(BACKENDS.openrouter, "~typesafe/jev-1.13")).toBe("Ready (~typesafe/jev-1.13 via openrouter).");
+  expect(outroLine(BACKENDS.openrouter, "typesafe/jev-1.13")).toBe("Ready (typesafe/jev-1.13 via openrouter).");
   expect(outroLine(gatewayBackend("https://gw.example.com/v1"), "jev-latest")).toBe("Ready (jev-latest via gateway).");
 });
 

@@ -15,6 +15,33 @@ work item is implemented. [0.4.0](#040---2026-09-20--providers-reliability-isola
 shipped WI-1 (multi-provider), WI-8 (error taxonomy), WI-11 (partial-failure
 isolation), and WI-12 (benchmarks); markdown chunking ships here too.
 
+### Documentation
+
+- `jgrep --help` rewritten: short usage, flags grouped by purpose (search,
+  input and chunking, output, modes, provider and keys, environment,
+  reliability, cost), every env var the code reads (`JEV_*`, `JGREP_ENDPOINT`,
+  `JGREP_MODEL`, the three key vars, `NO_COLOR`), exit codes, 14 runnable
+  examples and a use-case list. Every flag `parse()` accepts is listed, `-h`
+  and `-V` included; the help-length test cap moves from 60 to 140 lines.
+- Keys come from the environment: help, README and skill lead with exporting
+  `OPENROUTER_API_KEY` / `TYPESAFE_API_KEY` (or `JEV_GATEWAY_API_KEY`) in the
+  shell profile; no example carries a key; `jgrep init` is documented as the
+  fallback for users without an env var.
+- README: install leads with the fork's curl one-liner; new Examples, Use cases
+  and Cost sections (`--estimate`, the opt-in `--budget` reservation cap and its
+  estimator-accuracy ceiling); provider auto-selection order; cache semantics
+  under its own heading; `budget_exhausted` in the error table; states that the
+  fork is never published to npm (`"private": true`, publish workflow
+  upstream-only); the CI recipe installs the fork; upstream credit section.
+  The `install-dev.sh` section no longer tells end users to use npm.
+- Agent skill (`skills/jgrep/SKILL.md`): help block regenerated, setup reduced
+  to "check `command -v jgrep`, keys from the env", examples updated (`--funcs`,
+  `--estimate`, `--budget`), README duplication removed (358 → 261 lines). The
+  same file ships through `jgrep init`, `install-dev.sh` and the Claude Code
+  plugin.
+- Test fixtures use the valid pinned OpenRouter id `typesafe/jev-1.13` (the
+  `~` prefix is for OpenRouter's `-latest` aliases only).
+
 ### Synced from upstream (kyu1204/jgrep v0.5.0–v0.6.0)
 
 - `--estimate`: prints requests, input tokens and cost a run would need (code, `--diff`, `--rows`, `--tests`), exits 0, sends nothing and needs no key; `--json` prints `{requests,tokens,usd,estimate:true}`. Cost uses `JEV_PRICE_PER_MTOK`.
