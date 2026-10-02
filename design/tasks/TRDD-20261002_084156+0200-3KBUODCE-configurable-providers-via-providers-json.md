@@ -1,10 +1,10 @@
 ---
 trdd-id: 3KBUODCE
 title: Configurable providers via providers.json
-column: dev
+column: human_review
 status: tasked
 created: 2026-10-02T08:41:56+0200
-updated: 2026-10-02T08:41:56+0200
+updated: 2026-10-02T09:13:51+0200
 current-owner: main-agent@jgrep
 created-by: main-agent@jgrep
 task-type: feature
@@ -15,6 +15,7 @@ mandated-by: none
 approved: true
 approval-judge: main-agent@jgrep
 approval-datetime: 2026-10-02T08:41:56+0200
+implementation-commits: [929223b, 0bc40e4, fb87e8d]
 ---
 
 # Configurable providers via providers.json
@@ -108,3 +109,7 @@ Writes `~/.jgrep/providers.json` (0600 in 0700, atomic): picks a provider (openr
 ## Approval log
 
 - 2026-10-02T08:41:56+0200 — MANDATE issued by main-agent@jgrep (min-approval-requirement: none). Pre-approved: issuer authority >= required approver. No approval request was sent.
+
+## Implementation notes
+
+- 2026-10-02: implemented in 929223b (feature), 0bc40e4 (README, CHANGELOG), fb87e8d (coordinator correction: a choice judged in parts takes the label with the highest probability in any part). Cache lookups accept any model of the chain, the head's first, so a dead first key does not re-bill every run (answers are still written under the model that gave them). A missing key is named before a missing account id (Quicksilver's order). Test runs use a bunfig preload: own empty JGREP_HOME, provider keys cleared unless JGREP_E2E_LIVE=1. Not done here: live Cloudflare and Vercel checks (no credentials exported); their e2e tests are gated on CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID and AI_GATEWAY_API_KEY.
