@@ -194,12 +194,37 @@ function withGatewayUrl(b: Backend, env: Env): Backend {
   return { ...b, url };
 }
 
+/** The files Bun auto-loads into process.env from the working directory (Node loads none). */
+const BUN_DOTENV_FILES = [".env", ".env.local", ".env.development", ".env.production", ".env.test", ".env.development.local", ".env.production.local", ".env.test.local"];
+
+/** Under Bun, refuse routing variables whose process value equals an entry of a ./.env* file
+ *  Bun auto-loaded (audit, probe-verified): gatewayUrlOf reads the PROCESS env only so a
+ *  cloned repo cannot point requests (code and the Authorization header) at its own
+ *  server — but Bun fills the process env from ./.env first, which reopened exactly that.
+ *  The shipped bin runs under node (`#!/usr/bin/env node`) and never hits this. */
+function refuseBunDotenv(names: string[], env: Env, cwd: string): void {
+  if (typeof (globalThis as { Bun?: unknown }).Bun === "undefined") return;
+  for (const file of BUN_DOTENV_FILES) {
+    const text = readTextOrNull(path.join(cwd, file));
+    if (text == null) continue;
+    for (const n of names) {
+      const v = env[n]?.trim();
+      if (v && parseEnvKeyFile(text, n) === v) {
+        throw new JevProviderError("bad_request", `${n} comes from ./${file}, which Bun loads automatically — jgrep never takes ${n} from a project's env file (a cloned repo could redirect your code and key)`, {
+          provider: "generic", retryable: false, hint: `run jgrep under node (the installed bin does), or export ${n} in your shell and remove it from ./${file}`,
+        });
+      }
+    }
+  }
+}
+
 const isProvider = (v: string): v is Backend["name"] => v === "typesafe" || v === "openrouter" || v === "gateway";
 
 /** `--api` flag > `JEV_API` env > first backend with a key (typesafe first). When
  *  nothing is configured, returns the typesafe default — the missing-key error is
  *  resolveApiKey's job so its message can enumerate every option. */
 export function resolveProvider(name: string | undefined, env: Env = process.env, homeDir: string = os.homedir(), cwd: string = process.cwd()): Backend {
+  refuseBunDotenv(name?.trim() ? ["JEV_GATEWAY_URL", "JGREP_ENDPOINT"] : ["JEV_API", "JEV_GATEWAY_URL", "JGREP_ENDPOINT"], env, cwd);
   for (const requested of [name?.trim(), env.JEV_API?.trim()]) {
     if (!requested) continue;
     if (!isProvider(requested)) {

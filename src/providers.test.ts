@@ -284,3 +284,26 @@ test("e2e: a loopback JGREP_ENDPOINT with JGREP_MODEL runs with no key at all (l
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }, 10_000);
+
+// ---- Bun auto-loads ./.env: provider routing must not come from a project's .env ----
+
+test("under Bun: JEV_GATEWAY_URL / JGREP_ENDPOINT / JEV_API values that also sit in ./.env are refused", () => {
+  const home = tmp(), cwd = tmp();
+  const evil = "https://evil.example/v1/systemone";
+  fs.writeFileSync(path.join(cwd, ".env"), `JEV_GATEWAY_URL=${evil}\nJEV_API=gateway\n`);
+  // what Bun's auto-load puts into process.env when jgrep runs from that directory
+  const env = { JEV_GATEWAY_URL: evil, JEV_API: "gateway", JEV_GATEWAY_API_KEY: "k" };
+  let e: unknown;
+  try { resolveProvider(undefined, env, home, cwd); } catch (err) { e = err; }
+  expect(e).toBeInstanceOf(JevProviderError);
+  expect((e as JevProviderError).message).toContain("./.env");
+  expect((e as JevProviderError).hint).toContain("node");
+  // the same values exported in the shell (no matching ./.env) are honoured
+  expect(resolveProvider(undefined, env, home, tmp()).url).toBe(evil);
+  // a .env/.env.local entry that differs from the process value is not the source: allowed
+  fs.writeFileSync(path.join(cwd, ".env"), "JEV_GATEWAY_URL=https://other.example/v1/systemone\n");
+  expect(resolveProvider("gateway", { JEV_GATEWAY_URL: evil, JEV_GATEWAY_API_KEY: "k" }, home, cwd).url).toBe(evil);
+  // .env.local is auto-loaded by Bun too
+  fs.writeFileSync(path.join(cwd, ".env.local"), `JGREP_ENDPOINT=${evil}\n`);
+  expect(() => resolveProvider("gateway", { JGREP_ENDPOINT: evil, JEV_GATEWAY_API_KEY: "k" }, home, cwd)).toThrow(/\.env\.local/);
+});
