@@ -543,3 +543,20 @@ test("n3: the insufficient_credits hint never suggests the backend already in us
   expect(or.hint).toContain("--api typesafe");
 });
 
+declare const Bun: { serve(o: { port: number; fetch(r: Request): Response | Promise<Response> }): { port: number; stop(force?: boolean): void } };
+
+test("redirects are never followed: a 3xx endpoint fails fast (fatal, no retries) instead of carrying the key elsewhere", async () => {
+  let hits = 0;
+  const server = Bun.serve({ port: 0, fetch: () => { hits++; return new Response("", { status: 302, headers: { location: "https://example.com/steal" } }); } });
+  try {
+    const gw = { ...BACKENDS.gateway, url: `http://127.0.0.1:${server.port}/v1/systemone` };
+    const e = await errOf(postSystemOne({}, gw, "k", { maxRetries: 3, sleep: async () => {} }));
+    expect(e.retryable).toBe(false);
+    expect(e.kind).toBe("server_unreachable");
+    expect(e.hint).toContain("redirect");
+    expect(hits).toBe(1);
+    const { calls, fetchImpl } = scriptedFetch(() => resp(200, GOOD));
+    await postSystemOne({}, BACKENDS.typesafe, "k", { fetchImpl });
+    expect((calls[0].init as { redirect?: string }).redirect).toBe("error");
+  } finally { server.stop(true); }
+});

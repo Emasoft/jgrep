@@ -2,7 +2,7 @@
 // precedence, per-provider API-key lookup chain and key-file IO — plus the WI-11
 // HTTP engine (RateLimiter, postSystemOne, verifyApiKey). No deps.
 import {
-  classifyStatus, classifyTransport, jitteredDelayMs, parseRetryAfter, JevProviderError,
+  classifyStatus, classifyTransport, isRedirectError, jitteredDelayMs, parseRetryAfter, JevProviderError,
   RETRY_AFTER_MAX_MS, type JevErrorKind,
 } from "./errors";
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo; the surface used is trivial
@@ -433,6 +433,7 @@ function hintFor(kind: JevErrorKind, backend: Backend, snippet: string): string 
 
 /** Hints for transport failures: TLS carries the certificate message verbatim, timeouts name the flag. */
 function transportHint(kind: JevErrorKind, err: unknown): string {
+  if (isRedirectError(err)) return "the endpoint answered with a redirect, which jgrep never follows (the request carries your key) — use the final URL";
   if (kind === "tls_error") {
     const m = err != null && typeof err === "object" ? (err as { message?: unknown }).message : undefined;
     return typeof m === "string" && m ? m : "TLS/certificate problem — inspect the certificate chain";
@@ -520,6 +521,7 @@ export async function postSystemOne(
         headers: headersFor(apiKey, backend.url),
         body: json,
         signal,
+        redirect: "error", // never follow: a redirect would carry the Authorization header to another server
       });
       if (!res.ok) {
         // Read the body BEFORE classifying so a retry never needs it a second time.
@@ -619,6 +621,7 @@ export async function verifyApiKey(
         state: "ping",
         questions: { ok: { type: "noul", instructions: "Is the state the word ping?" } },
       }),
+      redirect: "error", // same rule as postSystemOne: the key never follows a redirect
       signal: AbortSignal.timeout(abortDelayMs(VERIFY_TIMEOUT_MS)), // literal int — floored for uniformity
     });
     let model: string | undefined;

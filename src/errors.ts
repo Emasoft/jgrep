@@ -75,14 +75,28 @@ type ErrLayer = { name?: unknown; code?: unknown; message?: unknown; cause?: unk
  * connection resets, refusals, DNS failures, unknown junk — is a retryable
  * server_unreachable, so the per-code table would only duplicate the fallthrough.
  */
-export function classifyTransport(err: unknown): { kind: JevErrorKind; retryable: boolean } {
+function layersOf(err: unknown): ErrLayer[] {
   const layers: ErrLayer[] = [];
   let cur: unknown = err;
   while (cur != null && typeof cur === "object" && layers.length < 5) {
     layers.push(cur as ErrLayer);
     cur = (cur as ErrLayer).cause;
   }
-  const str = (v: unknown): string => (typeof v === "string" ? v : "");
+  return layers;
+}
+const str = (v: unknown): string => (typeof v === "string" ? v : "");
+
+/** fetch(..., { redirect: "error" }) rejecting on a 3xx: Bun throws code
+ *  "UnexpectedRedirect", Node/undici a TypeError whose cause says "unexpected redirect". */
+export function isRedirectError(err: unknown): boolean {
+  return layersOf(err).some((l) => str(l.code) === "UnexpectedRedirect" || /unexpected redirect/i.test(str(l.message)));
+}
+
+export function classifyTransport(err: unknown): { kind: JevErrorKind; retryable: boolean } {
+  const layers = layersOf(err);
+  // A redirect is a misconfigured endpoint, not a transient failure: retrying cannot fix
+  // it, and following it would carry the Authorization header to another server.
+  if (isRedirectError(err)) return { kind: "server_unreachable", retryable: false };
   if (layers.some((l) => ABORT_NAMES.has(str(l.name)) || str(l.code) === "ABORT_ERR")) {
     return { kind: "timeout", retryable: true };
   }
