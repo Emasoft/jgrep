@@ -22,15 +22,16 @@ const okFetch = (p = 0.9) => {
   return { calls, fetchImpl };
 };
 
-test("chunkSignature: trims lines and drops blanks — whitespace-insensitive identity", () => {
-  expect(chunkSignature("  a \n\tb\n\nc\n")).toBe("a\nb\nc");
-  expect(chunkSignature("a\nb\nc")).toBe(chunkSignature("  a \n\tb\n\nc\n"));
+test("chunkSignature: strips trailing whitespace and blank lines, keeps leading indentation (B2)", () => {
+  expect(chunkSignature("  a \n\tb\n\nc\n")).toBe("  a\n\tb\nc");
+  expect(chunkSignature("  a\n\tb\nc")).toBe(chunkSignature("  a \r\n\tb\n\nc\n"));
+  expect(chunkSignature("a\nb\nc")).not.toBe(chunkSignature("  a\n\tb\nc"));
 });
 
 test("clustering: two signature-identical chunks send exactly ONE question for the pair", async () => {
   const cs = [
     mk("a.ts", 1, 3, "export function alpha() {\n  return 1;\n}\n"),
-    mk("b.ts", 40, 42, "export function alpha() {\n\treturn 1;\n}\n"), // tab indent: same signature, different raw text
+    mk("b.ts", 40, 42, "export function alpha() {  \r\n  return 1;\n\n}\n"), // trailing space/CRLF/blank line: same signature, different raw text
   ];
   const { calls, fetchImpl } = okFetch();
   const cache: Record<string, number> = {};
@@ -64,10 +65,10 @@ test("clustering: two different chunks are two questions (no false clustering)",
   expect(r.hits).toHaveLength(2);
 });
 
-test("clustering: whitespace variants (indent, trailing spaces, blank lines) share one signature", async () => {
+test("clustering: whitespace variants (trailing spaces, blank lines, CRLF) share one signature", async () => {
   const cs = [
     mk("a.ts", 1, 3, "export function gamma() {\n  return 3;\n}\n"),
-    mk("b.ts", 7, 10, "  export function gamma() {  \n\treturn 3;\n\n}\n"),
+    mk("b.ts", 7, 10, "export function gamma() {  \r\n  return 3;\t\n\n}\n"),
     mk("c.ts", 20, 24, "export function gamma() {\n\n\n  return 3;\n\n\n}\n"),
   ];
   const { calls, fetchImpl } = okFetch(0.8);
@@ -98,7 +99,7 @@ test("clustering: a failed head batch maps its error onto ALL signature siblings
 test("--group: groups[] built from hits, sorted p desc, count >= 2, representative present", async () => {
   const cs = [
     mk("a.ts", 1, 3, "export function alpha() {\n  return 1;\n}\n"),
-    mk("b.ts", 8, 10, "export function alpha() {\n return 1;\n}\n"), // same signature as a.ts
+    mk("b.ts", 8, 10, "export function alpha() {\n  return 1;   \n}\n"), // same signature as a.ts (trailing spaces only)
     mk("c.ts", 20, 22, "export function beta() {\n  return 2;\n}\n"),
     mk("d.ts", 30, 32, "export function beta() {\n  return 2;\n}\n"),
   ];

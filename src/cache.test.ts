@@ -15,8 +15,9 @@ const tmpDir = () => fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-cache-test-"))
 const chunkOf = (text: string): Chunk => ({ file: "f.ts", start: 1, end: 6, text });
 
 const BASE = "function one() {\n  return 1;\n}\nfunction two() {\n  return 2;\n}";
-// Whitespace-only variant of BASE: re-indented, trailing spaces, blank-line churn.
-const VARIANT = "   function one() {  \n\n\treturn 1;  \n\n\n}\n      function two() {\n\t\treturn 2;\n}\n";
+// Whitespace-only variant of BASE that must share its key: trailing spaces, blank-line
+// churn and CRLF line endings — but the SAME leading indentation (B2: indent-aware).
+const VARIANT = "function one() {  \r\n\r\n  return 1;  \n\n\n}\nfunction two() {\t\r\n  return 2;\n}\n";
 // Semantically different from BASE: must NOT share a cache key with it.
 const CHANGED = "function one() {\n  return 3;\n}\nfunction two() {\n  return 2;\n}";
 
@@ -47,16 +48,16 @@ const opts = (cache: Cache, fetchImpl: typeof fetch, extra: Record<string, unkno
 
 // ---- normalizeForCache --------------------------------------------------------
 
-test("normalizeForCache: whitespace-only reformatting collapses to one identity; content changes do not", () => {
+test("normalizeForCache: trailing-whitespace/blank-line/CRLF churn collapses to one identity; content and indentation changes do not", () => {
   expect(normalizeForCache(VARIANT)).toBe(normalizeForCache(BASE));
   expect(normalizeForCache(CHANGED)).not.toBe(normalizeForCache(BASE));
-  expect(normalizeForCache("  a \n\tb\n\nc\n")).toBe("a\nb\nc");
+  expect(normalizeForCache("  a \n\tb\n\nc\n")).toBe("  a\n\tb\nc"); // leading indentation kept (B2)
   expect(normalizeForCache("")).toBe(""); // empty text stays empty, no crash
 });
 
 // ---- normalized persistent keys (jgrep) ---------------------------------------
 
-test("cache keys are whitespace-normalized: a re-indented chunk re-run is cache-served, 0 new requests", async () => {
+test("cache keys are normalized: a trailing-space/blank-line/CRLF variant re-run is cache-served, 0 new requests", async () => {
   const file = path.join(tmpDir(), "cache.json");
   const calls: unknown[] = [];
   const fetchImpl = okFetch(calls);
@@ -68,7 +69,7 @@ test("cache keys are whitespace-normalized: a re-indented chunk re-run is cache-
   saveCache(cache1, file);
 
   const r2 = await jgrep("swallows errors", [chunkOf(VARIANT)], opts(loadCache(file), fetchImpl));
-  expect(calls).toHaveLength(1); // the re-indented twin is served from cache
+  expect(calls).toHaveLength(1); // the whitespace-churned twin is served from cache
   expect(r2.cached).toBe(1);
 });
 
@@ -106,7 +107,7 @@ test("rows: a whitespace-variant row is cache-served through the normalized judg
   const fetchImpl = okRowsFetch(calls);
   const questions: Questions = { match: { type: "noul", instructions: "is this skincare?" } };
   const rows1: Row[] = [{ handle: "@a", bio: "morning routine\nserum first\nspf always" }];
-  const rows2: Row[] = [{ handle: "@a", bio: "  morning routine  \n\n\tserum first  \n\nspf always\n" }];
+  const rows2: Row[] = [{ handle: "@a", bio: "morning routine  \r\n\nserum first  \n\nspf always\n" }];
 
   const cache1: Cache = {};
   const r1 = await scoreRows(rows1, questions, { batch: 4, concurrency: 1, apiKey: "k", fetchImpl, cache: cache1 });
@@ -218,4 +219,63 @@ test("loadCache: corrupt, empty, and missing files all degrade to an empty cache
   const empty = path.join(dir, "empty.json");
   fs.writeFileSync(empty, "{}");
   expect(loadCache(empty)).toEqual({});
+});
+
+// ---- B2: indent-aware normalization ------------------------------------------
+// USER decision 2026-10-02 (verbatim): "Indent-aware everywhere". Only trailing
+// whitespace, blank lines and the line-ending style are normalized; leading indentation
+// is meaning (Python blocks, YAML nesting, Makefile tabs, diff markers) and stays in
+// both the persistent cache key and the in-run signature.
+const PY_OUT = "if cond:\n    do_thing()\nreturn x";     // return runs always
+const PY_IN = "if cond:\n    do_thing()\n    return x";  // return runs only when cond
+
+/** Judge that tells the two Python snippets apart: p 0.9 only for the indented return. */
+const pyJudge = (calls: unknown[]) =>
+  (async (_url: unknown, init: { body: string }) => {
+    const body = JSON.parse(init.body);
+    calls.push(body);
+    const answers: Record<string, unknown> = {};
+    for (const c of body.state.chunks) answers[c.id] = { type: "noul", noul: /\n {4}return x/.test(c.code) ? 0.9 : 0.1 };
+    return new Response(JSON.stringify({ answers, usage: { input_tokens: 10 } }), { status: 200 });
+  }) as unknown as typeof fetch;
+
+test("B2 normalizeForCache / chunkSignature keep leading indentation; trailing space, blank lines and CRLF still collapse", async () => {
+  const { chunkSignature } = await import("./jgrep");
+  expect(normalizeForCache(PY_IN)).not.toBe(normalizeForCache(PY_OUT));
+  expect(chunkSignature(PY_IN)).not.toBe(chunkSignature(PY_OUT));
+  const churn = "if cond:   \r\n\r\n    do_thing()\t\r\n\n    return x\n\n";
+  expect(normalizeForCache(churn)).toBe(normalizeForCache(PY_IN));
+  expect(chunkSignature(churn)).toBe(chunkSignature(PY_IN));
+});
+
+test("B2 in-run: two Python snippets differing only in indentation are judged separately", async () => {
+  const calls: unknown[] = [];
+  const r = await jgrep("returns only when cond", [
+    { file: "a.py", start: 1, end: 3, text: PY_OUT },
+    { file: "b.py", start: 1, end: 3, text: PY_IN },
+  ], opts({}, pyJudge(calls), { batch: 1 }));
+  expect(calls).toHaveLength(2); // no signature clustering across the two
+  expect(r.all.find((h) => h.file === "a.py")!.p).toBe(0.1);
+  expect(r.all.find((h) => h.file === "b.py")!.p).toBe(0.9);
+  expect(r.hits.map((h) => h.file)).toEqual(["b.py"]);
+});
+
+test("B2 persistent: a cached verdict for one indentation is never served for the other", async () => {
+  const calls: unknown[] = [];
+  const cache: Cache = {};
+  await jgrep("returns only when cond", [{ file: "a.py", start: 1, end: 3, text: PY_OUT }], opts(cache, pyJudge(calls)));
+  const r = await jgrep("returns only when cond", [{ file: "b.py", start: 1, end: 3, text: PY_IN }], opts(cache, pyJudge(calls)));
+  expect(calls).toHaveLength(2); // b.py re-judged, not served from a.py's entry
+  expect(r.cached).toBe(0);
+  expect(r.hits.map((h) => h.p)).toEqual([0.9]);
+});
+
+test("B2 in-run: identical text under different markdown sections is judged per section (context in the signature)", async () => {
+  const calls: unknown[] = [];
+  const text = "Run the installer.\n\nThen restart.";
+  await jgrep("explains uninstalling", [
+    { file: "a.md", start: 1, end: 3, text, context: "Doc > Install" },
+    { file: "a.md", start: 9, end: 11, text, context: "Doc > Uninstall" },
+  ], opts({}, okFetch(calls), { batch: 1 }));
+  expect(calls).toHaveLength(2);
 });

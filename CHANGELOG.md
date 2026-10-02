@@ -28,7 +28,7 @@ isolation), and WI-12 (benchmarks); markdown chunking ships here too.
 
 ### Added
 
-- **`--group`** (WI-3): chunks sharing a whitespace-normalized signature are
+- **`--group`** (WI-3): chunks sharing a normalized (indent-aware) signature are
   near-identical boilerplate — the first is judged, siblings inherit its
   verdict (exactly one question for the whole family), and `--group` prints
   one group per signature (representative body + sites; `--json`/`--json-errors`
@@ -61,8 +61,11 @@ isolation), and WI-12 (benchmarks); markdown chunking ships here too.
 - **`--envelopes`** (WI-9): appends each chunk's numbers (`[numbers: 42, 7]`)
   to the judged text, steadying Jev's counting of quantities; off by default,
   and envelope/non-envelope runs share one cache.
-- **Cache hardening** (WI-6): keys hash the whitespace-normalized chunk text
-  (reformatting a file no longer re-bills; old raw-text keys miss once and
+- **Cache hardening** (WI-6): keys hash the normalized chunk text (trailing
+  whitespace, blank lines and line endings no longer re-bill; leading
+  indentation is kept, so differently indented code is never served another
+  block's verdict — the in-run `--group` signature follows the same rule and
+  also includes the markdown section; old raw-text keys miss once and
   re-bill, no migration code), saves are atomic (temp file + rename, so
   concurrent processes never see a half-written cache), and the cache is
   capped at 10,000 entries with oldest-first eviction (v1 envelope with an

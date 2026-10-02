@@ -346,10 +346,11 @@ failed batch is retried as a whole: keeping per-answer results from a failed
 batch depends on the provider returning per-question answers alongside errors,
 which is still to be verified on OpenRouter.
 
-New in 0.7.0. Cache keys hash the **whitespace-normalized** chunk
-text (lines trimmed, blank lines dropped) rather than the raw bytes, so
-reformatting a file — re-indentation, trailing spaces, blank-line churn — does
-not re-bill; any change in actual content still does. Entries keyed on the old
+New in 0.7.0. Cache keys hash the **normalized** chunk text (trailing
+whitespace stripped, blank lines dropped, line endings unified) rather than the
+raw bytes, so trailing spaces, blank-line churn and CRLF/LF changes do not
+re-bill; any change in content or in leading indentation still does
+(indentation is meaning in Python, YAML, Makefiles and diffs). Entries keyed on the old
 raw chunk text simply miss once and re-bill after upgrading; there is no
 migration code. The cache is also capped at **10,000 entries** (`v1` envelope
 with an insertion-order list): when a save would exceed the cap, the oldest
@@ -419,7 +420,7 @@ full.
   `p >= 0.6 × threshold`.
 - `--envelopes` appends each chunk's numbers (`[numbers: 42, 7]`) to the judged
   chunk text, steadying Jev's counting of quantities (off by default; cache keys
-  stay keyed on the whitespace-normalized chunk text, so an envelope re-run
+  stay keyed on the normalized chunk text, so an envelope re-run
   replays for free).
 - `--estimate` is a dry run: the run builds every request it would send (cached
   chunks are free) and prints per-file chunk counts plus the estimated requests,

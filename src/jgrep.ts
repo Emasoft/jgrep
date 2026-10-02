@@ -264,16 +264,17 @@ export function evict(c: Cache, cap: number = CACHE_MAX_ENTRIES): Cache {
 }
 
 /**
- * Whitespace-normalized chunk identity for the persistent cache key (WI-6): lines
- * trimmed, blank lines dropped, re-joined — the same rule as chunkSignature, kept a
- * SEPARATE function because the two serve different masters. chunkSignature only
- * dedups identical chunks WITHIN one run; this one decides what a cached judgment
- * costs: whitespace-only reformatting (re-indentation, trailing spaces, blank-line
- * churn) must not re-bill, while any change in actual content still hashes
- * differently and re-bills. Rows mode normalizes the judged row through this too.
+ * Chunk identity for the persistent cache key (WI-6) AND the in-run signature
+ * (chunkSignature): trailing whitespace (incl. a CRLF's \r) stripped and blank lines
+ * dropped, so trailing-space, blank-line and line-ending churn does not re-bill.
+ * LEADING INDENTATION IS KEPT — USER decision 2026-10-02 (B2): "Indent-aware
+ * everywhere". Trimming it aliased different code: in Python `return x` under an `if`
+ * and after it normalized identically, so one verdict (and its cache entry) was served
+ * for both; YAML nesting, Makefile tabs and diff context markers broke the same way.
+ * Rows mode normalizes the judged row through this too.
  */
 export function normalizeForCache(text: string): string {
-  return text.split("\n").map((l) => l.trim()).filter((l) => l.length > 0).join("\n");
+  return text.split("\n").map((l) => l.trimEnd()).filter((l) => l.length > 0).join("\n");
 }
 
 /** Disk format v1 (WI-6): `{"v":1,"entries":{…},"order":["key",…]}` with `order` =
@@ -310,21 +311,24 @@ export function saveCache(c: Cache, file: string = CACHE_FILE) {
     try { fs.rmSync(tmp, { force: true }); } catch { /* cache is best-effort */ }
   }
 }
-// Normalized signature: whitespace-insensitive chunk identity. Chunks sharing
-// a signature are near-identical boilerplate — judge one, siblings inherit.
+// In-run signature: the same indent-aware rule as the cache key (B2, see
+// normalizeForCache). Chunks sharing a signature are identical code modulo trailing
+// whitespace and blank lines — judge one, siblings inherit.
 export function chunkSignature(text: string): string {
-	return text.split("\n").map(l => l.trim()).filter(l => l.length > 0).join("\n");
+  return normalizeForCache(text);
 }
 
-// Intra-run signature key (WI-3): sha1 over (kind, question, normalized text).
-// Deliberately NOT the persistent cache key below — the signature only dedups
-// identical chunks WITHIN a single run.
+// Intra-run signature key (WI-3): sha1 over (kind, question, normalized text, context).
+// Deliberately NOT the persistent cache key below — the signature only dedups identical
+// chunks WITHIN a single run. The markdown context is part of it (B2): the question names
+// the section, so identical text under two headings is two different questions.
 const sigKey = (kind: Kind, q: string, c: Chunk) =>
-  createHash("sha1").update(`${kind}\0${q}\0${chunkSignature(c.text)}`).digest("hex");
+  createHash("sha1").update(`${kind}\0${q}\0${chunkSignature(c.text)}\0${c.context ?? ""}`).digest("hex");
 
 // Persistent cache key (WI-6): sha1 over (model, kind, question, NORMALIZED chunk
-// text [, context]) — normalizeForCache(c.text), not the raw bytes, so whitespace-
-// only reformatting of a file never re-bills while any content change does. Old
+// text [, context]) — normalizeForCache(c.text), not the raw bytes, so trailing-
+// whitespace, blank-line and line-ending churn never re-bills while any content or
+// indentation change does (B2). Old
 // raw-text keys simply miss and re-bill once (no migration code; README note).
 // Markdown chunks fold their context trail into the key; chunks without context
 // keep the exact pre-markdown key shape (no trailing \0). The #v{i} (votes) and
@@ -467,7 +471,7 @@ export interface Options {
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
 export interface ChunkError { file: string; start: number; end: number; kind: JevErrorKind; message: string; hint?: string }
-/** One signature cluster (WI-3 --group): hits sharing a whitespace-normalized signature.
+/** One signature cluster (WI-3 --group): hits sharing a normalized (indent-aware) signature.
  *  `p` is the group's best probability, `sites` are the hit sites in hit (file) order and
  *  `representative` is the first hit's chunk body. */
 export interface Group { sig: string; p: number; count: number; sites: { file: string; start: number; end: number }[]; representative: string }
@@ -503,10 +507,10 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
   let apiKey = o.apiKey;
   const apiKeyOf = (): string => { apiKey ??= resolveApiKey(backend); return apiKey; };
   const all: (Hit | undefined)[] = new Array(chunks.length); // errored chunks stay unset
-  // Signature clustering (WI-3): chunks sharing a whitespace-normalized signature are
+  // Signature clustering (WI-3): chunks sharing a normalized (indent-aware) signature are
   // near-identical boilerplate — the FIRST cache-missing chunk of a signature (the head)
   // enters the batch todo, siblings inherit the head's verdict once the pool settles.
-  // The persistent cache is keyed on the whitespace-normalized chunk text (WI-6);
+  // The persistent cache is keyed on the indent-aware normalized chunk text (WI-6, B2);
   // `cached` counts only genuinely cache-served chunks — an inheriting sibling is
   // deduped, not cached.
   const heads = new Map<string, number>();        // signature key -> head chunk index

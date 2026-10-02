@@ -75,9 +75,10 @@ export function buildRowsRequest(rows: Row[], questions: Questions, model = "jev
 }
 
 // Cache key (WI-6): the row — the judged content of rows mode — is normalized before
-// hashing: every string value goes through normalizeForCache (lines trimmed, blank
-// lines dropped), so whitespace-only reformatting of a CSV/JSONL row (re-indentation,
-// trailing spaces, blank-line churn) does not re-bill; any content change does.
+// hashing: every string value goes through normalizeForCache (trailing whitespace
+// stripped, blank lines dropped, leading indentation KEPT — B2), so trailing-space,
+// blank-line and line-ending churn in a CSV/JSONL value does not re-bill; any content
+// or indentation change does.
 // Model and question JSON stay verbatim. Vote/verify-style suffixes (none here yet)
 // would compose after this normalized base.
 const normalizeRow = (r: Row) =>
