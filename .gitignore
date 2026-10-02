@@ -4,3 +4,9 @@ dist/
 *.tgz
 bench/results/
 .DS_Store
+.env.*
+reports/
+reports_dev/
+*_dev/
+.janitor/
+.trashcan/
