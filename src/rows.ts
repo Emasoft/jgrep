@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { BACKENDS, DEFAULT_PRICE_PER_MTOK, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
 import { runPool, type PoolResult } from "./pool";
 import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
-import { DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, KEY_WORKED_EARLIER_HINT, BudgetMeter, normalizeForCache, type Cache, type Estimate } from "./jgrep";
+import { DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, KEY_WORKED_EARLIER_HINT, BudgetMeter, normalizeForCache, settledCost, type Cache, type Estimate } from "./jgrep";
 
 export type Row = Record<string, string>;
 export type Questions = Record<string, { type: "noul" | "choice" | "score"; instructions: string; [k: string]: unknown }>;
@@ -137,14 +137,15 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
     limiter: o.ratePerSec && o.ratePerSec > 0 ? new RateLimiter(o.ratePerSec, Math.max(1, o.concurrency)) : undefined,
   };
   let tokens = 0;
-  let cost: number | undefined; // stays undefined unless a provider reports a cost
+  let cost: number | undefined; // undefined until a pack is answered; then the settledCost sum (same rule as the meter)
+  const price = o.pricePerMtok ?? DEFAULT_PRICE_PER_MTOK;
   // Run-level success flag (plan §1.5), same rule as jgrep(): drives the invalid_api_key
   // expired-vs-wrong-key hint. Tracked HERE (not PoolResult) because failFast throws the
   // pool result away.
   let hadSuccess = false;
   // --budget (B4): rows used to ignore the budget entirely (cli.ts passed it, RowsOptions
   // dropped it). Same opt-in reservation meter as jgrep(); no budget = no meter.
-  const meter = o.budget !== undefined ? new BudgetMeter(o.budget, o.pricePerMtok ?? DEFAULT_PRICE_PER_MTOK) : undefined;
+  const meter = o.budget !== undefined ? new BudgetMeter(o.budget, price) : undefined;
   const worker = async (b: number[], index: number): Promise<PackOutcome> => {
     const req = buildRowsRequest(b.map((i) => rows[i]), questions, model);
     // --estimate: count before apiKeyOf() so a dry run needs no key.
@@ -155,7 +156,7 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
     });
     const res = await (meter ? meter.run(req, backend.name, go) : go()); // throws budget_exhausted unsent
     tokens += res.usage?.input_tokens ?? 0;
-    if (res.cost !== undefined) cost = (cost ?? 0) + res.cost;
+    cost = (cost ?? 0) + settledCost(res, price);
     const rowResults = b.map((ri, j) => {
       const a: Record<string, Answer> = {};
       for (const name of Object.keys(questions)) a[name] = res.answers[`r${j}.${name}`] ?? { type: "missing" };

@@ -185,3 +185,27 @@ test("--budget: a retried 5xx is charged its reservation; a 400 (never processed
   expect(bad.st.requests).toBe(10);
   expect(r4.errors.every((e) => e.kind === "bad_request")).toBe(true);
 });
+
+// ---- run cost = per-request settled cost, same rule as the meter (PR #2 open item) ----
+
+/** First request reports a provider cost, every later one reports only tokens. */
+const intermittentFetch = (reported: number, tokens: number) => {
+  let n = 0;
+  return (async (_u: unknown, init: { body: string }) => {
+    const body = JSON.parse(init.body);
+    const answers: Record<string, unknown> = {};
+    for (const id of Object.keys(body.questions)) answers[id] = { type: "noul", noul: 0.9 };
+    const first = n++ === 0;
+    return new Response(JSON.stringify({ answers, usage: { input_tokens: tokens }, ...(first ? { cost: reported } : {}) }), { status: 200 });
+  }) as unknown as Fetch;
+};
+
+test("run cost: a provider reporting cost only sometimes is not undercounted (jgrep, rows, tests)", async () => {
+  const unreported = (10 * PRICE) / 1e6; // one token-priced request: 10 tokens at $1000/Mtok = $0.01
+  const r = await jgrep("q", nChunks(3), { threshold: 0.7, batch: 1, concurrency: 1, pricePerMtok: PRICE, apiKey: "k", fetchImpl: intermittentFetch(0.5, 10), cache: {} });
+  expect(r.cost).toBeCloseTo(0.5 + 2 * unreported, 12); // before: 0.5 — the two unreported requests were free
+  const rows = await scoreRows(rowsOf(3), Q, { batch: 1, concurrency: 1, pricePerMtok: PRICE, apiKey: "k", fetchImpl: intermittentFetch(0.5, 10), cache: {} });
+  expect(rows.cost).toBeCloseTo(0.5 + 2 * unreported, 12);
+  const t = await selectTests(DIFF, testFiles(3), { threshold: 0.5, batch: 1, concurrency: 1, pricePerMtok: PRICE, apiKey: "k", fetchImpl: intermittentFetch(0.5, 10), cache: {} });
+  expect(t.cost).toBeCloseTo(0.5 + 2 * unreported, 12);
+});

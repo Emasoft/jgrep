@@ -407,6 +407,13 @@ export const estimateLine = (e: Estimate, pricePerMtok: number): string => {
   return `estimated: ${e.requests} requests, ~${tokens} input tokens, ~$${(tokens * pricePerMtok / 1e6).toFixed(4)} (list price, cached chunks free; nothing was sent)`;
 };
 
+/** What ONE answered request cost: the provider-reported cost when present, else its
+ *  billed input tokens × $/Mtok. The single rule for the --budget meter AND every run's
+ *  reported total — summing only reported costs undercounted runs whose provider reports
+ *  cost on some responses and not others (PR #2 open item). */
+export const settledCost = (res: { usage?: { input_tokens?: number }; cost?: number }, pricePerMtok: number): number =>
+  res.cost ?? ((res.usage?.input_tokens ?? 0) * pricePerMtok) / 1e6;
+
 // ---- --budget: hard cap via reservation (B1) -----------------------------------
 /** Run-wide spend meter, created ONLY when a budget is set. USER decision 2026-10-02:
  *  "Hard cap via reservation" and "make the cap opt-in. by default no cap should be
@@ -442,7 +449,7 @@ export class BudgetMeter {
     let real = 0;
     try {
       const res = await send();
-      real = res.cost ?? ((res.usage?.input_tokens ?? 0) * this.pricePerMtok) / 1e6;
+      real = settledCost(res, this.pricePerMtok);
       return res;
     } catch (e) {
       // A failure the provider may still have billed keeps its reservation as spend
@@ -485,6 +492,8 @@ export interface ChunkError { file: string; start: number; end: number; kind: Je
  *  `p` is the group's best probability, `sites` are the hit sites in hit (file) order and
  *  `representative` is the first hit's chunk body. */
 export interface Group { sig: string; p: number; count: number; sites: { file: string; start: number; end: number }[]; representative: string }
+/** `cost`: the run's spend, every answered request settled by settledCost (undefined when
+ *  no request was answered — a fully cached or estimate-only run). */
 export interface Result { hits: Hit[]; all: Hit[]; chunks: number; tokens: number; cached: number; errors: ChunkError[]; cost?: number; groups?: Group[] }
 
 /** What one batch worker hands back; runPool results are completion-ordered, so the
@@ -568,9 +577,10 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
     limiter: o.ratePerSec && o.ratePerSec > 0 ? new RateLimiter(o.ratePerSec, Math.max(1, o.concurrency)) : undefined,
   };
   let tokens = 0;
-  let cost: number | undefined; // stays undefined unless a provider reports a cost
+  let cost: number | undefined; // undefined until a request is answered; then the settledCost sum
+  const price = o.pricePerMtok ?? DEFAULT_PRICE_PER_MTOK;
   // --budget (B1): one meter for the main, verify and tag passes; none without a budget.
-  const meter = o.meter ?? (o.budget !== undefined ? new BudgetMeter(o.budget, o.pricePerMtok ?? DEFAULT_PRICE_PER_MTOK) : undefined);
+  const meter = o.meter ?? (o.budget !== undefined ? new BudgetMeter(o.budget, price) : undefined);
   /** Every provider request of this run goes through here: per-batch deadline (retries
    *  included, §1.6.1), lazy key, and the budget reservation when a budget is set. */
   const send = (req: unknown) => {
@@ -590,7 +600,7 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
     }
     const res = await send(req); // --budget: reserves first; throws budget_exhausted unsent
     tokens += res.usage?.input_tokens ?? 0;
-    if (res.cost !== undefined) cost = (cost ?? 0) + res.cost;
+    cost = (cost ?? 0) + settledCost(res, price);
     // Finite p-values go straight into the in-memory cache object: cli.ts persists it in a
     // finally (Step 7), so answers paid for survive even when other batches fail. A chunk
     // the provider did not answer (missing or non-finite p on a 200) is skipped here and
@@ -723,7 +733,7 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
           req.questions[id] = { type: "noul", instructions: VERIFY_PREFIX + (req.questions[id] as { instructions: string }).instructions };
         const res = await send(req); // --budget meters the verify pass too
         tokens += res.usage?.input_tokens ?? 0;
-        if (res.cost !== undefined) cost = (cost ?? 0) + res.cost;
+        cost = (cost ?? 0) + settledCost(res, price);
         const got: { hit: Hit; p: number }[] = [];
         const missing: Hit[] = [];
         bp.forEach(({ hit, cacheKey }, j) => {
@@ -792,7 +802,7 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
         // which this pass drops by policy (hits stay untagged, the run is not errored).
         const res = await send(buildTagRequest(bh, tags, kind, model));
         tokens += res.usage?.input_tokens ?? 0;
-        if (res.cost !== undefined) cost = (cost ?? 0) + res.cost;
+        cost = (cost ?? 0) + settledCost(res, price);
         const got: { hit: Hit; tag: string; p: number }[] = [];
         bh.forEach((hit, j) => {
           // A choice answer names its criterion by KEY (`t0`) with `probabilities`

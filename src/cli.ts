@@ -438,7 +438,7 @@ async function main() {
         if (o.show) console.log(h.text.split("\n").map((l) => "    " + l).join("\n") + "\n");
       }
     }
-    const cost = r.cost ?? (r.tokens * wiring.pricePerMtok) / 1e6;
+    const cost = r.cost ?? 0; // settled per request (reported cost, else tokens × $/Mtok); undefined = nothing answered
     // --budget (WI-7): when the meter tripped, the summary names the stop and the limit
     // (the per-chunk budget_exhausted errors already carry the "raise --budget" hint).
     const budgetStopped = r.errors.some((e) => e.kind === "budget_exhausted");
@@ -478,7 +478,7 @@ async function testsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
     const rows = o.all ? [...r.all].sort((a, b) => b.p - a.p) : r.selected;
     if (o.json) console.log(JSON.stringify(rows, null, 2));
     else for (const s of rows) console.log(o.all || process.stdout.isTTY ? `${s.file}${c("90", `  p=${s.p.toFixed(2)} ${s.reason}`)}` : s.file);
-    const cost = r.cost ?? (r.tokens * wiring.pricePerMtok) / 1e6;
+    const cost = r.cost ?? 0; // settled per request (reported cost, else tokens × $/Mtok); undefined = nothing answered
     const byCode = r.all.filter((s) => s.reason === "direct" || s.reason === "import" || s.reason === "package").length;
     const budgetStopped = r.errors.some((e) => e.kind === "budget_exhausted"); // same suffix as code mode
     const summary = `${r.selected.length} of ${tests.length} tests selected (${byCode} by name/import, ${r.cached} cached) · ${r.requests} requests · ${r.tokens} tokens · $${cost.toFixed(4)} · ${((Date.now() - t0) / 1000).toFixed(1)}s`
@@ -549,7 +549,7 @@ async function rowsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
         console.log(`${c("35", o.rows)}${c("36", ":")}${c("32", String(s.i + 2))}  ${c(pcol, `p=${s.p.toFixed(2)}`)}  ${preview}`);
       }
     }
-    const cost = r.cost ?? (r.tokens * wiring.pricePerMtok) / 1e6;
+    const cost = r.cost ?? 0; // settled per request (reported cost, else tokens × $/Mtok); undefined = nothing answered
     const budgetStopped = r.errors.some((e) => e.kind === "budget_exhausted"); // same suffix as code mode
     const summary = `${o.questions ? Object.keys(questions).length + " questions x " : hits + " hits / "}${rows.length} rows (${r.cached} cached) · ${r.requests} requests · ${r.tokens} tokens · $${cost.toFixed(4)} · ${((Date.now() - t0) / 1000).toFixed(1)}s`
       + (budgetStopped ? ` · stopped by --budget at $${cost.toFixed(4)} (limit $${wiring.budget})` : "");

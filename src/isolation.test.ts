@@ -274,25 +274,26 @@ test("failFast: a 401 as the very first batch keeps the base hint — no earlier
 
 // ---- jgrep: cost passthrough ---------------------------------------------------
 
-test("cost: provider-reported cost is passed through and summed across batches; absent stays undefined", async () => {
+test("cost: provider-reported cost is passed through and summed; a request without one is priced by its tokens", async () => {
   const r1 = await jgrep("q", nChunks(2), { threshold: 0.7, batch: 2, concurrency: 1, apiKey: "k", fetchImpl: costFetch(0.0042), cache: {} });
   expect(r1.cost).toBe(0.0042); // single batch
   const r2 = await jgrep("q", nChunks(4), { threshold: 0.7, batch: 2, concurrency: 1, apiKey: "k", fetchImpl: costFetch(0.0042), cache: {} });
   expect(r2.cost).toBeCloseTo(0.0084, 12); // two batches, both reporting
   const r3 = await jgrep("q", nChunks(2), { threshold: 0.7, batch: 2, concurrency: 1, apiKey: "k", fetchImpl: costFetch(undefined), cache: {} });
-  expect(r3.cost).toBeUndefined(); // no provider-reported cost anywhere in the run
+  // no provider-reported cost: settled at tokens × the default $/Mtok (same rule as the --budget meter)
+  expect(r3.cost).toBeCloseTo((10 * 0.042) / 1e6, 15);
 });
 
 // ---- jgrep: back-compat on the clean path --------------------------------------
 
-test("back-compat: a clean run keeps hits/tokens and reports errors: [] with no cost", async () => {
+test("back-compat: a clean run keeps hits/tokens and reports errors: [] with a token-priced cost", async () => {
   const { calls, fetchImpl } = okFetch();
   const r = await jgrep("q", nChunks(3), { threshold: 0.7, batch: 2, concurrency: 4, apiKey: "k", fetchImpl, cache: {} });
   expect(calls).toHaveLength(2); // 3 chunks, batch 2
   expect(r.errors).toEqual([]);
   expect(r.hits).toHaveLength(3);
   expect(r.tokens).toBe(20); // 2 requests x 10 tokens
-  expect(r.cost).toBeUndefined();
+  expect(r.cost).toBeCloseTo((20 * 0.042) / 1e6, 15); // settled: no reported cost -> tokens × default price
 });
 
 // ---- jgrep: rate limiting ------------------------------------------------------

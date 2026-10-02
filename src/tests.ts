@@ -13,7 +13,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, KEY_WORKED_EARLIER_HINT,
-  BudgetMeter, listFiles, type Cache, type Estimate,
+  BudgetMeter, listFiles, settledCost, type Cache, type Estimate,
 } from "./jgrep";
 import { BACKENDS, DEFAULT_PRICE_PER_MTOK, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
 import { runPool, type PoolResult } from "./pool";
@@ -216,7 +216,8 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
     limiter: o.ratePerSec && o.ratePerSec > 0 ? new RateLimiter(o.ratePerSec, Math.max(1, o.concurrency)) : undefined,
   };
   let tokens = 0;
-  let cost: number | undefined; // stays undefined unless a provider reports a cost
+  let cost: number | undefined; // undefined until a pack is answered; then the settledCost sum (same rule as the meter)
+  const price = o.pricePerMtok ?? DEFAULT_PRICE_PER_MTOK;
   // Run-level success flag, same rule as jgrep()/scoreRows(): drives the
   // invalid_api_key expired-vs-wrong-key hint. Tracked HERE (not PoolResult) because
   // failFast throws the pool result away.
@@ -224,7 +225,7 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
   // --budget (audit MAJOR): --tests used to have no meter, so --budget / $JEV_BUDGET were
   // silently ignored here while every other mode honoured them. Same opt-in reservation
   // meter as jgrep()/scoreRows(); no budget = no meter.
-  const meter = o.budget !== undefined ? new BudgetMeter(o.budget, o.pricePerMtok ?? DEFAULT_PRICE_PER_MTOK) : undefined;
+  const meter = o.budget !== undefined ? new BudgetMeter(o.budget, price) : undefined;
   const worker = async (b: number[], index: number): Promise<BatchOutcome> => {
     const state = { diff: compact, tests: b.map((i, j) => ({ id: `t${j}`, file: tests[i].file, signature: tests[i].signature })) };
     const questions: Record<string, unknown> = {};
@@ -240,7 +241,7 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
     });
     const res = await (meter ? meter.run(req, backend.name, go) : go()); // throws budget_exhausted unsent
     tokens += res.usage?.input_tokens ?? 0;
-    if (res.cost !== undefined) cost = (cost ?? 0) + res.cost;
+    cost = (cost ?? 0) + settledCost(res, price);
     // Finite p-values go straight into the in-memory cache object: cli.ts persists it in
     // a finally, so answers paid for survive even when other batches fail.
     const entries: { testIndex: number; p: number }[] = [];
