@@ -336,8 +336,11 @@ export function chunkPaths(paths: string[], opts: ListOptions = {}): Chunk[] {
 // UTF-8 BYTES of the JSON request at a conservative ~1.5 bytes/token (hex, base64 and CJK
 // tokenize far denser than code's ~3.3), so a request at the cap stays under ~27k tokens.
 export const MAX_REQUEST_BYTES = 40_000;
-/** One chunk's text at most this many bytes: any chunk always fits a request with its question. */
-export const MAX_CHUNK_BYTES = 8_000;
+/** One chunk's text at most this many bytes (<= ~10.7k tokens even at 1.5 bytes/token): any
+ *  chunk always fits a request with its question. Big enough that a semantic unit the
+ *  chunkers keep whole on purpose — a Markdown section or fenced block of ~200 lines, such
+ *  as SKILL.md's embedded --help — still reaches the judge in one piece. */
+export const MAX_CHUNK_BYTES = 16_000;
 /** Lines repeated at each cut, so a match spanning the cut is still seen whole by one piece. */
 export const SPLIT_OVERLAP_LINES = 3;
 const SPLIT_OVERLAP_CHARS = 200; // the same idea when a single line has to be cut
