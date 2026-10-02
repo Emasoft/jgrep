@@ -432,8 +432,8 @@ full.
   request that does not fit in what is left is never sent, and its chunks error
   kind `budget_exhausted` with a `raise --budget` hint. Each response then
   replaces its reservation with the real cost (provider-reported, else billed
-  tokens × `$/Mtok`). It covers the search and its `--verify` and `--tag`
-  passes; hits and cached answers are kept. `0` sends nothing. The cap is as
+  tokens × `$/Mtok`). It covers the search, its `--verify` and `--tag`
+  passes, and `--rows`; hits and cached answers are kept. `0` sends nothing. The cap is as
   exact as the estimate, which is within about 15% of billed tokens.
 - `--sarif` prints SARIF 2.1.0 instead of text: one rule per description, one
   result per hit (file uri + region.startLine) — ingestible by GitHub code

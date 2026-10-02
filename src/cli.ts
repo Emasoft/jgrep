@@ -473,7 +473,9 @@ async function rowsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
       }
     }
     const cost = r.cost ?? (r.tokens * wiring.pricePerMtok) / 1e6;
-    const summary = `${o.questions ? Object.keys(questions).length + " questions x " : hits + " hits / "}${rows.length} rows (${r.cached} cached) · ${r.requests} requests · ${r.tokens} tokens · $${cost.toFixed(4)} · ${((Date.now() - t0) / 1000).toFixed(1)}s`;
+    const budgetStopped = r.errors.some((e) => e.kind === "budget_exhausted"); // same suffix as code mode
+    const summary = `${o.questions ? Object.keys(questions).length + " questions x " : hits + " hits / "}${rows.length} rows (${r.cached} cached) · ${r.requests} requests · ${r.tokens} tokens · $${cost.toFixed(4)} · ${((Date.now() - t0) / 1000).toFixed(1)}s`
+      + (budgetStopped ? ` · stopped by --budget at $${cost.toFixed(4)} (limit $${wiring.budget})` : "");
     console.error(c("90", r.errors.length ? summary + erroredSuffix(r.errors) : summary));
     printExamples(r.errors.map((e) => ({ line: `  ${e.kind}: row ${e.row} ${e.message.slice(0, 120)}`, hint: e.hint })));
     if (wrote) console.error(c("90", `wrote ${o.out}`));

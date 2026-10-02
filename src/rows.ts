@@ -3,10 +3,10 @@
 // rows per request. Output is the table with one answer column per question.
 import fs from "node:fs";
 import { createHash } from "node:crypto";
-import { BACKENDS, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
+import { BACKENDS, DEFAULT_PRICE_PER_MTOK, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
 import { runPool, type PoolResult } from "./pool";
 import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
-import { DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, KEY_WORKED_EARLIER_HINT, normalizeForCache, type Cache, type Estimate } from "./jgrep";
+import { DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, KEY_WORKED_EARLIER_HINT, BudgetMeter, normalizeForCache, type Cache, type Estimate } from "./jgrep";
 
 export type Row = Record<string, string>;
 export type Questions = Record<string, { type: "noul" | "choice" | "score"; instructions: string; [k: string]: unknown }>;
@@ -94,6 +94,8 @@ export interface RowsOptions {
   ratePerSec?: number;         // token-bucket pacing across all requests; 0/undefined = unlimited
   failFast?: boolean;          // rethrow the first fatal error instead of isolating it
   estimate?: Estimate;         // dry run: count requests/chars into this sink, never call the provider
+  budget?: number;             // --budget: hard cap via reservation, same as jgrep(); undefined = no cap
+  pricePerMtok?: number;       // $/Mtok for the budget reservation and token-priced spend (default DEFAULT_PRICE_PER_MTOK)
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
 
@@ -139,14 +141,18 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
   // expired-vs-wrong-key hint. Tracked HERE (not PoolResult) because failFast throws the
   // pool result away.
   let hadSuccess = false;
+  // --budget (B4): rows used to ignore the budget entirely (cli.ts passed it, RowsOptions
+  // dropped it). Same opt-in reservation meter as jgrep(); no budget = no meter.
+  const meter = o.budget !== undefined ? new BudgetMeter(o.budget, o.pricePerMtok ?? DEFAULT_PRICE_PER_MTOK) : undefined;
   const worker = async (b: number[], index: number): Promise<PackOutcome> => {
     const req = buildRowsRequest(b.map((i) => rows[i]), questions, model);
     // --estimate: count before apiKeyOf() so a dry run needs no key.
     if (o.estimate) { o.estimate.requests++; o.estimate.chars += JSON.stringify(req).length; return { index, rowResults: [] }; }
-    const res = await postSystemOne(req, backend, apiKeyOf(), {
+    const go = () => postSystemOne(req, backend, apiKeyOf(), {
       ...post,
       deadlineMs: Date.now() + timeoutMs, // per-batch deadline, retries included (§1.6.1)
     });
+    const res = await (meter ? meter.run(req, backend.name, go) : go()); // throws budget_exhausted unsent
     tokens += res.usage?.input_tokens ?? 0;
     if (res.cost !== undefined) cost = (cost ?? 0) + res.cost;
     const rowResults = b.map((ri, j) => {

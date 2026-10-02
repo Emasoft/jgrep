@@ -55,7 +55,8 @@ isolation), and WI-12 (benchmarks); markdown chunking ships here too.
   estimated cost before it is sent, a request that does not fit is never sent
   (its chunks error `budget_exhausted`), and the response replaces the
   reservation with the real cost — so concurrent workers can no longer
-  overshoot the budget by a whole wave of requests; `--sarif` prints SARIF 2.1.0
+  overshoot the budget by a whole wave of requests, and `--rows` now honours
+  it too (it used to ignore it); `--sarif` prints SARIF 2.1.0
   ingestible by GitHub code scanning.
 - **`--envelopes`** (WI-9): appends each chunk's numbers (`[numbers: 42, 7]`)
   to the judged text, steadying Jev's counting of quantities; off by default,
