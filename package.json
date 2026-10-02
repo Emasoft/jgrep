@@ -18,6 +18,7 @@
   "scripts": {
     "build": "bun build src/cli.ts --target=node --outfile=dist/jgrep.js && chmod +x dist/jgrep.js",
     "test": "bun test src/",
+    "sync-docs": "bun scripts/sync-docs.ts",
     "prepublishOnly": "bun run test && bun run build"
   },
   "devDependencies": {

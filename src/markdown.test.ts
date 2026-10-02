@@ -97,7 +97,7 @@ test("chunkMarkdown on the repo SKILL.md: the fenced help block is ONE chunk —
   expect(block[0].text).toContain("-t, --threshold <p>   print chunks with p >= this (default 0.7; 0.5 with --tests)");
   expect(block[0].text).toContain("exit status: 0 when something matched, 1 when nothing did");
   expect(block[0].text).toContain('jgrep --follow-symlinks --max-bytes 5000000 "reads user input" .');
-  expect(block[0].text).toContain("bun test $(jgrep --tests origin/main)"); // upstream's --tests lines ride along
+  expect(block[0].text).toContain("jgrep --tests origin/main | xargs bun test"); // upstream's --tests lines ride along
   expect(block[0].text).toContain("jgrep --provider compatible --model <name> \"<rule>\" src/"); // last USAGE line: the whole help is one chunk
   expect(block[0].text.split("\n").filter((l) => /^\s*```/.test(l))).toEqual(["```", "```"]); // fence open + close intact
 });

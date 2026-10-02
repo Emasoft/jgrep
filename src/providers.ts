@@ -126,7 +126,7 @@ function warnIfEnvNotGitignored(source: string, cwd: string): void {
 
 // ---- providers.json schema (version 1, shared with Quicksilver) ------------------
 export type Adapter = "system-one" | "cloudflare-ai-run" | "vercel-evaluation";
-const ADAPTER_NAMES: Adapter[] = ["system-one", "cloudflare-ai-run", "vercel-evaluation"];
+export const ADAPTER_NAMES: Adapter[] =["system-one", "cloudflare-ai-run", "vercel-evaluation"];
 
 /** One entry of providers.json, in the file's own (snake_case) schema. */
 export interface ProviderEntry {
@@ -171,8 +171,9 @@ const HEADER_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
 const SECRET_HEADER_RE = /^(authorization|cookie|proxy-authorization|x-api-key)$|-(key|token)$/i;
 const ACCOUNT_RE = /^[A-Za-z0-9]{1,64}$/;
 // User decision: "enabled" accepts these words, case-insensitive; anything else is an error.
-const TRUE_WORDS = new Set(["true", "enabled", "enable", "1", "yes", "y", "active", "on"]);
-const FALSE_WORDS = new Set(["false", "disabled", "disable", "0", "no", "n", "inactive", "off"]);
+// Exported: cli.ts USAGE and the error below list them from here, so the docs cannot drift.
+export const TRUE_WORDS: ReadonlySet<string> = new Set(["true", "enabled", "enable", "1", "yes", "y", "active", "on"]);
+export const FALSE_WORDS: ReadonlySet<string> = new Set(["false", "disabled", "disable", "0", "no", "n", "inactive", "off"]);
 const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 const LOOPBACK = ["localhost", "127.0.0.1", "[::1]"];
 
@@ -213,7 +214,8 @@ function parseEnabled(v: unknown, where: string): boolean {
   const w = typeof v === "string" ? v.trim().toLowerCase() : "";
   if (TRUE_WORDS.has(w)) return true;
   if (FALSE_WORDS.has(w)) return false;
-  throw configError(`${where}: "enabled" must be true/false (or yes/no, on/off, 1/0, enabled/disabled, active/inactive), got ${JSON.stringify(v)}`);
+  // Listed from the sets (the old hand-written list omitted enable/disable and y/n).
+  throw configError(`${where}: "enabled" must be one of ${[...TRUE_WORDS].join(", ")} or ${[...FALSE_WORDS].join(", ")} (any case), got ${JSON.stringify(v)}`);
 }
 
 /** A validated entry: the merged fields plus the parsed `enabled` and the compiled pattern. */
@@ -593,7 +595,7 @@ export type ChainLog = (e: JevProviderError, entry: ChainEntry, fallback: string
 /** Failures that hand the request to the next provider (user decision: fall back "in case of
  *  errors, exhausted credits, or missing env var"). bad_request is a request-shape problem that
  *  would fail on every provider, so it never falls back. */
-const FALLBACK_KINDS: ReadonlySet<JevErrorKind> = new Set<JevErrorKind>([
+export const FALLBACK_KINDS: ReadonlySet<JevErrorKind> = new Set<JevErrorKind>([
   "invalid_api_key", "insufficient_credits", "model_unavailable", "rate_limited", "server_unreachable",
   "timeout", "tls_error", "malformed_response", "forbidden",
 ]);
@@ -828,7 +830,8 @@ export class RateLimiter {
 }
 
 const REQUEST_TIMEOUT_MS = 30_000;
-const VERIFY_TIMEOUT_MS = 15_000;
+/** Default deadline of a free key check (`jgrep init` and `jgrep status` use it too; USAGE states it). */
+export const VERIFY_TIMEOUT_MS = 15_000;
 const SNIPPET_MAX = 300;
 
 export interface PostOpts {

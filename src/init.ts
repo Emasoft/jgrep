@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 import { execFile, spawnSync } from "node:child_process";
 import * as p from "@clack/prompts";
 import {
-  BUILTINS, buildEntries, builtinDoc, isLoopbackHttp, loadProviders, providersFile, readProvidersDoc, verifyApiKey, writeFileAtomic,
+  BUILTINS, buildEntries, builtinDoc, isLoopbackHttp, loadProviders, providersFile, readProvidersDoc, verifyApiKey, writeFileAtomic, VERIFY_TIMEOUT_MS,
   type Backend, type ProviderEntry,
 } from "./providers";
 
@@ -169,12 +169,16 @@ export function legacySkillCopies(home: string): string[] {
 }
 
 
+/** The options `jgrep init` accepts — src/skill.test.ts checks the init usage line of
+ *  cli.ts USAGE names exactly these (cli.ts cannot import this module statically). */
+export const INIT_FLAGS = ["--request-timeout"] as const;
+
 /** `jgrep init [--request-timeout <s>]` (review n4: the key check now honours the same
- *  per-attempt timeout flag as a search; default 15 s). */
+ *  per-attempt timeout flag as a search; default: the key-check deadline, 15 s). */
 export function parseInitArgs(argv: string[]): { requestTimeoutSec: number } {
-  const o = { requestTimeoutSec: 15 };
+  const o = { requestTimeoutSec: VERIFY_TIMEOUT_MS / 1000 };
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--request-timeout") {
+    if (argv[i] === INIT_FLAGS[0]) {
       o.requestTimeoutSec = Number(argv[++i]);
       if (!Number.isFinite(o.requestTimeoutSec) || o.requestTimeoutSec <= 0) throw new Error("request-timeout must be a positive number");
     } else throw new Error(`unknown option ${argv[i]} for jgrep init (it takes only --request-timeout <s>)`);

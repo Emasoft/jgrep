@@ -33,7 +33,8 @@ Providers are listed in `~/.jgrep/providers.json`, in fallback order (no file:
 openrouter, typesafe, compatible, cloudflare, vercel). Each entry's key is an env
 var (`"api_key": "$OPENROUTER_API_KEY"`) or a literal key; a provider whose key is
 unset is skipped, and a request that fails on a rejected key, no credits, a missing
-model or a 429/5xx moves to the next provider. `jgrep status` lists the chain and
+model, a 429/5xx or a network error (never a malformed request) moves to the next
+provider. `jgrep status` lists the chain and
 each provider's state. Never put a key on the command line and never edit the
 user's providers.json yourself: if jgrep reports "no provider is ready" or "No
 <provider> API key found", tell the user (they export a key or run `jgrep init`)
@@ -76,7 +77,7 @@ status, examples and use cases:
 jgrep 0.7.0 — semantic grep powered by Jev
 
 usage: jgrep init [--request-timeout <s>]   setup: provider, key (checked), agent skills
-       jgrep status [--provider <name>]     the provider chain and each one's state
+       jgrep status [--provider <name>] [--request-timeout <s>]  the chain and its state
        jgrep [options] "<description>" [path ...]
        jgrep [options] --diff [ref] "<description>"
        jgrep [options] --tests [ref] [--staged] [path ...]
@@ -85,7 +86,6 @@ usage: jgrep init [--request-timeout <s>]   setup: provider, key (checked), agen
 
 Describe the code in English; jgrep asks Jev one yes/no question per chunk and
 prints the chunks that match as file:line ranges with a probability p.
-Keys: export OPENROUTER_API_KEY (or another provider's key, below) or run `jgrep init`.
 
 search
   -t, --threshold <p>   print chunks with p >= this (default 0.7; 0.5 with --tests)
@@ -126,7 +126,7 @@ modes
       --envelopes       append each chunk's numbers to its text (steadier counting)
       --tag <a,b,...>   classify each hit into one of 2+ categories, printed as [tag]
       --default <label> catch-all category of --tag or a --questions choice (default:
-                        the last); a row judged in parts takes its best other label
+                        the last; unknown: exit 1); a split row takes its best other label
       --tests [ref]     print the test files a diff plausibly affects (by name, by
                         import, then by Jev); pipe the list into your test runner
       --rows <file>     judge the rows of a CSV / JSONL file instead of code
@@ -136,22 +136,26 @@ modes
 
 provider and keys (~/.jgrep/providers.json; `jgrep status` shows the chain)
       --provider <name> only this provider, no fallback (env JEV_API)
-      --model <id>      model id, used where it fits a provider's ids (env JEV_MODEL,
-                        then JGREP_MODEL); other providers keep their own
+      --model <id>      model id where it fits a provider's ids (env JEV_MODEL, JGREP_MODEL)
   providers.json: {"version":1,"providers":[{"name":"openrouter","api_key":
-  "$OPENROUTER_API_KEY"},{"name":"typesafe"}]}: array order = fallback order (no file:
-  openrouter, typesafe, compatible, cloudflare, vercel); a key, credit, model or
-  429/5xx failure moves the request on, logged to ~/.jgrep/errors.log (72 h); api_key
-  "$VAR" or a literal (chmod 600); "enabled": false skips one; every field: see
-  providers.example.json; key fallbacks: ~/.config/jgrep/{<name>.key,env}, ./.env
+  "$OPENROUTER_API_KEY"},{"name":"typesafe"}]}: array order = fallback order; a
+  failure moves the request on unless bad_request/circuit_breaker_open/budget_exhausted,
+  logged to ~/.jgrep/errors.log (kept 72 h); api_key "$VAR" or a literal (chmod 600),
+  else ~/.config/jgrep/{<name>.key,env}, ./.env; fields: providers.example.json
+  "adapter": system-one/cloudflare-ai-run/vercel-evaluation
+  "enabled" (any case): true/enabled/enable/1/yes/y/active/on or absent keeps an entry,
+  false/disabled/disable/0/no/n/inactive/off skips it, anything else is a config error
+  built-ins (the chain without a file) and their key env vars (the first one set wins):
+    openrouter  OPENROUTER_API_KEY
+    typesafe    JEV_API_KEY / TYPESAFE_API_KEY
+    compatible  JEV_GATEWAY_API_KEY
+    cloudflare  JEV_CLOUDFLARE_API_TOKEN / CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID
+    vercel      AI_GATEWAY_API_KEY
 
 environment
-  OPENROUTER_API_KEY    openrouter key; JEV_API_KEY or TYPESAFE_API_KEY: typesafe key
   JEV_GATEWAY_URL       compatible: full System One endpoint when providers.json gives
                         no base_url; https:// or a loopback http:// server that needs no
                         key (alias JGREP_ENDPOINT; process env only, never ./.env)
-  JEV_GATEWAY_API_KEY   compatible key; AI_GATEWAY_API_KEY: vercel key
-  CLOUDFLARE_API_TOKEN  + CLOUDFLARE_ACCOUNT_ID: cloudflare (alias JEV_CLOUDFLARE_API_TOKEN)
   JGREP_HOME            jgrep's home instead of ~/.jgrep (absolute path)
   JEV_BUDGET            default --budget in dollars (the flag wins)
   JEV_PRICE_PER_MTOK    dollars per million input tokens for --estimate, --budget and
@@ -162,7 +166,7 @@ environment
 
 reliability
       --timeout <s>     per-batch deadline, retries included (default 15)
-      --request-timeout <s>  per-attempt HTTP timeout (default 30)
+      --request-timeout <s>  per-attempt HTTP timeout (default 30; init, status: 15)
       --retries <n>     failed attempts tolerated per batch (default 4)
   -c, --concurrency <n> parallel requests (default 16)
       --rate <req/s>    global request pacing (token bucket); 0 = unlimited
@@ -178,9 +182,8 @@ cost (no cap unless you set one)
   -v, -V, --version     print version
 
 exit status: 0 when something matched, 1 when nothing did, 2 on error or when any
-chunk errored (partial failure: hits and errors are both reported; every failed
-chunk carries a typed kind — timeout, rate_limited, budget_exhausted, ... — with
-an actionable hint on stderr). --estimate exits 0. In CI test for 1, never use !:
+chunk errored (partial failure: hits and errors both reported; each failed chunk has a
+typed kind and a hint on stderr). --estimate exits 0. In CI test for 1, never use !:
   jgrep --diff origin/main "adds an endpoint without an auth check"; [ $? -eq 1 ]
 
 examples:
@@ -189,14 +192,10 @@ examples:
   jgrep -a -t 0 "retries failed HTTP requests" src/ | head
   jgrep --funcs "parses command-line arguments" src/
   jgrep --diff --staged "leaves debug output such as console.log"
-  jgrep --diff origin/main --sarif "adds an endpoint without an auth check"
   jgrep --tag "real bug,best-effort cleanup" "swallows an exception" src/
   jgrep --json "spawns a child process" src/ | jq -r '.[].file'
-  bun test $(jgrep --tests origin/main)
   jgrep --rows examples/creators.csv "beauty is the main content of this account"
   jgrep --rows examples/creators.csv --questions examples/beauty.json --out scored.csv
-  jgrep --estimate "swallows errors" src/
-  jgrep --budget 0.05 "swallows errors" .
   jgrep --follow-symlinks --max-bytes 5000000 "reads user input" .
 
 use cases:

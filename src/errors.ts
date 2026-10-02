@@ -1,11 +1,14 @@
 // WI-12 error taxonomy: typed provider errors, status/transport classification,
 // Retry-After parsing and full-jitter backoff math. Pure functions, no I/O, no deps.
-export type JevErrorKind =
-  | "insufficient_credits" | "invalid_api_key" | "model_unavailable" | "rate_limited"
-  | "bad_request" | "malformed_response" | "server_unreachable" | "tls_error"
-  | "timeout" | "circuit_breaker_open"
-  | "budget_exhausted" // WI-7 --budget: run-policy stop, never a provider failure
-  | "forbidden";        // OpenRouter 403: moderation flag or a key/model permission — per request, never fatal
+// A runtime list (the type derives from it) so cli.ts USAGE can name the kinds from here.
+export const ERROR_KINDS = [
+  "insufficient_credits", "invalid_api_key", "model_unavailable", "rate_limited",
+  "bad_request", "malformed_response", "server_unreachable", "tls_error",
+  "timeout", "circuit_breaker_open",
+  "budget_exhausted", // WI-7 --budget: run-policy stop, never a provider failure
+  "forbidden",        // OpenRouter 403: moderation flag or a key/model permission — per request, never fatal
+] as const;
+export type JevErrorKind = (typeof ERROR_KINDS)[number];
 
 export interface JevErrorOpts { provider: string; status?: number; retryable: boolean; hint?: string; cause?: unknown }
 

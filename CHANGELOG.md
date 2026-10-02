@@ -17,8 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the chain is exactly its entries; without it, the built-ins in order openrouter,
   typesafe, compatible, cloudflare, vercel. `api_key` is `"$VAR"`, `"${VAR}"`, a
   literal key (the file must then be `chmod 600`) or an array; `"enabled"` accepts
-  true/false and yes/no, on/off, 1/0, enabled/disabled, active/inactive; every
-  field is validated strictly. Example: `providers.example.json` (shipped).
+  true/false and yes/no, y/n, on/off, 1/0, enabled/disabled, enable/disable,
+  active/inactive (any case), anything else is a config error; every field is
+  validated strictly. Example: `providers.example.json` (shipped).
 - A failed provider is skipped for the rest of the run, and until a provider has
   answered once the run's other requests wait for it (a dead key costs one
   request). The run ends with a `fallback:` line when it moved, and every provider
@@ -90,6 +91,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `--help` is built from the constants the code uses (defaults, limits, built-in
+  providers and their key variables, adapters, the `enabled` words, exit codes), and
+  the help blocks in README.md and SKILL.md are regenerated from it
+  (`bun run sync-docs`); tests fail when the accepted options or the env vars read
+  differ from the ones `--help` names, or when the docs mention one that does not
+  exist. Drift fixed on the way: `jgrep status` also takes `--request-timeout`
+  (default 15, like `jgrep init`); the cloudflare key is `JEV_CLOUDFLARE_API_TOKEN`
+  first, then `CLOUDFLARE_API_TOKEN`; a timeout, network, TLS, 403 or malformed
+  answer also moves a request to the next provider; the `enabled` error message
+  listed only some of the accepted words; `--help` now states that `--default` with
+  an unknown label exits 1.
 - `--tests` ignored `--budget` / `$JEV_BUDGET`.
 - A failed request the provider likely billed (malformed 200, timeout, 5xx) now
   keeps its budget reservation as spend.

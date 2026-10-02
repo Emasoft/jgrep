@@ -22,7 +22,11 @@ export type Kind = "code" | "diff";
 // ---- chunking ---------------------------------------------------------------
 // Language-agnostic heuristic: a column-0 line starts a new block. Swap in
 // tree-sitter per language when this misfires on real code.
-export function chunk(file: string, text: string, opts = { minLines: 5, maxLines: 60 }): Chunk[] {
+/** Chunk size in lines (cli.ts USAGE states both): a column-0 line closes a chunk once it
+ *  has CHUNK_MIN_LINES, and no chunk grows past CHUNK_MAX_LINES. */
+export const CHUNK_MIN_LINES = 5;
+export const CHUNK_MAX_LINES = 60;
+export function chunk(file: string, text: string, opts = { minLines: CHUNK_MIN_LINES, maxLines: CHUNK_MAX_LINES }): Chunk[] {
   const lines = text.split("\n");
   const out: Chunk[] = [];
   let start = 0;
@@ -62,9 +66,9 @@ const isMdFence = (line: string) => /^\s*```/.test(line);
  * lines OUTSIDE fenced code blocks; a fence that outgrows maxLines is never broken
  * (that piece exceeds maxLines instead). Ranges are 1-based inclusive, like chunk().
  */
-export function chunkMarkdown(file: string, text: string, opts = { minLines: 5, maxLines: 60 }): Chunk[] {
+export function chunkMarkdown(file: string, text: string, opts = { minLines: CHUNK_MIN_LINES, maxLines: CHUNK_MAX_LINES }): Chunk[] {
   const lines = text.split("\n");
-  const maxLines = opts.maxLines ?? 60; // minLines unused: headings are semantic units, never merged away
+  const maxLines = opts.maxLines ?? CHUNK_MAX_LINES; // minLines unused: headings are semantic units, never merged away
   const out: Chunk[] = [];
   const push = (start: number, end: number, context?: string) => {
     const t = lines.slice(start, end + 1).join("\n");
@@ -281,7 +285,8 @@ export function listFiles(paths: string[], opts: ListOptions = {}): string[] {
   return out.sort();
 }
 
-const MAX_WALK_FILES = 5000;
+/** Without git a walk lists at most this many files (cli.ts USAGE states it). */
+export const MAX_WALK_FILES = 5000;
 /** Recursive listing without git: hidden entries and SKIP_DIRS are skipped. Symlinks are
  *  ADDED as entries (never descended here) — listFiles decides whether to follow them. */
 function walk(root: string, out: Set<string>, dir = root) {
