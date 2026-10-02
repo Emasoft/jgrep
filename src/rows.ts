@@ -239,7 +239,17 @@ export function flattenAnswers(result: RowsResult): (Record<string, string | num
   return result.answers.map((a) => (a ? flatten(a) : null));
 }
 
+/** A text cell a spreadsheet would run as a formula (=, +, -, @, TAB, CR first) gets a
+ *  leading `'` (OWASP CSV-injection guidance, audit NIT); plain numbers such as -5 or +1.5
+ *  are left alone so numeric columns stay numeric. */
+const FORMULA_RE = /^[=+\-@\t\r]/;
+const NUMBER_TEXT_RE = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+
 export function toCsv(columns: string[], rows: Record<string, unknown>[]): string {
-  const esc = (v: unknown) => { const s = v == null ? "" : String(v); return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+  const esc = (v: unknown) => {
+    let s = v == null ? "" : String(v);
+    if (typeof v === "string" && FORMULA_RE.test(s) && !NUMBER_TEXT_RE.test(s)) s = `'${s}`;
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
   return [columns.map(esc).join(","), ...rows.map((r) => columns.map((c) => esc(r[c])).join(","))].join("\n") + "\n";
 }

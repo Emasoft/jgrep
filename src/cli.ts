@@ -163,6 +163,11 @@ use cases:
 const tty = process.stdout.isTTY && !process.env.NO_COLOR;
 const c = (code: string, s: string) => (tty ? `\x1b[${code}m${s}\x1b[0m` : s);
 
+/** Repo text printed to the terminal loses its C0 control characters (TAB and newline
+ *  kept) and DEL: a hostile repo's chunk could otherwise push ANSI/OSC escape sequences
+ *  through jgrep — retitle the window, clear the screen, forge output (audit NIT). */
+export const safeText = (s: string): string => s.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
+
 export function parse(argv: string[]) {
   const o = {
     threshold: 0.7, batch: 16, concurrency: 16, all: false, show: false, group: false, votes: 1, verify: false, json: false, jsonErrors: false, cache: true,
@@ -319,8 +324,17 @@ function printExamples(lines: { line: string; hint?: string }[]) {
 }
 
 // ---- --sarif (WI-7) --------------------------------------------------------------
+/** SARIF artifact URI (audit NIT): a relative path percent-encoded per segment (spaces, `#`,
+ *  `%` in names broke consumers), an absolute one as a file:// URI. */
+const sarifUri = (file: string): string => {
+  const enc = (p: string) => p.split("/").map(encodeURIComponent).join("/");
+  if (file.startsWith("/")) return `file://${enc(file)}`;
+  if (/^[A-Za-z]:[\\/]/.test(file)) return `file:///${enc(file.replace(/\\/g, "/"))}`; // Windows drive path
+  return enc(file);
+};
+
 /** SARIF 2.1.0 rendering of a run: one rule per description hash, one result per hit
- *  (message = the description, location = file uri + the chunk's start line). The shape
+ *  (message = the description, location = file uri + the chunk's line range). The shape
  *  GitHub code scanning and every SARIF consumer ingest; printed instead of text when
  *  --sarif is set (works with --diff and plain runs alike). */
 export function toSarif(question: string, hits: Hit[]) {
@@ -335,8 +349,8 @@ export function toSarif(question: string, hits: Hit[]) {
         message: { text: question },
         locations: [{
           physicalLocation: {
-            artifactLocation: { uri: h.file },
-            region: { startLine: h.start },
+            artifactLocation: { uri: sarifUri(h.file) },
+            region: { startLine: h.start, endLine: h.end },
           },
         }],
       })),
@@ -473,16 +487,16 @@ async function main() {
         const pcol = g.p >= o.threshold ? "32" : "90";
         console.log(`${c("90", g.sig.slice(0, 7))} ${c("36", `×${g.count}`)}  ${c(pcol, `p=${g.p.toFixed(2)}`)}`);
         for (const s of g.sites)
-          console.log(`    ${c("35", s.file)}${c("36", ":")}${c("32", `${s.start}-${s.end}`)}`);
+          console.log(`    ${c("35", safeText(s.file))}${c("36", ":")}${c("32", `${s.start}-${s.end}`)}`);
       }
     } else {
       for (const h of rows) {
-        const head = h.text.split("\n").find((l) => l.trim() && !l.startsWith("@@"))?.trim().slice(0, 90) ?? "";
+        const head = safeText(h.text.split("\n").find((l) => l.trim() && !l.startsWith("@@"))?.trim().slice(0, 90) ?? "");
         const pcol = h.p >= o.threshold ? "32" : "90";
         // --tag (WI-4): the winning category prints right after the p column.
         const tagcol = h.tag !== undefined ? c("33", ` [${h.tag}]`) : "";
-        console.log(`${c("35", h.file)}${c("36", ":")}${c("32", `${h.start}-${h.end}`)}  ${c(pcol, `p=${h.p.toFixed(2)}`)}${tagcol}  ${head}`);
-        if (o.show) console.log(h.text.split("\n").map((l) => "    " + l).join("\n") + "\n");
+        console.log(`${c("35", safeText(h.file))}${c("36", ":")}${c("32", `${h.start}-${h.end}`)}  ${c(pcol, `p=${h.p.toFixed(2)}`)}${tagcol}  ${head}`);
+        if (o.show) console.log(safeText(h.text).split("\n").map((l) => "    " + l).join("\n") + "\n");
       }
     }
     const cost = r.cost ?? 0; // settled per request (reported cost, else tokens × $/Mtok); undefined = nothing answered
@@ -525,7 +539,7 @@ async function testsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
     if (reportEstimate(wiring, o.json)) return;
     const rows = o.all ? [...r.all].sort((a, b) => b.p - a.p) : r.selected;
     if (o.json) console.log(JSON.stringify(rows, null, 2));
-    else for (const s of rows) console.log(o.all || process.stdout.isTTY ? `${s.file}${c("90", `  p=${s.p.toFixed(2)} ${s.reason}`)}` : s.file);
+    else for (const s of rows) console.log(o.all || process.stdout.isTTY ? `${safeText(s.file)}${c("90", `  p=${s.p.toFixed(2)} ${s.reason}`)}` : s.file);
     const cost = r.cost ?? 0; // settled per request (reported cost, else tokens × $/Mtok); undefined = nothing answered
     const byCode = r.all.filter((s) => s.reason === "direct" || s.reason === "import" || s.reason === "package").length;
     const budgetStopped = r.errors.some((e) => e.kind === "budget_exhausted"); // same suffix as code mode
@@ -593,7 +607,7 @@ async function rowsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
         writeOut(toCsv(["row", "p", ...cols], shown.map((s) => ({ row: s.i + 2, p: s.p, ...(flat[s.i] ?? {}) }))));
       }
       if (!o.json || o.out) for (const s of shown) { // with --json --out the JSON went to the file; stdout keeps the pretty hits
-        const preview = Object.values(s.row).filter(Boolean).join(" | ").slice(0, 90);
+        const preview = safeText(Object.values(s.row).filter(Boolean).join(" | ").slice(0, 90));
         const pcol = s.p >= o.threshold ? "32" : "90";
         console.log(`${c("35", o.rows)}${c("36", ":")}${c("32", String(s.i + 2))}  ${c(pcol, `p=${s.p.toFixed(2)}`)}  ${preview}`);
       }

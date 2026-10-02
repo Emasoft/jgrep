@@ -367,3 +367,40 @@ test("cli e2e: --budget with JEV_PRICE_PER_MTOK below the billed rate prints one
     server.stop(true);
   }
 }, 20_000);
+
+// ---- output hardening (audit NITs): SARIF URIs, control characters, CSV formulas -------
+
+test("toSarif: uri is percent-encoded (relative) or a file:// URI (absolute); region carries endLine", () => {
+  const s = toSarif("q", [
+    { file: "src/a b#1%.ts", start: 3, end: 9, text: "", p: 0.9 },
+    { file: "/tmp/x y.ts", start: 1, end: 2, text: "", p: 0.9 },
+  ] as Parameters<typeof toSarif>[1]);
+  const locs = s.runs[0].results.map((r) => r.locations[0].physicalLocation);
+  expect(locs[0].artifactLocation.uri).toBe("src/a%20b%231%25.ts");
+  expect(locs[0].region).toEqual({ startLine: 3, endLine: 9 });
+  expect(locs[1].artifactLocation.uri).toBe("file:///tmp/x%20y.ts");
+});
+
+test("safeText: C0 control characters (ESC, BEL, ...) are stripped from terminal output; TAB and newline kept", async () => {
+  const { safeText } = await import("./cli");
+  expect(safeText("ok\x1b]0;pwned\x07 \x1b[31mred\x1b[0m\tz\nnext\x7f")).toBe("ok]0;pwned [31mred[0m\tz\nnext");
+});
+
+test("cli e2e: a hostile chunk's escape sequences never reach the terminal (preview and -C body)", async () => {
+  const server = startBigUsageGateway();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-esc-"));
+  try {
+    fs.writeFileSync(path.join(dir, "evil.ts"), "const x = 1; // \x1b]0;pwned\x07 title hijack\nconst y = 2; // \x1b[2J clear screen\n");
+    const p = await spawn(["bun", "src/cli.ts", "--no-cache", "--api", "gateway", "-C", "anything", path.join(dir, "evil.ts")], gatewayEnv(server.port));
+    expect(p.exitCode).toBe(0);
+    expect(p.stdout).toContain("title hijack");
+    expect(p.stdout).not.toContain("\x1b");
+    expect(p.stdout).not.toContain("\x07");
+  } finally { server.stop(true); fs.rmSync(dir, { recursive: true, force: true }); }
+}, 20_000);
+
+test("toCsv: formula-looking cells are neutralised with a leading quote; numbers stay numbers", async () => {
+  const { toCsv } = await import("./rows");
+  const out = toCsv(["v"], [{ v: "=HYPERLINK(\"http://x\")" }, { v: "@SUM(A1)" }, { v: "+cmd" }, { v: "-5" }, { v: "+1.5" }, { v: 0.5 }, { v: "plain" }]);
+  expect(out.split("\n").slice(1, 8)).toEqual(["\"'=HYPERLINK(\"\"http://x\"\")\"", "'@SUM(A1)", "'+cmd", "-5", "+1.5", "0.5", "plain"]);
+});
