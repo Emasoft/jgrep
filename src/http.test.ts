@@ -523,3 +523,14 @@ test("m5: OpenRouter 403 -> forbidden (moderation / permission), non-fatal, not 
   expect(isFatalError(e)).toBe(false); // one flagged chunk must not trip the breaker for the rest
 });
 
+test("m6: a Retry-After longer than the batch deadline reports rate_limited with the --rate hint, not timeout", async () => {
+  const { calls, fetchImpl } = scriptedFetch(() => resp(429, "slow down", { "Retry-After": "20" }));
+  const { sleeps, sleep } = sleepRecorder();
+  const e = await errOf(postSystemOne({}, BACKENDS.openrouter, "k", { fetchImpl, sleep, deadlineMs: Date.now() + 1000 }));
+  expect(e.kind).toBe("rate_limited");
+  expect(e.hint).toContain("--rate");
+  expect(e.message).toContain("Retry-After");
+  expect(calls.length).toBe(1);
+  expect(sleeps.length).toBe(0); // no point sleeping into a deadline the wait cannot beat
+});
+

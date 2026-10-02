@@ -583,6 +583,15 @@ export async function postSystemOne(
 
     const delay = jitteredDelayMs(attempt); // full jitter, base 500ms, cap 30s (float — floored below)
     const retryAfterMs = parseRetryAfter(retryAfterRaw); // transport errors have no header -> null
+    // A Retry-After the batch deadline cannot outlast: sleeping until the deadline only to
+    // report "timeout" hid the real cause (throttling) and its fix (--rate). Say so now.
+    if (deadline !== undefined && retryAfterMs !== null && retryAfterMs > deadline - monotonicMs()) {
+      throw new JevProviderError(
+        retryKind,
+        `${backend.name} ${retryStatus ?? retryKind}: the provider asked to wait ${Math.ceil(retryAfterMs / 1000)}s (Retry-After), longer than the batch deadline allows`,
+        { provider: backend.name, status: retryStatus, retryable: true, hint: `${hintFor(retryKind, backend, retryDetail) ?? ""} (or raise --timeout)`.trim() },
+      );
+    }
     let wait = Math.min(Math.max(delay, retryAfterMs ?? 0), RETRY_AFTER_MAX_MS);
     if (deadline !== undefined) wait = Math.min(wait, deadline - monotonicMs());
     // Integer ms only: jitter and the deadline remainder are floats (see abortDelayMs).
