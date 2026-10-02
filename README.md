@@ -426,10 +426,15 @@ full.
   input tokens and cost — nothing is sent, no key is needed. It covers code,
   `--diff`, `--rows` and `--tests`; with `--funcs` it prices the plain search (an
   overestimate: pass 2 depends on answers a dry run never gets).
-- `--budget <usd>` stops the run once its metered cost exceeds `<usd>` dollars
-  (`$JEV_BUDGET` env override, `0` legal); un-run chunks error kind
-  `budget_exhausted` with a `raise --budget` hint — hits and cached answers are
-  kept.
+- `--budget <usd>` is a hard spend cap, off unless you set it (`$JEV_BUDGET` is
+  the env form; the flag wins). Before each request is sent, its estimated cost
+  (the `--estimate` token model × `$/Mtok`) is reserved against the budget; a
+  request that does not fit in what is left is never sent, and its chunks error
+  kind `budget_exhausted` with a `raise --budget` hint. Each response then
+  replaces its reservation with the real cost (provider-reported, else billed
+  tokens × `$/Mtok`). It covers the search and its `--verify` and `--tag`
+  passes; hits and cached answers are kept. `0` sends nothing. The cap is as
+  exact as the estimate, which is within about 15% of billed tokens.
 - `--sarif` prints SARIF 2.1.0 instead of text: one rule per description, one
   result per hit (file uri + region.startLine) — ingestible by GitHub code
   scanning.

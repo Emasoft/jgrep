@@ -1,5 +1,5 @@
 // WI-7 + WI-9 roadmap features: --estimate (the per-file table of the unified dry run;
-// the token model itself is tested in jgrep.test.ts), --budget (metered soft stop, kind budget_exhausted), --sarif (SARIF 2.1.0
+// the token model itself is tested in jgrep.test.ts), --budget (hard cap via reservation, kind budget_exhausted; the concurrency cases live in budget.test.ts), --sarif (SARIF 2.1.0
 // output) and --envelopes (numeric envelopes inside buildRequest). Core behavior runs
 // through jgrep()/buildRequest() with the repo's fake-fetch DI pattern (explicit apiKey
 // everywhere, so the lazy key resolver never touches the filesystem); the CLI surface
@@ -143,7 +143,7 @@ test("--envelopes: cache keys stay keyed on the RAW chunk text — an envelope r
   expect(r2.cached).toBe(1);
 });
 
-// ---- --budget (WI-7): metered soft stop --------------------------------------------
+// ---- --budget (WI-7): the stop, at concurrency 1 --------------------------------------------
 
 test("--budget: large usage stops after the first batch; remaining chunks error budget_exhausted; hits and cache kept", async () => {
   const { calls, fetchImpl } = okFetch(1_000_000); // $0.042 per batch at the default price
@@ -180,12 +180,15 @@ test("--budget: a provider-reported cost meters the same way; an under-budget ru
 });
 
 test("--budget: the meter honors pricePerMtok when the provider reports no cost", async () => {
-  const { fetchImpl } = okFetch(10); // 10 tokens per batch
+  const { fetchImpl } = okFetch(1_000_000); // 1M billed tokens per batch, no reported cost
   const chunks = nChunks(4);
-  // price 1 $/Mtok => $0.00001 per batch: over a $0.000005 budget after batch 0
-  const r = await jgrep("q", chunks, { threshold: 0.7, batch: 2, concurrency: 1, budget: 0.000005, pricePerMtok: 1, apiKey: "k", fetchImpl, cache: {} });
+  // price 1 $/Mtok => $1 billed per batch: over a $0.5 budget after batch 0
+  const r = await jgrep("q", chunks, { threshold: 0.7, batch: 2, concurrency: 1, budget: 0.5, pricePerMtok: 1, apiKey: "k", fetchImpl, cache: {} });
   expect(r.hits).toHaveLength(2);
   expect(r.errors.filter((e) => e.kind === "budget_exhausted")).toHaveLength(2);
+  // at $0.042/Mtok the same batches bill $0.042 each: all fit in $0.5
+  const cheap = await jgrep("q", chunks, { threshold: 0.7, batch: 2, concurrency: 1, budget: 0.5, pricePerMtok: 0.042, apiKey: "k", fetchImpl, cache: {} });
+  expect(cheap.errors).toEqual([]);
 });
 
 test("budget_exhausted: non-retryable but never fatal — a long budget stop does not trip the circuit breaker", async () => {
@@ -206,7 +209,7 @@ test("cli parse: --estimate/--sarif/--envelopes are boolean flags; --budget take
     estimate: true, sarif: true, envelopes: true, question: "q", paths: ["src/"],
   });
   expect(parse(["--budget", "0.05", "q"])).toMatchObject({ budget: 0.05 });
-  expect(parse(["--budget", "0", "q"]).budget).toBe(0); // legal: stop once the first batch spends anything
+  expect(parse(["--budget", "0", "q"]).budget).toBe(0); // legal: nothing is sent
   expect(() => parse(["--budget", "abc", "q"])).toThrow(/numeric option expected/);
   expect(() => parse(["--budget", "-1", "q"])).toThrow(/numeric option expected/);
 });

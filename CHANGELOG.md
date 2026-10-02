@@ -50,9 +50,12 @@ isolation), and WI-12 (benchmarks); markdown chunking ships here too.
   and files with no extractable signatures are skipped.
 - **Cost controls & SARIF** (WI-7): `--estimate` text output gains a per-file
   chunk table above the estimated requests/tokens/cost line (one dry-run
-  implementation for every mode, see the upstream entry above); `--budget <usd>` meters per-batch cost
-  (provider-reported else tokens × price) and over-budget chunks error
-  `budget_exhausted` (`JEV_BUDGET` env override); `--sarif` prints SARIF 2.1.0
+  implementation for every mode, see the upstream entry above); `--budget <usd>` is an opt-in hard spend
+  cap (no cap unless set; `JEV_BUDGET` env form): every request reserves its
+  estimated cost before it is sent, a request that does not fit is never sent
+  (its chunks error `budget_exhausted`), and the response replaces the
+  reservation with the real cost — so concurrent workers can no longer
+  overshoot the budget by a whole wave of requests; `--sarif` prints SARIF 2.1.0
   ingestible by GitHub code scanning.
 - **`--envelopes`** (WI-9): appends each chunk's numbers (`[numbers: 42, 7]`)
   to the judged text, steadying Jev's counting of quantities; off by default,

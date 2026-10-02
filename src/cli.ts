@@ -164,8 +164,8 @@ export function parse(argv: string[]) {
   // through to jgrep(), which re-parses it the same way.
   if (o.tag !== "" && parseTagCategories(o.tag).length < 2)
     throw new Error(`--tag needs at least 2 comma-separated categories (got ${parseTagCategories(o.tag).length})`);
-  // --budget (WI-7): dollars; 0 stays legal (stop once the first batch has spent
-  // anything), negative/non-finite gets the generic numeric error like every flag.
+  // --budget (WI-7): dollars; 0 stays legal (nothing is sent: every request's
+  // reservation exceeds it), negative/non-finite gets the generic numeric error.
   if (o.budget !== null && !(Number.isFinite(o.budget) && o.budget >= 0))
     throw new Error("numeric option expected");
   return { ...o, question: rest[0], paths: rest.slice(1) };

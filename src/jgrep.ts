@@ -403,6 +403,50 @@ export const estimateLine = (e: Estimate, pricePerMtok: number): string => {
   return `estimated: ${e.requests} requests, ~${tokens} input tokens, ~$${(tokens * pricePerMtok / 1e6).toFixed(4)} (list price, cached chunks free; nothing was sent)`;
 };
 
+// ---- --budget: hard cap via reservation (B1) -----------------------------------
+/** Run-wide spend meter, created ONLY when a budget is set. USER decision 2026-10-02:
+ *  "Hard cap via reservation" and "make the cap opt-in. by default no cap should be
+ *  enabled." — a run without a budget has no meter, no reservation and no limit.
+ *  Why reservation: the pool starts `concurrency` workers at once, so the old check of
+ *  metered spend at each worker's ENTRY let a whole wave through before the first
+ *  response was billed (16 requests sent on a budget for 3). Now each request reserves
+ *  its estimated cost (the --estimate token model on the exact request body × $/Mtok)
+ *  synchronously before it is sent — no await between check and reserve, so concurrent
+ *  workers cannot race past it — and a request that does not fit in what is left never
+ *  starts. The response replaces the reservation with the real cost of THAT request:
+ *  provider-reported when present, else its billed tokens × $/Mtok.
+ *  ponytail: the cap is as exact as the estimator (within ~15% on live data); a request
+ *  billed above its estimate can overshoot by that margin. Calibrate the estimate from
+ *  observed bills if that ever matters. */
+export class BudgetMeter {
+  spent = 0;
+  reserved = 0;
+  constructor(readonly budget: number, readonly pricePerMtok: number) {}
+  /** Reserve, send, settle. Throws budget_exhausted — with nothing sent — when the
+   *  request does not fit. budget_exhausted is non-retryable but deliberately NOT fatal
+   *  (errors.ts FATAL_KINDS): the breaker never trips on it, so every remaining batch
+   *  reports the same stop instead of the run becoming circuit_breaker_open. */
+  async run<T extends { usage?: { input_tokens?: number }; cost?: number }>(req: unknown, provider: string, send: () => Promise<T>): Promise<T> {
+    const est = (estimateTokens({ requests: 1, chars: JSON.stringify(req).length }) * this.pricePerMtok) / 1e6;
+    if (this.spent + this.reserved + est > this.budget)
+      throw new JevProviderError(
+        "budget_exhausted",
+        `budget exhausted: $${this.spent.toFixed(4)} spent${this.reserved > 0 ? ` + $${this.reserved.toFixed(4)} in flight` : ""} of the $${this.budget} --budget; the next request needs ~$${est.toFixed(4)}`,
+        { provider, retryable: false, hint: "raise --budget" },
+      );
+    this.reserved += est;
+    let real = 0; // a request that failed after its retries is not billed: the reservation is just released
+    try {
+      const res = await send();
+      real = res.cost ?? ((res.usage?.input_tokens ?? 0) * this.pricePerMtok) / 1e6;
+      return res;
+    } finally {
+      this.reserved -= est;
+      this.spent += real;
+    }
+  }
+}
+
 export interface Options {
   threshold: number; batch: number; concurrency: number; apiKey?: string; kind?: Kind;
   backend?: Backend; model?: string;
@@ -511,19 +555,14 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
   };
   let tokens = 0;
   let cost: number | undefined; // stays undefined unless a provider reports a cost
-  // --budget (WI-7): the meter mirrors the CLI summary line — the provider-reported
-  // cost when one arrived, else tokens × $/Mtok. Checked at each worker's ENTRY, i.e.
-  // AFTER the previous batch's spend was recorded: in-flight batches finish (their
-  // hits and cache entries are kept), later ones refuse to start for free.
-  const price = o.pricePerMtok ?? DEFAULT_PRICE_PER_MTOK;
-  const meteredCost = (): number => (cost !== undefined ? cost : (tokens * price) / 1e6);
-  const budgetStop = (): boolean => o.budget !== undefined && meteredCost() > o.budget;
-  const budgetError = (): JevProviderError =>
-    new JevProviderError(
-      "budget_exhausted",
-      `budget exhausted: $${meteredCost().toFixed(4)} spent of the $${o.budget} --budget`,
-      { provider: backend.name, retryable: false, hint: "raise --budget" },
-    );
+  // --budget (B1): one meter for the main, verify and tag passes; none without a budget.
+  const meter = o.budget !== undefined ? new BudgetMeter(o.budget, o.pricePerMtok ?? DEFAULT_PRICE_PER_MTOK) : undefined;
+  /** Every provider request of this run goes through here: per-batch deadline (retries
+   *  included, §1.6.1), lazy key, and the budget reservation when a budget is set. */
+  const send = (req: unknown) => {
+    const go = () => postSystemOne(req as Parameters<typeof postSystemOne>[0], backend, apiKeyOf(), { ...post, deadlineMs: Date.now() + timeoutMs });
+    return meter ? meter.run(req, backend.name, go) : go();
+  };
   // Run-level success flag (plan §1.5): drives the invalid_api_key expired-vs-wrong-key
   // hint. Tracked HERE (not PoolResult) because failFast throws the pool result away.
   let hadSuccess = false;
@@ -535,15 +574,7 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
       if (o.estimate.files) for (const i of b) o.estimate.files[chunks[i].file] = (o.estimate.files[chunks[i].file] ?? 0) + 1;
       return { index, entries: [], malformed: [] };
     }
-    // --budget (WI-7): refuse to start a batch once the meter exceeds the budget — no
-    // request, no spend. budget_exhausted is non-retryable but deliberately NOT fatal
-    // (see errors.ts FATAL_KINDS): the breaker never trips on it, so every remaining
-    // batch reports the same stop instead of the run becoming circuit_breaker_open.
-    if (budgetStop()) throw budgetError();
-    const res = await postSystemOne(req, backend, apiKeyOf(), {
-      ...post,
-      deadlineMs: Date.now() + timeoutMs, // per-batch deadline, retries included (§1.6.1)
-    });
+    const res = await send(req); // --budget: reserves first; throws budget_exhausted unsent
     tokens += res.usage?.input_tokens ?? 0;
     if (res.cost !== undefined) cost = (cost ?? 0) + res.cost;
     // Finite p-values go straight into the in-memory cache object: cli.ts persists it in a
@@ -673,11 +704,10 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
       const vBatches: (typeof pending)[] = [];
       for (let i = 0; i < pending.length; i += batch) vBatches.push(pending.slice(i, i + batch));
       const vWorker = async (bp: typeof pending, index: number): Promise<VerifyOutcome> => {
-        if (budgetStop()) throw budgetError(); // --budget meters the verify pass too
         const req = buildRequest(question, bp.map(({ hit }) => hit), kind, model, 1, envelopes);
         for (const id of Object.keys(req.questions))
           req.questions[id] = { type: "noul", instructions: VERIFY_PREFIX + (req.questions[id] as { instructions: string }).instructions };
-        const res = await postSystemOne(req, backend, apiKeyOf(), { ...post, deadlineMs: Date.now() + timeoutMs });
+        const res = await send(req); // --budget meters the verify pass too
         tokens += res.usage?.input_tokens ?? 0;
         if (res.cost !== undefined) cost = (cost ?? 0) + res.cost;
         const got: { hit: Hit; p: number }[] = [];
@@ -744,11 +774,9 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
       const tBatches: Hit[][] = [];
       for (let i = 0; i < hits.length; i += tagBatch) tBatches.push(hits.slice(i, i + tagBatch));
       const tWorker = async (bh: Hit[], index: number): Promise<TagOutcome> => {
-        if (budgetStop()) return { index, got: [] }; // --budget exhausted: no tags, no error (policy above)
-        const res = await postSystemOne(buildTagRequest(bh, tags, kind, model), backend, apiKeyOf(), {
-          ...post,
-          deadlineMs: Date.now() + timeoutMs, // per-batch deadline, retries included (§1.6.1)
-        });
+        // --budget: a tag batch that does not fit throws budget_exhausted into tPool.errors,
+        // which this pass drops by policy (hits stay untagged, the run is not errored).
+        const res = await send(buildTagRequest(bh, tags, kind, model));
         tokens += res.usage?.input_tokens ?? 0;
         if (res.cost !== undefined) cost = (cost ?? 0) + res.cost;
         const got: { hit: Hit; tag: string; p: number }[] = [];
