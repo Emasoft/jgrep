@@ -534,3 +534,12 @@ test("m6: a Retry-After longer than the batch deadline reports rate_limited with
   expect(sleeps.length).toBe(0); // no point sleeping into a deadline the wait cannot beat
 });
 
+test("n3: the insufficient_credits hint never suggests the backend already in use", async () => {
+  const { fetchImpl } = scriptedFetch(() => resp(402, "no credits"));
+  const ts = await errOf(postSystemOne({}, BACKENDS.typesafe, "k", { fetchImpl }));
+  expect(ts.hint).not.toContain("--api typesafe");
+  expect(ts.hint).toContain("--api openrouter");
+  const or = await errOf(postSystemOne({}, BACKENDS.openrouter, "k", { fetchImpl }));
+  expect(or.hint).toContain("--api typesafe");
+});
+

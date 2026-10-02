@@ -402,10 +402,12 @@ const firstNumeric = (...vals: unknown[]): number | undefined => {
 function hintFor(kind: JevErrorKind, backend: Backend, snippet: string): string | undefined {
   switch (kind) {
     case "insufficient_credits": {
-      // A self-hosted gateway has no billing page to point at — say so plainly.
+      // A self-hosted gateway has no billing page to point at — say so plainly. The switch
+      // suggestion names the OTHER hosted provider, never the one already in use.
       const billing = PROVIDER_URLS[backend.name].billing;
+      const other = backend.name === "typesafe" ? "openrouter" : "typesafe";
       return billing
-        ? `top up credits at ${billing} or switch with --api typesafe if a TypeSafe key exists`
+        ? `top up credits at ${billing} or switch with --api ${other} if you have a ${other} key`
         : "insufficient credits on the gateway provider";
     }
     case "forbidden":
