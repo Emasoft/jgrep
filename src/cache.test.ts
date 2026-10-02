@@ -9,6 +9,7 @@ import path from "node:path";
 import { test, expect, spyOn } from "bun:test";
 import { jgrep, loadCache, saveCache, evict, normalizeForCache, CACHE_MAX_ENTRIES, type Cache, type Chunk } from "./jgrep";
 import { scoreRows, type Questions, type Row } from "./rows";
+import type { Fetch } from "./providers";
 
 const tmpDir = () => fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-cache-test-"));
 
@@ -278,4 +279,25 @@ test("B2 in-run: identical text under different markdown sections is judged per 
     { file: "a.md", start: 9, end: 11, text, context: "Doc > Uninstall" },
   ], opts({}, okFetch(calls), { batch: 1 }));
   expect(calls).toHaveLength(2);
+});
+
+test("votes=1: a corrupt cache value (null / string) is re-judged, never served as p", async () => {
+  const chunks: Chunk[] = [{ file: "a.ts", start: 1, end: 2, text: "const a = 1;" }, { file: "b.ts", start: 1, end: 2, text: "const b = 2;" }];
+  let calls = 0;
+  const fetchImpl = (async (_u: unknown, init: { body: string }) => {
+    calls++;
+    const body = JSON.parse(init.body);
+    const answers: Record<string, unknown> = {};
+    for (const id of Object.keys(body.questions)) answers[id] = { type: "noul", noul: 0.9 };
+    return new Response(JSON.stringify({ answers, usage: { input_tokens: 1 } }), { status: 200 });
+  }) as unknown as Fetch;
+  const cache: Record<string, unknown> = {};
+  await jgrep("q", chunks, { threshold: 0.7, batch: 2, concurrency: 1, apiKey: "k", fetchImpl, cache });
+  const keys = Object.keys(cache);
+  expect(keys).toHaveLength(2);
+  cache[keys[0]] = null; cache[keys[1]] = "0.9"; // hand-edited / corrupt cache file
+  const r = await jgrep("q", chunks, { threshold: 0.7, batch: 2, concurrency: 1, apiKey: "k", fetchImpl, cache });
+  expect(calls).toBe(2); // before: both served from the corrupt entries, no request
+  expect(r.cached).toBe(0);
+  expect(r.all.every((h) => typeof h.p === "number" && Number.isFinite(h.p))).toBe(true);
 });

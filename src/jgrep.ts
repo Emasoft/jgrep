@@ -568,8 +568,10 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
       }
       if (complete) { all[i] = { ...c, p: median(ps) }; cached++; return; }
     } else {
+      // Same finite-number rule as the votes path: a hand-edited or corrupt cache value
+      // (null, a string) would otherwise become `p` and crash `p.toFixed` in the CLI.
       const hit = cache[k];
-      if (hit !== undefined) { all[i] = { ...c, p: hit }; cached++; return; }
+      if (typeof hit === "number" && Number.isFinite(hit)) { all[i] = { ...c, p: hit }; cached++; return; }
     }
     const sk = sigKey(kind, question, c);
     if (heads.has(sk)) siblingsOf.get(sk)!.push(i);
