@@ -3,7 +3,8 @@
 export type JevErrorKind =
   | "insufficient_credits" | "invalid_api_key" | "model_unavailable" | "rate_limited"
   | "bad_request" | "malformed_response" | "server_unreachable" | "tls_error"
-  | "timeout" | "circuit_breaker_open";
+  | "timeout" | "circuit_breaker_open"
+  | "budget_exhausted"; // WI-7 --budget: run-policy stop, never a provider failure
 
 export interface JevErrorOpts { provider: string; status?: number; retryable: boolean; hint?: string; cause?: unknown }
 
@@ -28,7 +29,11 @@ export class JevProviderError extends Error {
 
 export const RETRYABLE_STATUSES: ReadonlySet<number> = new Set([408, 429, 500, 502, 503, 504, 529]);
 export const NON_RETRYABLE_STATUSES: ReadonlySet<number> = new Set([400, 401, 402, 403, 404, 405, 422]);
-/** Fatal kinds trip the circuit breaker and abort the run early (§1.5). */
+/** Fatal kinds trip the circuit breaker and abort the run early (§1.5).
+ *  "budget_exhausted" (WI-7 --budget) is deliberately NOT here: it is run policy, not
+ *  a provider failure — non-retryable by construction (nothing to retry) but it must
+ *  not count toward the breaker, so every remaining batch reports the same budget stop
+ *  instead of the run mutating into circuit_breaker_open errors. */
 export const FATAL_KINDS: ReadonlySet<JevErrorKind> = new Set([
   "insufficient_credits", "invalid_api_key", "model_unavailable", "server_unreachable", "tls_error",
 ]);

@@ -90,6 +90,7 @@ jgrep "description" src/                 # hits with p >= 0.7, file order
 jgrep -t 0.85 "description" src/         # fewer, higher-precision hits
 jgrep -C "description" src/              # print the matching chunk bodies
 jgrep --json "description" src/          # hits as a JSON array: [{file,start,end,p,text}]
+jgrep --tag "real bug,needs review" "description" src/   # classify hits, e.g. for triage
 jgrep --json-errors "description" src/   # object instead: {hits:[...], errors:[...]}
 jgrep -a -t 0 "description" src/ | head  # everything, best first (when 0 hits)
 jgrep --diff --staged "rule"             # lint your staged change
@@ -103,7 +104,7 @@ jgrep --api openrouter "rule" src/       # pick a provider: typesafe | openroute
 `jgrep --help` prints the full reference — every flag, default, and exit status:
 
 ```
-jgrep 0.6.0 — semantic grep powered by Jev
+jgrep 0.7.0 — semantic grep powered by Jev
 
 usage: jgrep init                       interactive setup (provider, key, agent skills)
        jgrep [options] "<description>" [path ...]
@@ -115,9 +116,12 @@ usage: jgrep init                       interactive setup (provider, key, agent 
   -t, --threshold <p>   print chunks with probability >= p (default 0.7)
   -C, --show            print the matching chunk body under each hit
   -a, --all             print every chunk with its probability, best first
+      --group/--votes <n>/--verify   grouped verdicts, N-vote medians, strict re-ask
+      --budget <usd>/--sarif/--envelopes   spend cap (off unless set), SARIF, envelopes
+      --funcs           two-phase navigation: shortlist files by function signatures, then search only those
+      --tag <list>      classify hits: one choice question per hit; the winning category prints as [tag]
       --json            machine-readable output: hits as a JSON array
-                        (v0.3.0-compatible: [{file,start,end,p,text}]; rows:
-                        [flattened answer objects, null for errored rows])
+                        (v0.3.0-compatible: [{file,start,end,p,text}]; rows: flattened objects)
       --json-errors     with --json: a JSON object instead — code mode
                         {hits:[...], errors:[{file,start,end,kind,message}]};
                         rows mode {answers:[...], errors:[{row,kind,message}]}
@@ -142,8 +146,7 @@ usage: jgrep init                       interactive setup (provider, key, agent 
       --retries <n>     failed attempts tolerated per batch (default 4)
       --rate <req/s>    global request pacing (token bucket); 0 = unlimited
       --fail-fast       abort on the first fatal error instead of isolating it
-      --estimate        print requests, input tokens and cost a run would need, then
-                        exit 0 without calling the API (no key needed)
+      --estimate        dry run: print requests, tokens and cost; send nothing (no key)
       --no-cache        ignore and do not write ~/.cache/jgrep
   -v, --version         print version
 
@@ -155,6 +158,7 @@ CI lint:    jgrep --diff origin/main "adds an endpoint without an auth check"; [
 
 examples:
   jgrep "catches an error and silently ignores it" src/
+  jgrep --estimate "swallows errors" src/
   jgrep --rows creators.csv "beauty is the main content of this account"
   jgrep --rows creators.csv --questions beauty.json --out scored.csv
   jgrep -C "reads user input without validating it" app/

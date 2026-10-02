@@ -83,9 +83,15 @@ test("chunkMarkdown on the repo SKILL.md: the fenced help block is ONE chunk —
   const help = cs.filter((c) => c.context === "jgrep > Help");
   expect(help.length).toBeGreaterThan(1); // oversized section: pieces, not one chunk
   expect(help[0].start).toBe(lines.indexOf("## Help") + 1);
-  expect(help[help.length - 1].end).toBe(lines.indexOf("## Reading results")); // through the line before the next heading
+  // through the last non-blank line before the next heading (a trailing blank line rides
+  // along only when it fits the piece; a whitespace-only remainder is never a chunk)
+  let lastBody = lines.indexOf("## Reading results") - 1;
+  while (!lines[lastBody].trim()) lastBody--;
+  expect([lastBody + 1, lines.indexOf("## Reading results")]).toContain(help[help.length - 1].end);
   expect(help.every((c, i) => i === 0 || help[i - 1].end < c.start)).toBe(true); // ordered, non-overlapping
-  expect(help.every((c) => c.end - c.start + 1 <= 60)).toBe(true); // every piece respects maxLines
+  // every piece respects maxLines, except the fenced help block itself: the chunker
+  // documents "fence ran past maxLines: exceed rather than break it"
+  expect(help.every((c) => c.end - c.start + 1 <= 60 || /^```/m.test(c.text))).toBe(true);
   const block = help.filter((c) => c.text.split("\n").some((l) => /^\s*```/.test(l)));
   expect(block).toHaveLength(1); // the full fenced help block rides in this one chunk
   expect(block[0].text).toContain("-t, --threshold <p>   print chunks with probability >= p (default 0.7)");

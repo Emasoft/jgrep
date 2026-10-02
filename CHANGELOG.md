@@ -7,7 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Synced from upstream (kyu1204/jgrep v0.5.0–v0.6.0, version now 0.6.0)
+## [0.7.0] - 2026-10-02 — roadmap completion (issue #1: WI-2, WI-3, WI-4, WI-5, WI-6, WI-7, WI-9, WI-10) and upstream v0.6.0 sync
+
+Completes the deferred roadmap of
+[Emasoft/jgrep#1](https://github.com/Emasoft/jgrep/issues/1): every remaining
+work item is implemented. [0.4.0](#040---2026-09-20--providers-reliability-isolation-benchmarks-issue-1-wi-1-wi-8-wi-11-wi-12)
+shipped WI-1 (multi-provider), WI-8 (error taxonomy), WI-11 (partial-failure
+isolation), and WI-12 (benchmarks); markdown chunking ships here too.
+
+### Synced from upstream (kyu1204/jgrep v0.5.0–v0.6.0)
 
 - `--estimate`: prints requests, input tokens and cost a run would need (code, `--diff`, `--rows`, `--tests`), exits 0, sends nothing and needs no key; `--json` prints `{requests,tokens,usd,estimate:true}`. Cost uses `JEV_PRICE_PER_MTOK`.
 - `--tests`: type-test suffixes (`.tst.ts`, `.test-d.ts`, `_test.ts`), dynamic `import()` and `export … from` in signatures, and package-root selection (tests importing the package by name or `../src` are selected in code when the package entry file changes; reason `package`).
@@ -20,8 +28,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--group`** (WI-3): chunks sharing a whitespace-normalized signature are
+  near-identical boilerplate — the first is judged, siblings inherit its
+  verdict (exactly one question for the whole family), and `--group` prints
+  one group per signature (representative body + sites; `--json`/`--json-errors`
+  gain `groups[]`).
+- **`--tag <list>`** (WI-4): classify the standing hits — one `choice` question
+  per hit (at most 16 per request), categories given comma-separated. The
+  winning category prints after the `p` column (`[real bug]`) and rides on
+  `--json` hit objects as `tag`/`tag_p`. Runs after `--verify` filtering; a
+  failed tag batch never errors the run — those hits stay untagged.
+- **Verification cascade** (WI-2): `--verify` re-asks every hit with strict
+  instructions and keeps it only at `p >= 0.6 × threshold` (fail-open when the
+  verify batch itself fails); `--votes <n>` (1–5) judges every chunk n times
+  and the MEDIAN probability wins, with per-vote cache keys.
+- **`--funcs`** (WI-5): two-phase function navigation — pass 1 packs all of a
+  file's regex-extracted function/method/class signature lines into one
+  signature chunk per file (tree-sitter is a future upgrade; the regexes are
+  the documented fallback) and judges those first; pass 2 runs the normal
+  chunk search only on the shortlisted files. Files in unsupported languages
+  and files with no extractable signatures are skipped.
+- **Cost controls & SARIF** (WI-7): `--estimate` text output gains a per-file
+  chunk table above the estimated requests/tokens/cost line (one dry-run
+  implementation for every mode, see the upstream entry above); `--budget <usd>` meters per-batch cost
+  (provider-reported else tokens × price) and over-budget chunks error
+  `budget_exhausted` (`JEV_BUDGET` env override); `--sarif` prints SARIF 2.1.0
+  ingestible by GitHub code scanning.
+- **`--envelopes`** (WI-9): appends each chunk's numbers (`[numbers: 42, 7]`)
+  to the judged text, steadying Jev's counting of quantities; off by default,
+  and envelope/non-envelope runs share one cache.
+- **Cache hardening** (WI-6): keys hash the whitespace-normalized chunk text
+  (reformatting a file no longer re-bills; old raw-text keys miss once and
+  re-bill, no migration code), saves are atomic (temp file + rename, so
+  concurrent processes never see a half-written cache), and the cache is
+  capped at 10,000 entries with oldest-first eviction (v1 envelope with an
+  insertion-order list).
 - install-dev.sh: remote/curl install path — `curl -fsSL https://raw.githubusercontent.com/Emasoft/jgrep/main/install-dev.sh | bash -s -- --choice 8` (new menu `[8]`, appended, never renumbered) clones or updates a script-managed fork clone at `~/.local/share/jgrep` (`JGREP_DEV_DIR` overrides the location), then runs the full local setup (deps, build, system-wide bin symlink, agent-skill refresh), autodetects and replaces previous installs with `.bak` archival exactly like option 1, and auto-installs bun when missing (node stays a runtime requirement); the interactive menu refuses through a pipe (exit 2 with the two documented one-liners), and the fork can never publish npm (`publish.yml` now runs only in the upstream `kyu1204/jgrep` repo).
-- markdown-aware chunking: .md/.mdx files split at headings with section-trail context; fenced code blocks never split — sub-section extraction via -C/--json start-end
+- markdown-aware chunking: .md/.mdx files split at headings with section-trail
+  context; fenced code blocks never split — sub-section extraction via
+  -C/--json start-end.
 
 ### Fixed
 
@@ -33,6 +78,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `JEV_PRICE_PER_MTOK` is validated right after provider resolution (both modes) — an invalid price can no longer surface only after the run has billed tokens.
 - install-dev.sh: `check` and choice 6 never create the target directory (a missing `~/.local/bin` was mkdir'd under "no mutation").
 - The gateway 402 hint drops the "top up credits at …" clause when the provider has no billing URL ("insufficient credits on the gateway provider").
+- Reliability: expired waiters are evicted from the rate limiter without consuming a token, and the per-batch deadline is monotonic with a fail-fast settlement guard.
 - Removed dead code: the redundant unreachable-codes branch in `classifyTransport` (identical fallthrough) and the unused `installSkills` (superseded by init's universal skill installer).
 - Docs: README now says code-mode `--json` is byte-identical to 0.3.0 while rows mode is a flattened answer array; the bench `--limit` note reads "rows per class"; the Bench workflow input says "Rows per class / cases"; the `--help` init line reads "(provider, key, agent skills)".
 - CI runs the bench unit tests too (`bun test src/ bench/`).
