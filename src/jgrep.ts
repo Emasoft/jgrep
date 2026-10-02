@@ -439,11 +439,20 @@ export class BudgetMeter {
         { provider, retryable: false, hint: "raise --budget" },
       );
     this.reserved += est;
-    let real = 0; // a request that failed after its retries is not billed: the reservation is just released
+    let real = 0;
     try {
       const res = await send();
       real = res.cost ?? ((res.usage?.input_tokens ?? 0) * this.pricePerMtok) / 1e6;
       return res;
+    } catch (e) {
+      // A failure the provider may still have billed keeps its reservation as spend
+      // (audit: settling those at $0 let the cap be exceeded). Likely billed: a 200 with a
+      // malformed body, a client-side timeout (the server may have finished the work) and
+      // a 5xx (the server reached the request). Never processed — released: 4xx refusals
+      // (bad key, credits, bad request, missing model), 429 and connection failures.
+      // ponytail: a retried batch is charged ONE estimate, not one per attempt.
+      if (e instanceof JevProviderError && (e.kind === "malformed_response" || e.kind === "timeout" || (e.status !== undefined && e.status >= 500))) real = est;
+      throw e;
     } finally {
       this.reserved -= est;
       this.spent += real;

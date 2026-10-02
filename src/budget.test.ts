@@ -155,3 +155,33 @@ test("--tests without a budget: no cap — every pack runs", async () => {
   expect(st.requests).toBe(40);
   expect(r.errors).toEqual([]);
 });
+
+// ---- billed-but-failed requests settle their reservation (audit MINOR) ----------
+
+const failingFetch = (status: number, body: string) => {
+  const st = { requests: 0 };
+  const fetchImpl = (async () => { st.requests++; return new Response(body, { status }); }) as unknown as Fetch;
+  return { st, fetchImpl };
+};
+
+test("--budget: a 200 with a malformed body (likely billed) is charged its reservation, so the cap still holds", async () => {
+  const c1 = await oneRequestCost();
+  const { st, fetchImpl } = failingFetch(200, "not json");
+  const r = await jgrep("q", nChunks(10), { threshold: 0.7, batch: 1, concurrency: 1, maxRetries: 0, budget: c1 * 3.5, pricePerMtok: PRICE, apiKey: "k", fetchImpl, cache: {} });
+  expect(st.requests).toBe(3); // before: spend stayed $0 on every failed request and all 10 were sent
+  expect(r.errors.filter((e) => e.kind === "malformed_response")).toHaveLength(3);
+  expect(r.errors.filter((e) => e.kind === "budget_exhausted")).toHaveLength(7);
+});
+
+test("--budget: a retried 5xx is charged its reservation; a 400 (never processed) is released", async () => {
+  const c1 = await oneRequestCost();
+  const five = failingFetch(503, "busy");
+  // room for 2: the breaker (3 consecutive fatal 5xx) must not be what stops the run
+  const r5 = await jgrep("q", nChunks(10), { threshold: 0.7, batch: 1, concurrency: 1, maxRetries: 0, budget: c1 * 2.5, pricePerMtok: PRICE, apiKey: "k", fetchImpl: five.fetchImpl, cache: {} });
+  expect(five.st.requests).toBe(2);
+  expect(r5.errors.filter((e) => e.kind === "budget_exhausted")).toHaveLength(8);
+  const bad = failingFetch(400, "bad request");
+  const r4 = await jgrep("q", nChunks(10), { threshold: 0.7, batch: 1, concurrency: 1, maxRetries: 0, budget: c1 * 3.5, pricePerMtok: PRICE, apiKey: "k", fetchImpl: bad.fetchImpl, cache: {} });
+  expect(bad.st.requests).toBe(10);
+  expect(r4.errors.every((e) => e.kind === "bad_request")).toBe(true);
+});
