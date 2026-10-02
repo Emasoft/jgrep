@@ -93,7 +93,7 @@ input and chunking
   and a per-file verdict (--funcs, --tests, a split row) takes the best part
   -b, --batch <n>       chunks per request (default ${DEFAULT_BATCH}; fewer when chunks are big)
       --max-bytes <n>   skip files over n bytes (default: none; over the ${HARD_MAX_BYTES / 2 ** 20} MB
-                        hard ceiling always skipped; a larger n exits ${EXIT.noMatch})
+                        hard ceiling always skipped; a larger n exits ${EXIT.error})
       --follow-symlinks follow symlinks found while listing (default: skip and
                         report them); secret-looking names/targets stay refused
       --no-cache        ignore and do not write the cache (~/.jgrep/cache.json)
@@ -118,7 +118,7 @@ modes
       --envelopes       append each chunk's numbers to its text (steadier counting)
       --tag <a,b,...>   classify each hit into one of ${MIN_TAG_CATEGORIES}+ categories, printed as [tag]
       --default <label> catch-all category of --tag or a --questions choice (default:
-                        the last; unknown: exit ${EXIT.noMatch}); a split row takes its best other label
+                        the last; unknown: exit ${EXIT.error}); a split row takes its best other label
       --tests [ref]     print the test files a diff plausibly affects (by name, by
                         import, then by Jev); pipe the list into your test runner
       --rows <file>     judge the rows of a CSV / JSONL file instead of code
@@ -240,7 +240,7 @@ export function parse(argv: string[]) {
     else if (a === "--envelopes") o.envelopes = true;
     else if (a === "--funcs") o.funcs = true;
     else if (a === "--tag") o.tag = argv[++i] ?? ""; // comma-separated categories; validated below
-    else if (a === "--default") o.defaultLabel = argv[++i] ?? ""; // checked against the categories in main()/rowsMain(), exit 1
+    else if (a === "--default") o.defaultLabel = argv[++i] ?? ""; // checked against the categories in main()/rowsMain(), exit 2
     else if (a === "--estimate") o.estimateOnly = true;
     else if (a === "--json") o.json = true;
     else if (a === "--json-errors") { o.jsonErrors = true; o.json = true; } // implies --json
@@ -302,7 +302,7 @@ export function parse(argv: string[]) {
   // reservation exceeds it), negative/non-finite gets the generic numeric error.
   if (o.budget !== null && !(Number.isFinite(o.budget) && o.budget >= 0))
     throw new Error("numeric option expected");
-  // --max-bytes: a byte count (> 0). The 100 MB ceiling is checked in main(), with exit 1.
+  // --max-bytes: a byte count (> 0). The 100 MB ceiling is checked in main(), with exit 2.
   if (o.maxBytes !== null && !(Number.isInteger(o.maxBytes) && o.maxBytes > 0))
     throw new Error("max-bytes must be a positive whole number of bytes");
   return { ...o, question: rest[0], paths: rest.slice(1) };
@@ -527,7 +527,8 @@ async function main() {
   // symlinks or not"); the flag or JGREP_FOLLOW_SYMLINKS=1 turns following on.
   o.followSymlinks ||= process.env.JGREP_FOLLOW_SYMLINKS === "1";
   // --max-bytes > $JGREP_MAX_BYTES > none (any size up to the hard ceiling). USER: the
-  // 100 MB ceiling "just to prevent system hangs" can be lowered, never raised: exit 1.
+  // 100 MB ceiling "just to prevent system hangs" can be lowered, never raised. A refusal is a
+  // usage error (exit 2), not "nothing matched" (exit 1): CI tests `[ $? -eq 1 ]` for a clean run.
   const envMax = process.env.JGREP_MAX_BYTES?.trim();
   if (o.maxBytes === null && envMax) {
     o.maxBytes = Number(envMax);
@@ -535,7 +536,7 @@ async function main() {
   }
   if (o.maxBytes !== null && o.maxBytes > HARD_MAX_BYTES) {
     console.error(`--max-bytes ${o.maxBytes} is above the ${HARD_MAX_BYTES / 2 ** 20} MB hard ceiling (${HARD_MAX_BYTES} bytes), which cannot be raised`);
-    process.exit(EXIT.noMatch); // the code USAGE documents for this refusal
+    process.exit(EXIT.error); // usage error: exit 1 would read as a clean run in CI
   }
   const sizeOpts = { followSymlinks: o.followSymlinks, maxBytes: o.maxBytes ?? undefined };
   if (o.tests) return testsMain(o, wiring);
@@ -670,9 +671,10 @@ async function testsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
 }
 
 /** --default must be a label of every category list given ([question name, labels]; ""
- *  for --tag); an unknown label, or no categories at all, exits 1 before anything is sent. */
+ *  for --tag); an unknown label, or no categories at all, exits 2 (usage error, never the
+ *  "nothing matched" 1 that CI reads as clean) before anything is sent. */
 function checkDefault(label: string, lists: [string, string[]][]) {
-  const fail = (m: string) => { console.error(c("31", m)); process.exit(EXIT.noMatch); }; // the code USAGE documents
+  const fail = (m: string) => { console.error(c("31", m)); process.exit(EXIT.error); }; // usage error, not a clean run
   if (!lists.some(([, ls]) => ls.length)) fail(`--default "${label}" needs categories: --tag, or a choice question in --rows --questions`);
   for (const [name, ls] of lists)
     if (!ls.includes(label)) fail(`--default "${label}" is not one of the categories${name ? ` of question "${name}"` : ""}: ${ls.join(", ")}`);

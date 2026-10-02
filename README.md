@@ -385,7 +385,7 @@ Question objects are passed to the API verbatim, so anything Jev accepts works
 array is rejected with HTTP 400).
 A row too big for one request is judged in parts. For a `choice` the best real
 evidence wins: the catch-all label is the last criterion (`other` above) unless
-`--default <label>` names another (an unknown label exits 1); a part votes only
+`--default <label>` names another (an unknown label exits 2); a part votes only
 when its top label is not the catch-all, the voting part with the highest
 probability decides, and a row where no part votes gets the catch-all at its best
 probability. noul and score take the highest part.
@@ -540,7 +540,7 @@ input and chunking
   and a per-file verdict (--funcs, --tests, a split row) takes the best part
   -b, --batch <n>       chunks per request (default 16; fewer when chunks are big)
       --max-bytes <n>   skip files over n bytes (default: none; over the 100 MB
-                        hard ceiling always skipped; a larger n exits 1)
+                        hard ceiling always skipped; a larger n exits 2)
       --follow-symlinks follow symlinks found while listing (default: skip and
                         report them); secret-looking names/targets stay refused
       --no-cache        ignore and do not write the cache (~/.jgrep/cache.json)
@@ -565,7 +565,7 @@ modes
       --envelopes       append each chunk's numbers to its text (steadier counting)
       --tag <a,b,...>   classify each hit into one of 2+ categories, printed as [tag]
       --default <label> catch-all category of --tag or a --questions choice (default:
-                        the last; unknown: exit 1); a split row takes its best other label
+                        the last; unknown: exit 2); a split row takes its best other label
       --tests [ref]     print the test files a diff plausibly affects (by name, by
                         import, then by Jev); pipe the list into your test runner
       --rows <file>     judge the rows of a CSV / JSONL file instead of code

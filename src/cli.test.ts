@@ -145,14 +145,14 @@ test("cli main: a non-numeric numeric flag exits 2 with the plain untyped render
   expect(err).not.toContain("bad_request:"); // plain Error keeps today's rendering (no kind prefix)
 });
 
-test("cli main: --default must name a category (--tag or a choice question's criteria), else exit 1", async () => {
+test("cli main: --default must name a category (--tag or a choice question's criteria), else exit 2 (usage error)", async () => {
   const fs = await import("node:fs");
   const os = await import("node:os");
   const path = await import("node:path");
   const tag = run(["--tag", "bug,filler", "--default", "nope", "--estimate", "q", "src/rows.ts"]);
-  expect(tag.exitCode).toBe(1);
+  expect(tag.exitCode).toBe(2);
   expect(tag.stderr.toString()).toContain('--default "nope" is not one of the categories: bug, filler');
-  expect(run(["--default", "bug", "--estimate", "q", "src/rows.ts"]).exitCode).toBe(1); // no categories at all
+  expect(run(["--default", "bug", "--estimate", "q", "src/rows.ts"]).exitCode).toBe(2); // no categories at all
   expect(run(["--tag", "bug,filler", "--default", "filler", "--estimate", "q", "src/rows.ts"]).exitCode).toBe(0);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-default-"));
   try {
@@ -160,7 +160,7 @@ test("cli main: --default must name a category (--tag or a choice question's cri
     fs.writeFileSync(csv, "handle\n@a\n");
     fs.writeFileSync(qf, JSON.stringify({ kind: { type: "choice", instructions: "kind?", criteria: { bug: "b", filler: "f" } } }));
     const bad = run(["--rows", csv, "--questions", qf, "--default", "nope", "--estimate"]);
-    expect(bad.exitCode).toBe(1);
+    expect(bad.exitCode).toBe(2);
     expect(bad.stderr.toString()).toContain('--default "nope" is not one of the categories of question "kind": bug, filler');
     expect(run(["--rows", csv, "--questions", qf, "--default", "bug", "--estimate"]).exitCode).toBe(0);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
