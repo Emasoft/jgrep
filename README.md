@@ -53,13 +53,14 @@ curl -fsSL https://raw.githubusercontent.com/Emasoft/jgrep/main/install-dev.sh |
 ```
 
 Then give jgrep a key the way you give it to every other tool: export
-`OPENROUTER_API_KEY` or `TYPESAFE_API_KEY` (or `JEV_GATEWAY_API_KEY` with
-`JEV_GATEWAY_URL`) in your shell profile. jgrep detects it; there is nothing to
-pass on the command line, and an OpenRouter key alone selects OpenRouter. Get a
-key at [openrouter.ai/keys](https://openrouter.ai/keys) or
-[console.typesafe.ai](https://console.typesafe.ai). No env var? `jgrep init`
-is the fallback (below). `jgrep --estimate ...` shows what a run would cost
-without sending anything or needing a key.
+`OPENROUTER_API_KEY` (or `TYPESAFE_API_KEY`, or another provider's key, see
+[Providers](#providers)) in your shell profile. jgrep finds it; there is nothing to
+pass on the command line. Get a key at
+[openrouter.ai/keys](https://openrouter.ai/keys) or
+[console.typesafe.ai](https://console.typesafe.ai). To choose providers and their
+order, write `~/.jgrep/providers.json`, or let `jgrep init` write it (below).
+`jgrep --estimate ...` shows what a run would cost without sending anything or
+needing a key.
 
 ### This fork is never published to npm
 
@@ -101,64 +102,104 @@ bun install && bun run build
 npm i -g .        # installs the `jgrep` bin from this folder
 ```
 
-### No key in your environment? `jgrep init`
+### `jgrep init`
 
-`jgrep init` is only for people who do not export a key. It asks **which
-provider** — TypeSafe, OpenRouter, or a self-hosted gateway — verifies the key
-(OpenRouter through its free `GET /api/v1/key`, never a billed request; a key on
-an empty account is accepted with a top-up warning, and a network failure lets
-you save the key unverified instead of calling it rejected), stores it with
-`chmod 600` in `~/.config/jgrep/<provider>.key` (or the legacy
-`~/.config/jgrep/env`, or the project's `./.env`, which is then `chmod 600` too
-and checked with `git check-ignore`), remembers the provider you picked (and a
-gateway's URL) for the next plain `jgrep` run, and optionally installs the jgrep
-skill into your AI agents (every harness, via the pinned vercel `skills`
+`jgrep init` writes `~/.jgrep/providers.json` for you. It asks **which provider**
+(OpenRouter, TypeSafe, a compatible System One endpoint, Cloudflare Workers AI or
+the Vercel AI Gateway), the endpoint for `compatible` and the account id for
+Cloudflare when they are not exported, keeps an existing key or verifies a pasted
+one (OpenRouter, TypeSafe and Cloudflare through their free key-check routes, never
+a billed request; a key on an empty account is accepted with a top-up warning, and
+a network failure lets you save the key unverified instead of calling it
+rejected), saves it as that provider's literal `api_key` (the file is written
+`0600` in a `0700` directory, atomically) unless you export the variable yourself,
+offers to put the provider first in the fallback chain, and optionally installs the
+jgrep skill into your AI agents (every harness, via the pinned vercel `skills`
 installer). `jgrep init --request-timeout <s>` sets the key check's timeout
 (default 15 s).
 
 ## Providers
 
-Three backends speak the same Jev protocol. Pick one with `--api`, or let jgrep
-find a key.
+Providers live in **`~/.jgrep/providers.json`** (or `$JGREP_HOME/providers.json`),
+the same format as [Quicksilver](https://github.com/Emasoft/quicksilver)'s
+`~/.quicksilver/providers.json`. The `providers` array **is the fallback chain**:
+the first provider whose key is set gets each request, and a request that fails on
+a rejected key (401/403), no credits (402), an unavailable model, or a 429 / 5xx /
+network error after its retries moves on to the next one. A request-shape error
+(400/422) would fail everywhere, so it never falls back.
 
-| backend      | endpoint                                                    | default model                            | key                    |
-| ------------ | ----------------------------------------------------------- | ---------------------------------------- | ---------------------- |
-| `typesafe`   | `https://api.typesafe.ai/v1/systemone`                      | `jev-latest`                             | `TYPESAFE_API_KEY`     |
-| `openrouter` | `https://openrouter.ai/api/v1/systemone`                    | `~typesafe/jev-latest`                   | `OPENROUTER_API_KEY`   |
-| `gateway`    | `$JEV_GATEWAY_URL` (full System One endpoint, e.g. LiteLLM) | `jev-latest` (override with `--model`)   | `JEV_GATEWAY_API_KEY`  |
-
-Provider precedence: `--api` > `$JEV_API` > the first backend with a key, in
-the order typesafe, openrouter, gateway. So with only `OPENROUTER_API_KEY`
-exported, OpenRouter is selected automatically; with both keys exported,
-TypeSafe wins unless you pass `--api openrouter` or set `JEV_API=openrouter`.
-Key lookup, per provider: env var > `~/.config/jgrep/<name>.key` (mode 600,
-written by `jgrep init`) > the legacy `~/.config/jgrep/env` > `./.env` in the
-project (warned on stderr when it isn't gitignored; `chmod 600` is a no-op on
-Windows — init warns there too).
-
-```bash
-jgrep "swallows errors" src/                    # exported key found, provider auto-selected
-jgrep --api openrouter "swallows errors" src/   # forced
-jgrep --api gateway "swallows errors" src/      # JEV_GATEWAY_URL (+ JEV_GATEWAY_API_KEY) exported
-JEV_GATEWAY_URL=http://127.0.0.1:11434/v1/systemone \
-  jgrep --api gateway --model nimble --tests HEAD~1   # a local server (e.g. Ollama): no key needed
+```json
+{
+  "version": 1,
+  "providers": [
+    { "name": "openrouter", "api_key": "$OPENROUTER_API_KEY" },
+    { "name": "typesafe", "api_key": ["$JEV_API_KEY", "$TYPESAFE_API_KEY"] },
+    { "name": "cloudflare", "enabled": "off" }
+  ]
+}
 ```
 
-The gateway URL must be `https://`, except a loopback `http://` server
-(`localhost`, `127.0.0.1`, `[::1]`), which also needs no key. It is read from the
-environment (or the URL `jgrep init` saved in `~/.config/jgrep/env`) only, never
-from a project's `./.env`, so a cloned repo cannot redirect your key to its own
-server. **Run jgrep under node** (the installed bin does, via its shebang): bun
-loads `./.env` into the environment by itself, so under bun a `JEV_GATEWAY_URL`,
-`JGREP_ENDPOINT` or `JEV_API` value that came from a `./.env*` file is refused.
-`jgrep init` saves the provider you pick (`JEV_API`, plus `JEV_GATEWAY_URL` for a
-gateway) in `~/.config/jgrep/env`; `--api` and an exported `$JEV_API` still win.
-`$JEV_MODEL` is applied only when the id fits the provider (OpenRouter ids are
-`vendor/model`, TypeSafe ids have no slash, a gateway takes any); a misfit is
-ignored with a warning, and `--model` always applies. `JGREP_ENDPOINT` and `JGREP_MODEL` (the
-upstream project's names) are accepted as aliases of `JEV_GATEWAY_URL` and
-`JEV_MODEL`; unlike upstream, `JGREP_ENDPOINT` selects the gateway backend and
-its own key — it never re-routes a TypeSafe or OpenRouter key.
+With no file, the chain is the five built-ins in this order:
+
+| name         | endpoint                                                             | default model          | key (`api_key`)                                                     | free key check |
+| ------------ | -------------------------------------------------------------------- | ---------------------- | ------------------------------------------------------------------- | -------------- |
+| `openrouter` | `https://openrouter.ai/api/v1/systemone`                             | `~typesafe/jev-latest` | `$OPENROUTER_API_KEY`                                               | `/api/v1/key`  |
+| `typesafe`   | `https://api.typesafe.ai/v1/systemone`                               | `jev-latest`           | `$JEV_API_KEY`, `$TYPESAFE_API_KEY`                                 | `/v1/models`   |
+| `compatible` | `base_url` + `path`, or `$JEV_GATEWAY_URL` (any System One endpoint) | `jev-latest`           | `$JEV_GATEWAY_API_KEY`                                              | none           |
+| `cloudflare` | `https://api.cloudflare.com/client/v4/accounts/<id>/ai/run`          | `typesafe/jev`         | `$JEV_CLOUDFLARE_API_TOKEN`, `$CLOUDFLARE_API_TOKEN` + `$CLOUDFLARE_ACCOUNT_ID` | `/user/tokens/verify` |
+| `vercel`     | `https://ai-gateway.vercel.sh/v4/ai/evaluation-model`                | `typesafe-ai/jev`      | `$AI_GATEWAY_API_KEY`                                               | none           |
+
+- **The file is the chain, exactly.** When providers.json exists, only its entries
+  are used, in its order; a built-in it does not name is never appended. An entry
+  named like a built-in takes the built-in's fields as defaults and overrides any
+  of them; any other name is a new provider and must give `base_url`, `path`,
+  `adapter` (`system-one`, `cloudflare-ai-run` or `vercel-evaluation`), `api_key`
+  and `model`. `providers.example.json` (shipped with jgrep) shows every field.
+- **Keys.** `api_key` is `"$VAR"` or `"${VAR}"` (read from your environment), a
+  literal key, or an array of these (the first one set wins). A provider whose key
+  is unset is skipped silently — that is not an error. A file holding a literal key
+  must be `chmod 600`: otherwise jgrep refuses it and prints the command. Keys are
+  never printed (`jgrep status` names the variable, or "literal in providers.json").
+  If providers.json gives no key, jgrep still looks in its old places, in this
+  order: `~/.config/jgrep/<name>.key`, the legacy `~/.config/jgrep/env`, then the
+  project's `./.env` (warned on stderr when it is not gitignored).
+- **`enabled`**: `false` (or `no`, `off`, `0`, `disabled`, `inactive`) skips an
+  entry; `true` (or `yes`, `on`, `1`, `enabled`, `active`) or no field keeps it.
+  Anything else is an error naming the provider and the value.
+- **Pinning.** `--provider NAME` (or `JEV_API=NAME`) uses only that provider, with
+  no fallback. `--model` (or `JEV_MODEL`, `JGREP_MODEL`) applies to each provider
+  whose model ids it fits (OpenRouter ids are `vendor/model`, TypeSafe ids have no
+  slash); the others keep their own model, with a warning.
+- **Circuit breaker.** A provider that failed is skipped for the rest of the run,
+  and until a provider has answered once the run's other requests wait for that
+  first one, so a dead key costs one request, not one per batch. An answer a
+  fallback provider gave is cached under its own model.
+- **What happened.** When a run falls back, stderr ends with a `fallback:` line
+  (from which provider to which, why, how many requests) and which provider and
+  model answered. Every provider error is logged to **`~/.jgrep/errors.log`**:
+  timestamp, version, provider, model, kind, HTTP status, where the request went
+  next, the message (keys masked); entries older than 72 hours are dropped on
+  every write. `jgrep status` lists the chain with each provider's state (ready,
+  key present (not verified), key missing, rejected, no credits, unreachable,
+  disabled) using only the free key checks.
+
+```bash
+jgrep "swallows errors" src/                            # the chain, in providers.json order
+jgrep --provider openrouter "swallows errors" src/      # only OpenRouter, no fallback
+jgrep status                                            # the chain and each provider's state
+JEV_GATEWAY_URL=http://127.0.0.1:11434/v1/systemone \
+  jgrep --provider compatible --model nimble --tests HEAD~1   # a local server: no key needed
+```
+
+A `base_url` must be `https://`, except a loopback `http://` server
+(`localhost`, `127.0.0.1`, `[::1]`), which also needs no key. providers.json is
+read only from jgrep's home, and `JEV_GATEWAY_URL` (alias `JGREP_ENDPOINT`) only
+from the environment (or the URL an older `jgrep init` saved in
+`~/.config/jgrep/env`), never from a project's `./.env`, so a cloned repo cannot
+redirect your key to its own server. **Run jgrep under node** (the installed bin
+does, via its shebang): bun loads `./.env` into the environment by itself, so under
+bun a `JGREP_HOME`, `JEV_API`, `JEV_GATEWAY_URL` or `JGREP_ENDPOINT` value that
+came from a `./.env*` file is refused. Requests never follow a redirect.
 
 Requests to openrouter.ai carry OpenRouter's app-attribution headers
 (`HTTP-Referer`, `X-OpenRouter-Title` and its older alias `X-Title`, both `jgrep`,
@@ -183,7 +224,7 @@ jgrep --rows examples/creators.csv "beauty is the main content of this account"
 jgrep --rows examples/creators.csv --questions examples/beauty.json --out scored.csv
 jgrep --estimate "swallows errors" src/
 jgrep --budget 0.05 "swallows errors" .
-jgrep --api openrouter "swallows errors" src/
+jgrep --provider openrouter "swallows errors" src/
 ```
 
 ## Use cases
@@ -196,7 +237,7 @@ jgrep --api openrouter "swallows errors" src/
 | classify CSV / JSONL rows with typed questions | `jgrep --rows data.csv --questions q.json --out scored.csv` |
 | cap spending: price the run first, then set a hard cap | `jgrep --estimate "<rule>" src/ && jgrep --budget 0.02 "<rule>" src/` |
 | SARIF for code scanning in CI | `jgrep --diff origin/main --sarif "<rule>" > jgrep.sarif` |
-| a local or Ollama System One server, no key, no code leaves the machine | `JEV_GATEWAY_URL=http://localhost:11434/v1/systemone jgrep --api gateway --model <name> "<rule>" src/` |
+| a local or Ollama System One server, no key, no code leaves the machine | `JEV_GATEWAY_URL=http://localhost:11434/v1/systemone jgrep --provider compatible --model <name> "<rule>" src/` |
 
 ## Cost
 
@@ -405,13 +446,15 @@ cache.
 
 Exit status: `0` hits, `1` none, `2` when any chunk errored or a fatal was
 thrown. Hits and the error breakdown are both printed, and every failed chunk
-carries a typed kind with a hint on stderr:
+carries a typed kind with a hint on stderr. With several providers in the chain,
+these are the errors left after every provider was tried: the message lists each
+provider's failure, and a key or credit failure among them is the kind reported.
 
 | kind                   | hint |
 | ---------------------- | ---- |
-| `insufficient_credits` | billing URL to top up, or switch to the other hosted provider (`--api openrouter` / `--api typesafe`) |
-| `invalid_api_key`      | names the provider's key env and key file; tells you when the key worked earlier this run (expired/revoked) vs never worked (wrong provider's key) |
-| `model_unavailable`    | pin a version with `--model` (e.g. `typesafe/jev-1.13`), or `--api typesafe`; OpenRouter's 400 "Model X does not exist" lands here |
+| `insufficient_credits` | billing URL to top up, or switch to the other hosted provider (`--provider openrouter` / `--provider typesafe`) |
+| `invalid_api_key`      | names where the provider's key comes from; tells you when the key worked earlier this run (expired/revoked) vs never worked (wrong provider's key) |
+| `model_unavailable`    | pin a version with `--model` (e.g. `typesafe/jev-1.13`), or `--provider typesafe`; OpenRouter's 400 "Model X does not exist" lands here |
 | `forbidden`            | OpenRouter 403: moderation flagged that chunk, or the key has no access to the model — per chunk, never trips the breaker |
 | `rate_limited`         | the provider is throttling — pace with `--rate` |
 | `bad_request`          | request-shape problem; the provider's error message is quoted (`error.message` of a JSON body, so account fields such as `user_id` never reach the output) |
@@ -442,9 +485,10 @@ which is still to be verified on OpenRouter.
 
 ### Cache
 
-Answers are cached in `$XDG_CACHE_HOME/jgrep/` (when that is an absolute path),
-else `~/.cache/jgrep/`, by (model, question, chunk), so the same query again is
-free; a save that fails (read-only home, full disk) prints one warning instead
+Answers are cached in `~/.jgrep/cache.json` (or `$JGREP_HOME/cache.json`) by
+(model, question, chunk), so the same query again is free. The cache used to live
+in `~/.cache/jgrep/` (or `$XDG_CACHE_HOME/jgrep/`); it is not migrated, and jgrep
+says once, until the new cache exists, that the old file can be deleted; a save that fails (read-only home, full disk) prints one warning instead
 of silently re-billing every run. New in 0.7.0: cache keys hash the **normalized** chunk text (trailing
 whitespace stripped, blank lines dropped, line endings unified) rather than the
 raw bytes, so trailing spaces, blank-line churn and CRLF/LF changes do not
@@ -465,6 +509,7 @@ concurrent jgrep processes can never see a half-written cache.
 jgrep 0.7.0 — semantic grep powered by Jev
 
 usage: jgrep init [--request-timeout <s>]   setup: provider, key (checked), agent skills
+       jgrep status [--provider <name>]     the provider chain and each one's state
        jgrep [options] "<description>" [path ...]
        jgrep [options] --diff [ref] "<description>"
        jgrep [options] --tests [ref] [--staged] [path ...]
@@ -473,8 +518,7 @@ usage: jgrep init [--request-timeout <s>]   setup: provider, key (checked), agen
 
 Describe the code in English; jgrep asks Jev one yes/no question per chunk and
 prints the chunks that match as file:line ranges with a probability p.
-Key: export OPENROUTER_API_KEY or TYPESAFE_API_KEY (or JEV_GATEWAY_API_KEY) in your
-shell profile; jgrep detects it. No env var? `jgrep init` stores a key file instead.
+Keys: export OPENROUTER_API_KEY (or another provider's key, below) or run `jgrep init`.
 
 search
   -t, --threshold <p>   print chunks with p >= this (default 0.7; 0.5 with --tests)
@@ -493,8 +537,7 @@ input and chunking
                         hard ceiling always skipped; a larger n exits 1)
       --follow-symlinks follow symlinks found while listing (default: skip and
                         report them); secret-looking names/targets stay refused
-      --no-cache        ignore and do not write the cache ($XDG_CACHE_HOME/jgrep
-                        or ~/.cache/jgrep)
+      --no-cache        ignore and do not write the cache (~/.jgrep/cache.json)
 
 output
       --json            hits as a JSON array [{file,start,end,p,text}] (v0.3.0 shape);
@@ -522,24 +565,25 @@ modes
                         of every row; prints the table with one column per question
   --group, --votes, --verify, --envelopes and --tag apply to code and --diff search
 
-provider and keys
-      --api <name>      typesafe | openrouter | gateway; precedence: --api > $JEV_API >
-                        the one `jgrep init` saved > the first with a key (typesafe,
-                        openrouter, gateway): an OpenRouter key alone selects OpenRouter
-      --model <id>      model id (default: the provider's; env JEV_MODEL, JGREP_MODEL)
-  key lookup per provider: env var > ~/.config/jgrep/<provider>.key (jgrep init)
-  > ~/.config/jgrep/env > ./.env of the project
+provider and keys (~/.jgrep/providers.json; `jgrep status` shows the chain)
+      --provider <name> only this provider, no fallback (env JEV_API)
+      --model <id>      model id, used where it fits a provider's ids (env JEV_MODEL,
+                        then JGREP_MODEL); other providers keep their own
+  providers.json: {"version":1,"providers":[{"name":"openrouter","api_key":
+  "$OPENROUTER_API_KEY"},{"name":"typesafe"}]}: array order = fallback order (no file:
+  openrouter, typesafe, compatible, cloudflare, vercel); a key, credit, model or
+  429/5xx failure moves the request on, logged to ~/.jgrep/errors.log (72 h); api_key
+  "$VAR" or a literal (chmod 600); "enabled": false skips one; every field: see
+  providers.example.json; key fallbacks: ~/.config/jgrep/{<name>.key,env}, ./.env
 
 environment
-  TYPESAFE_API_KEY      TypeSafe key
-  OPENROUTER_API_KEY    OpenRouter key
-  JEV_GATEWAY_URL       gateway: full System One endpoint, https:// or a loopback
-                        http:// server that needs no key (alias JGREP_ENDPOINT; process
-                        env only: under bun, a value bun loaded from ./.env is refused)
-  JEV_GATEWAY_API_KEY   gateway key
-  JEV_API               default provider (--api wins)
-  JEV_MODEL             default model id (alias JGREP_MODEL; --model wins; ignored
-                        with a warning when it does not fit the provider)
+  OPENROUTER_API_KEY    openrouter key; JEV_API_KEY or TYPESAFE_API_KEY: typesafe key
+  JEV_GATEWAY_URL       compatible: full System One endpoint when providers.json gives
+                        no base_url; https:// or a loopback http:// server that needs no
+                        key (alias JGREP_ENDPOINT; process env only, never ./.env)
+  JEV_GATEWAY_API_KEY   compatible key; AI_GATEWAY_API_KEY: vercel key
+  CLOUDFLARE_API_TOKEN  + CLOUDFLARE_ACCOUNT_ID: cloudflare (alias JEV_CLOUDFLARE_API_TOKEN)
+  JGREP_HOME            jgrep's home instead of ~/.jgrep (absolute path)
   JEV_BUDGET            default --budget in dollars (the flag wins)
   JEV_PRICE_PER_MTOK    dollars per million input tokens for --estimate, --budget and
                         the cost line when the provider reports none (default 0.042;
@@ -601,7 +645,7 @@ use cases:
       jgrep --diff origin/main --sarif "<rule>" > jgrep.sarif
   a local or Ollama System One server, no key, no code leaves the machine
       JEV_GATEWAY_URL=http://localhost:11434/v1/systemone \
-        jgrep --api gateway --model <name> "<rule>" src/
+        jgrep --provider compatible --model <name> "<rule>" src/
 ```
 
 ### Judging, cost controls, and machine-readable output
@@ -669,9 +713,8 @@ full.
 3. **One request, up to 16 chunks, one question each**: `state.chunks[]` plus a
    Noul question per chunk, *"look only at chunk c3, does it match: …"*.
 4. **Threshold**: probabilities at or above `-t` are printed in file order.
-   Answers are cached by `(model, question, chunk)` in the cache directory
-   (`$XDG_CACHE_HOME/jgrep/` or `~/.cache/jgrep/`), so the same query again is
-   free and instant.
+   Answers are cached by `(model, question, chunk)` in `~/.jgrep/cache.json`,
+   so the same query again is free and instant.
 
 | repo                         | chunks | time  | cost    |
 | ---------------------------- | -----: | ----: | ------: |

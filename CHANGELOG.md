@@ -9,20 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Configurable providers: `~/.jgrep/providers.json`** (TRDD-3KBUODCE), the same
+  format as Quicksilver's `~/.quicksilver/providers.json`. Its `providers` array is
+  the fallback chain: the first provider whose key is set takes each request, and a
+  rejected key, no credits, an unavailable model, or a 429/5xx/network failure after
+  retries moves the request to the next one (never a 400/422). When the file exists
+  the chain is exactly its entries; without it, the built-ins in order openrouter,
+  typesafe, compatible, cloudflare, vercel. `api_key` is `"$VAR"`, `"${VAR}"`, a
+  literal key (the file must then be `chmod 600`) or an array; `"enabled"` accepts
+  true/false and yes/no, on/off, 1/0, enabled/disabled, active/inactive; every
+  field is validated strictly. Example: `providers.example.json` (shipped).
+- A failed provider is skipped for the rest of the run, and until a provider has
+  answered once the run's other requests wait for it (a dead key costs one
+  request). The run ends with a `fallback:` line when it moved, and every provider
+  error is logged to `~/.jgrep/errors.log` (keys masked, entries older than 72 h
+  dropped on each write). A fallback answer is cached under its own model.
+- Cloudflare Workers AI (`cloudflare-ai-run`) and the Vercel AI Gateway
+  (`vercel-evaluation`) adapters, as built-in providers `cloudflare` and `vercel`.
+- `jgrep status [--provider NAME]`: the chain in order and each provider's state,
+  from the free key checks only (OpenRouter `/api/v1/key`, TypeSafe `/v1/models`,
+  Cloudflare `/user/tokens/verify`); a provider without one shows "key present (not
+  verified)", never "ready".
+
 - `--follow-symlinks` / `JGREP_FOLLOW_SYMLINKS=1`: follow symlinks found while
   listing (deduped by real path, directory loops cut, secret-looking link names or
   targets still refused). Default: skipped and reported.
 - `--max-bytes N` / `JGREP_MAX_BYTES`: an opt-in per-file size limit. There is no
   default limit any more (the silent 1 MB skip is gone); a 100 MB hard ceiling
   cannot be raised (a larger value exits 1). Over-limit files are reported.
-- `jgrep init --request-timeout <s>`; init remembers the chosen provider (and a
-  gateway URL) in `~/.config/jgrep/env`, read after `--api` / `$JEV_API`.
+- `jgrep init --request-timeout <s>`.
 - Error kind `forbidden` (OpenRouter 403: moderation or model permission; per
   chunk, never trips the breaker).
 - `--budget` warns when the provider bills more per token than
   `JEV_PRICE_PER_MTOK` (the reservation price).
 
 ### Changed
+
+- `jgrep init` writes `~/.jgrep/providers.json` (0600 in a 0700 home, atomic): the
+  pasted key as the provider's literal `api_key`, the compatible endpoint, the
+  Cloudflare account id, and optionally the provider first in the chain. It no
+  longer writes `~/.config/jgrep/<name>.key`, the legacy env file or `./.env`;
+  those are still read, after providers.json, as key fallbacks.
+- `--api` is now `--provider` (the benches too); `JEV_API` still pins. The `gateway`
+  provider is now `compatible` (same `JEV_GATEWAY_URL` / `JEV_GATEWAY_API_KEY`; its
+  old `gateway.key` file is still read). An OpenRouter key no longer jumps the queue:
+  the order of providers.json decides, and openrouter comes first in the built-in
+  order. TypeSafe also reads `JEV_API_KEY` (before `TYPESAFE_API_KEY`).
+- jgrep's home is `~/.jgrep` (`$JGREP_HOME` for tests): the cache moved from
+  `~/.cache/jgrep/cache.json` (or `$XDG_CACHE_HOME/jgrep`) to `~/.jgrep/cache.json`.
+  The old cache is not migrated or deleted; jgrep says once that it can be deleted.
 
 - Nothing is truncated to fit Jev's context any more: oversized chunks (giant
   fences, hunks, minified lines) are split with overlap, requests are packed under
@@ -34,8 +69,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `--json` `upper_bound`) instead of the plain search.
 - Run cost totals settle every request like the budget meter (reported cost, else
   tokens × price), so intermittent cost reporting is not undercounted.
-- `$JEV_MODEL` / `$JGREP_MODEL` apply only when the id fits the provider.
-- The cache honours `$XDG_CACHE_HOME`; a failed save warns once.
+- `--model`, `$JEV_MODEL` and `$JGREP_MODEL` apply to each provider whose ids they
+  fit (`model_pattern`); the others keep their own model, with a warning.
+- A failed cache save warns once.
 - `git ls-files` runs inside each listed directory (a directory in another repo
   than the cwd was silently walked without .gitignore); other ls-files failures
   are reported once.
@@ -57,8 +93,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changed lines such as `+--flag`.
 - votes=1 cache reads require a finite number.
 - `jgrep init`: a valid OpenRouter key on an empty account (402) can be saved, a
-  network failure is "unverified", not "rejected"; the `.env` append starts on its
-  own line.
+  network failure is "unverified", not "rejected".
 
 ### Security
 
@@ -66,10 +101,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exactly the fork, with no uncommitted changes, on `main`.
 - Symlinks are not followed by default (a tracked link could send a file outside
   the repo to the provider).
-- Under bun, `JEV_GATEWAY_URL` / `JGREP_ENDPOINT` / `JEV_API` values that came
-  from an auto-loaded `./.env*` are refused (run the bin under node).
-- Key files, the legacy env file and a project `./.env` are chmod 0600 after every
-  write; the `.env` gitignore check uses `git check-ignore`.
+- Under bun, `JGREP_HOME` / `JEV_GATEWAY_URL` / `JGREP_ENDPOINT` / `JEV_API`
+  values that came from an auto-loaded `./.env*` are refused (run the bin under node).
+- providers.json is read only from jgrep's home; a literal key in a file others can
+  read is refused with the `chmod 600` fix; parse errors never quote the file; one
+  `$VAR` may belong to one enabled provider only; keys are redacted from echoed
+  provider text and errors.log. The `.env` gitignore check uses `git check-ignore`.
+- The test suite runs with its own empty jgrep home and without provider keys
+  (`bunfig.toml` preload), so no test reads the user's providers.json or sends
+  code to a real provider.
 - SARIF URIs are percent-encoded; terminal output strips control characters; CSV
   output neutralises formula-looking cells.
 - Workflows: least-privilege CI token, actions on their latest majors pinned to
