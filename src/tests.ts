@@ -13,7 +13,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, KEY_WORKED_EARLIER_HINT,
-  BudgetMeter, listFiles, settledCost, type Cache, type Estimate,
+  BudgetMeter, listFiles, settledCost, type Cache, type Estimate, type ListOptions,
 } from "./jgrep";
 import { BACKENDS, DEFAULT_PRICE_PER_MTOK, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
 import { runPool, type PoolResult } from "./pool";
@@ -313,6 +313,6 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
   return { selected, all: answered, tokens, ...(cost !== undefined ? { cost } : {}), requests: batches.length - (pool.aborted ? pool.unprocessed : 0) - budgetRefused, cached: tests.length - byCode - todo.length, errors };
 }
 
-export function loadTests(paths: string[] = ["."]): TestFile[] {
-  return findTestFiles(listFiles(paths)).map((file) => ({ file, signature: signature(file) }));
+export function loadTests(paths: string[] = ["."], opts: ListOptions = {}): TestFile[] {
+  return findTestFiles(listFiles(paths, opts)).map((file) => ({ file, signature: signature(file) }));
 }

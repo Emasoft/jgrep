@@ -597,6 +597,7 @@ export interface Options {
   tag?: string;                // --tag (WI-4): comma-separated categories; one choice question per standing hit, the winner rides on Hit.tag
   funcs?: boolean;             // --funcs (WI-5): two-phase navigation — shortlist files by signature chunks, then search only those
   envelopes?: boolean;         // --envelopes (WI-9): append each chunk's numbers ("[numbers: 42, 7]") to the judged text
+  followSymlinks?: boolean;    // --follow-symlinks: jgrepFuncs' own file listing follows symlinks (see ListOptions)
   budget?: number;             // --budget (WI-7): once metered cost exceeds this many dollars, un-run chunks error budget_exhausted
   pricePerMtok?: number;       // $/Mtok for the --budget meter when the provider reports no cost (default DEFAULT_PRICE_PER_MTOK)
   meter?: BudgetMeter;         // a meter shared across runs (jgrepFuncs' two passes, the CLI's under-pricing check); else built from budget
@@ -985,7 +986,7 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
  */
 export async function jgrepFuncs(question: string, paths: string[], o: Options): Promise<Result> {
   const sigChunks: Chunk[] = [];
-  for (const file of listFiles(paths)) {
+  for (const file of listFiles(paths, { followSymlinks: o.followSymlinks })) {
     const lang = detectLanguage(file);
     if (!lang) continue; // unsupported language: excluded from --funcs search (documented)
     const text = readText(file);
@@ -999,7 +1000,7 @@ export async function jgrepFuncs(question: string, paths: string[], o: Options):
   const pass1 = await jgrep(question, sigChunks, { ...o, tag: undefined, meter });
   const shortlist = [...new Set(pass1.hits.map((h) => h.file))];
   if (shortlist.length === 0) return pass1;
-  const pass2 = await jgrep(question, chunkPaths(shortlist), { ...o, meter });
+  const pass2 = await jgrep(question, chunkPaths(shortlist, { followSymlinks: o.followSymlinks }), { ...o, meter });
   const cost = pass1.cost === undefined && pass2.cost === undefined ? undefined : (pass1.cost ?? 0) + (pass2.cost ?? 0);
   return {
     ...pass2,

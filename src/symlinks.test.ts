@@ -116,3 +116,22 @@ test("a file named explicitly and also listed under a named directory is listed 
     expect(listFiles([path.join(proj, "real.ts"), proj])).toHaveLength(1);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+// ---- CLI wiring: --follow-symlinks and JGREP_FOLLOW_SYMLINKS=1 ---------------------
+
+declare const Bun: { spawnSync(cmd: string[], opts?: { env?: Record<string, string | undefined> }): { exitCode: number | null; stdout: { toString(): string }; stderr: { toString(): string } } };
+
+test("cli: --estimate lists a symlinked file only with --follow-symlinks or JGREP_FOLLOW_SYMLINKS=1", () => {
+  const { root, proj, outside } = fixture();
+  try {
+    fs.symlinkSync(path.join(outside, "notes.txt"), path.join(proj, "link.txt"));
+    const env = { ...process.env, JGREP_NO_MAIN: "", JGREP_FOLLOW_SYMLINKS: "" };
+    const run = (args: string[], e = env) => Bun.spawnSync(["bun", "src/cli.ts", "--estimate", "--no-cache", ...args, "q", proj], { env: e });
+    const plain = run([]);
+    expect(plain.exitCode).toBe(0);
+    expect(plain.stdout.toString()).not.toContain("link.txt");
+    expect(plain.stderr.toString()).toContain("--follow-symlinks");
+    expect(run(["--follow-symlinks"]).stdout.toString()).toContain("link.txt");
+    expect(run([], { ...env, JGREP_FOLLOW_SYMLINKS: "1" }).stdout.toString()).toContain("link.txt");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+}, 20_000);

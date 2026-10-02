@@ -166,7 +166,7 @@ const c = (code: string, s: string) => (tty ? `\x1b[${code}m${s}\x1b[0m` : s);
 export function parse(argv: string[]) {
   const o = {
     threshold: 0.7, batch: 16, concurrency: 16, all: false, show: false, group: false, votes: 1, verify: false, json: false, jsonErrors: false, cache: true,
-    estimate: false, sarif: false, envelopes: false, funcs: false, budget: null as number | null,
+    estimate: false, sarif: false, envelopes: false, funcs: false, budget: null as number | null, followSymlinks: false,
     diff: null as string[] | null, rows: "", questions: "", out: "", tests: false, tag: "",
     api: "", model: "", timeout: 15, requestTimeout: 30, retries: 4, rate: 0, failFast: false,
   };
@@ -191,6 +191,7 @@ export function parse(argv: string[]) {
     else if (a === "--sarif") o.sarif = true; // machine-readable SARIF 2.1.0 (its own shape, not --json's)
     else if (a === "--budget") o.budget = Number(argv[++i]);
     else if (a === "--no-cache") o.cache = false;
+    else if (a === "--follow-symlinks") o.followSymlinks = true;
     else if (a === "--api") o.api = argv[++i] ?? "";
     else if (a === "--model") o.model = argv[++i] ?? "";
     else if (a === "--timeout") o.timeout = Number(argv[++i]);
@@ -377,6 +378,9 @@ async function main() {
     budget: o.budget ?? resolveBudgetEnv(process.env), // --budget (WI-7): flag > $JEV_BUDGET > unlimited
   };
   if (wiring.budget !== undefined) wiring.meter = new BudgetMeter(wiring.budget, pricePerMtok);
+  // Symlinks found while listing are skipped unless asked (USER: "an option to follow
+  // symlinks or not"); the flag or JGREP_FOLLOW_SYMLINKS=1 turns following on.
+  o.followSymlinks ||= process.env.JGREP_FOLLOW_SYMLINKS === "1";
   if (o.tests) return testsMain(o, wiring);
   if (o.rows) return rowsMain(o, wiring);
   if (!o.question) { console.error(USAGE); process.exit(2); }
@@ -388,7 +392,7 @@ async function main() {
   // Applies to code search only: --diff keeps judging hunks (funcs ignored there).
   // --estimate prices the plain search even with --funcs: pass 2 depends on pass-1
   // answers a dry run never gets (a known overestimate, listed in the CHANGELOG).
-  const chunks = o.funcs && !o.diff && !o.estimate ? null : (o.diff ? diffChunks(gitDiff(o.diff)) : chunkPaths(o.paths.length ? o.paths : ["."]));
+  const chunks = o.funcs && !o.diff && !o.estimate ? null : (o.diff ? diffChunks(gitDiff(o.diff)) : chunkPaths(o.paths.length ? o.paths : ["."], { followSymlinks: o.followSymlinks }));
   if (chunks !== null && !chunks.length) { console.error(o.diff ? "empty diff" : "no text files found"); process.exit(1); }
   const cache = o.cache ? loadCache() : {};
   try {
@@ -475,7 +479,7 @@ async function testsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
   const diff = gitDiff(o.diff ?? []);
   if (!diff.trim()) { console.error("empty diff"); process.exit(1); }
   const paths = [o.question, ...o.paths].filter((p): p is string => !!p);
-  const tests = loadTests(paths.length ? paths : ["."]);
+  const tests = loadTests(paths.length ? paths : ["."], { followSymlinks: o.followSymlinks });
   if (!tests.length) { console.error("no test files found"); process.exit(1); }
   const threshold = o.threshold === 0.7 ? 0.5 : o.threshold; // recall matters more here
   const cache = o.cache ? loadCache() : {};
