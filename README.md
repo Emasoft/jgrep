@@ -74,15 +74,22 @@ fork). Install the fork with the one-liner above, or from a clone:
 
 `--choice 8` clones the fork into `~/.local/share/jgrep` (override with
 `JGREP_DEV_DIR`) — a script-managed directory, never a dev checkout: every
-re-run fetches `origin/main` and `git reset --hard origin/main` there, then
+re-run fetches `origin/main` and `git reset --hard origin/main` there — but only
+in a clone the script created itself (it carries a `jgrep-managed` marker in its
+git dir), whose origin is exactly the fork, with no uncommitted changes and on
+`main`; anything else is refused, so a `JGREP_DEV_DIR` pointed at a real checkout
+can never lose work (a clone made by an older script is adopted with the `touch`
+command the refusal prints). Then it
 runs the full setup: deps (`bun install`), build, the `jgrep` bin symlinked
 system-wide (npm global bin → `/usr/local/bin` → `~/.local/bin`), and the
 agent-skill refresh. Previous installs are autodetected and replaced exactly
 like option 1: symlinks are repointed (including one pointing at an old clone
 path), real files are archived as `jgrep.bak-<timestamp>` with the printed
-`mv` command to revert. Updating = re-running the same command. Missing bun is
-offered (interactive y/N) or auto-installed (`--choice`/`--yes`) via
-[bun.sh](https://bun.sh); node ≥ 18 is still required at runtime. The
+`mv` command to revert. Updating = re-running the same command. A missing bun is
+installed via [bun.sh](https://bun.sh) only after a yes: the script asks (through
+`/dev/tty` when piped) and installs without asking only with an explicit
+`--yes` (`--choice` alone no longer implies it); node ≥ 18 is still required at
+runtime. The
 interactive menu cannot run through a pipe — use the `--choice 8` one-liner;
 `--choice 8 --dry-run` previews everything and mutates nothing.
 
@@ -98,10 +105,16 @@ npm i -g .        # installs the `jgrep` bin from this folder
 
 `jgrep init` is only for people who do not export a key. It asks **which
 provider** — TypeSafe, OpenRouter, or a self-hosted gateway — verifies the key
-against it, stores it with `chmod 600` in `~/.config/jgrep/<provider>.key` (or
-the legacy `~/.config/jgrep/env`, or the project's `./.env`), and optionally
-installs the jgrep skill into your AI agents (every harness, via the vercel
-`skills` installer).
+(OpenRouter through its free `GET /api/v1/key`, never a billed request; a key on
+an empty account is accepted with a top-up warning, and a network failure lets
+you save the key unverified instead of calling it rejected), stores it with
+`chmod 600` in `~/.config/jgrep/<provider>.key` (or the legacy
+`~/.config/jgrep/env`, or the project's `./.env`, which is then `chmod 600` too
+and checked with `git check-ignore`), remembers the provider you picked (and a
+gateway's URL) for the next plain `jgrep` run, and optionally installs the jgrep
+skill into your AI agents (every harness, via the pinned vercel `skills`
+installer). `jgrep init --request-timeout <s>` sets the key check's timeout
+(default 15 s).
 
 ## Providers
 
@@ -133,8 +146,16 @@ JEV_GATEWAY_URL=http://127.0.0.1:11434/v1/systemone \
 
 The gateway URL must be `https://`, except a loopback `http://` server
 (`localhost`, `127.0.0.1`, `[::1]`), which also needs no key. It is read from the
-environment only, never from a project's `./.env`, so a cloned repo cannot
-redirect your key to its own server. `JGREP_ENDPOINT` and `JGREP_MODEL` (the
+environment (or the URL `jgrep init` saved in `~/.config/jgrep/env`) only, never
+from a project's `./.env`, so a cloned repo cannot redirect your key to its own
+server. **Run jgrep under node** (the installed bin does, via its shebang): bun
+loads `./.env` into the environment by itself, so under bun a `JEV_GATEWAY_URL`,
+`JGREP_ENDPOINT` or `JEV_API` value that came from a `./.env*` file is refused.
+`jgrep init` saves the provider you pick (`JEV_API`, plus `JEV_GATEWAY_URL` for a
+gateway) in `~/.config/jgrep/env`; `--api` and an exported `$JEV_API` still win.
+`$JEV_MODEL` is applied only when the id fits the provider (OpenRouter ids are
+`vendor/model`, TypeSafe ids have no slash, a gateway takes any); a misfit is
+ignored with a warning, and `--model` always applies. `JGREP_ENDPOINT` and `JGREP_MODEL` (the
 upstream project's names) are accepted as aliases of `JEV_GATEWAY_URL` and
 `JEV_MODEL`; unlike upstream, `JGREP_ENDPOINT` selects the gateway backend and
 its own key — it never re-routes a TypeSafe or OpenRouter key.
@@ -179,17 +200,20 @@ jgrep --api openrouter "swallows errors" src/
 
 ## Cost
 
-Cost is the provider's reported number when it sends one (OpenRouter), else
-`input tokens × $JEV_PRICE_PER_MTOK` (default `$0.042` per million input
-tokens, output free).
+Cost is settled per request: the provider's reported number when it sends one
+(OpenRouter), else that request's `input tokens × $JEV_PRICE_PER_MTOK` (default
+`$0.042` per million input tokens, output free), so a provider that reports cost
+only sometimes is not undercounted.
 
 - **`--estimate`** is a dry run for every mode (code, `--diff`, `--rows`,
   `--tests`): it builds every request the run would send, counts cached chunks
   as free, prints a per-file chunk table and
   `estimated: N requests, ~T input tokens, ~$X`, sends nothing, needs no key,
   and exits 0 (`--json` prints `{requests,tokens,usd,estimate:true}`). With
-  `--funcs` it prices the plain search, an overestimate: pass 2 depends on
-  answers a dry run never gets.
+  `--funcs` it prices pass 1 (the signature chunks) exactly and pass 2 as an
+  **upper bound** — every candidate file shortlisted — since pass 2 depends on
+  answers a dry run never gets (`estimated --funcs pass 1: …` and
+  `upper bound with pass 2 …`; `--json` adds `upper_bound`).
 - **`--budget <usd>`** is a hard cap, and it is **opt-in: there is no cap
   unless you set one** (`--budget`, or `JEV_BUDGET`; the flag wins). Before a
   request is sent, its estimated cost is *reserved* against the budget; a
@@ -197,8 +221,10 @@ tokens, output free).
   `budget_exhausted` (exit 2, with a `raise --budget` hint). Each response
   replaces its reservation with the real cost. Because concurrent requests
   reserve before they are sent, a wave of parallel workers cannot overshoot.
-  It covers the search, `--verify`, `--tag`, both `--funcs` passes and
-  `--rows`, not `--tests`. Hits and cached answers already in hand are kept.
+  It covers every mode: the search, `--verify`, `--tag`, both `--funcs`
+  passes, `--rows` and `--tests`. Hits and cached answers already in hand are
+  kept. A request that fails after the provider likely billed it (a 200 with a
+  malformed body, a client-side timeout, a 5xx) keeps its reservation as spend.
   `--budget 0` sends nothing.
 - **The cap's ceiling is the estimator's accuracy.** A reservation is
   estimated input tokens × `$JEV_PRICE_PER_MTOK`; the estimate lands within
@@ -206,7 +232,10 @@ tokens, output free).
   repo's `src/`), so the requests in flight can push the final spend past the
   limit by up to that margin.
   If `JEV_PRICE_PER_MTOK` is set far below what the provider really charges,
-  every reservation is under-priced and the cap overshoots in proportion.
+  every reservation is under-priced and the cap overshoots in proportion — so
+  with `--budget` set, jgrep compares the provider-reported cost per token with
+  that price and prints a warning (naming the value to set) when the provider
+  bills more than 10% above it.
 
 ## Use
 
@@ -334,7 +363,8 @@ curl install (and `install-dev.sh` options 1-3) refreshes it in every
 agent-skills harness (Claude Code, Codex, OpenCode, Cursor, +75 more) via the
 vercel `skills` installer, falling back to the standard `~/.agents/skills/jgrep`
 folder; `jgrep init` offers the same install; manually:
-`npx skills add ./skills -g` from a checkout.
+`npx skills@1.7.0 add ./skills -g` from a checkout (the installer is pinned to
+an exact version everywhere).
 
 Or install the skill as a Claude Code plugin (the `jgrep` command must be installed too):
 
@@ -357,7 +387,10 @@ cache.
   (timeouts, `ECONNRESET`/`ETIMEDOUT`/`ECONNREFUSED`/`EAI_AGAIN`) retry with
   full-jitter exponential backoff (500 ms base, 30 s cap), `--retries` times
   (default 4, so 5 attempts). A provider `Retry-After` is honored, capped at
-  5 minutes.
+  5 minutes; one longer than what is left of the batch deadline fails the batch
+  at once as `rate_limited` (pace with `--rate`) instead of sleeping into a
+  `timeout`. Redirects are never followed (the request carries your key): a 3xx
+  endpoint fails fast with a hint to use the final URL.
 - **Deadlines**: `--request-timeout` (30 s) bounds one HTTP attempt;
   `--timeout` (15 s) is the deadline for a whole batch *including* its retries —
   an expired batch is recorded as errored and the run moves on.
@@ -376,11 +409,12 @@ carries a typed kind with a hint on stderr:
 
 | kind                   | hint |
 | ---------------------- | ---- |
-| `insufficient_credits` | billing URL to top up, or `--api typesafe` if a TypeSafe key exists |
+| `insufficient_credits` | billing URL to top up, or switch to the other hosted provider (`--api openrouter` / `--api typesafe`) |
 | `invalid_api_key`      | names the provider's key env and key file; tells you when the key worked earlier this run (expired/revoked) vs never worked (wrong provider's key) |
-| `model_unavailable`    | pin a version with `--model` (e.g. `typesafe/jev-1.13`), or `--api typesafe` |
+| `model_unavailable`    | pin a version with `--model` (e.g. `typesafe/jev-1.13`), or `--api typesafe`; OpenRouter's 400 "Model X does not exist" lands here |
+| `forbidden`            | OpenRouter 403: moderation flagged that chunk, or the key has no access to the model — per chunk, never trips the breaker |
 | `rate_limited`         | the provider is throttling — pace with `--rate` |
-| `bad_request`          | request-shape problem; the provider's response body is quoted |
+| `bad_request`          | request-shape problem; the provider's error message is quoted (`error.message` of a JSON body, so account fields such as `user_id` never reach the output) |
 | `malformed_response`   | the API surface may have changed — pin `--model` or report it |
 | `server_unreachable`   | check the network or the provider's status page |
 | `tls_error`            | certificate problem, message quoted verbatim |
@@ -408,8 +442,10 @@ which is still to be verified on OpenRouter.
 
 ### Cache
 
-Answers are cached in `~/.cache/jgrep/` by (model, question, chunk), so the same
-query again is free. New in 0.7.0: cache keys hash the **normalized** chunk text (trailing
+Answers are cached in `$XDG_CACHE_HOME/jgrep/` (when that is an absolute path),
+else `~/.cache/jgrep/`, by (model, question, chunk), so the same query again is
+free; a save that fails (read-only home, full disk) prints one warning instead
+of silently re-billing every run. New in 0.7.0: cache keys hash the **normalized** chunk text (trailing
 whitespace stripped, blank lines dropped, line endings unified) rather than the
 raw bytes, so trailing spaces, blank-line churn and CRLF/LF changes do not
 re-bill; any change in content or in leading indentation still does
@@ -428,7 +464,7 @@ concurrent jgrep processes can never see a half-written cache.
 ```
 jgrep 0.7.0 — semantic grep powered by Jev
 
-usage: jgrep init                       interactive setup (provider, key, agent skills)
+usage: jgrep init [--request-timeout <s>]   setup: provider, key (checked), agent skills
        jgrep [options] "<description>" [path ...]
        jgrep [options] --diff [ref] "<description>"
        jgrep [options] --tests [ref] [--staged] [path ...]
@@ -449,10 +485,16 @@ search
 
 input and chunking
   paths default to "."; files come from git ls-files (else a walk, max 5000 files);
-  binaries and files over 1 MB are skipped; code splits into 5-60 line chunks,
-  Markdown at its headings, and every diff hunk is one chunk
-  -b, --batch <n>       chunks per request (default 16)
-      --no-cache        ignore and do not write ~/.cache/jgrep
+  binaries are skipped; code splits into 5-60 line chunks, Markdown at headings,
+  a diff per hunk; anything too big for Jev's context is split, never truncated,
+  and a per-file verdict (--funcs, --tests, a split row) takes the best part
+  -b, --batch <n>       chunks per request (default 16; fewer when chunks are big)
+      --max-bytes <n>   skip files over n bytes (default: none; over the 100 MB
+                        hard ceiling always skipped; a larger n exits 1)
+      --follow-symlinks follow symlinks found while listing (default: skip and
+                        report them); secret-looking names/targets stay refused
+      --no-cache        ignore and do not write the cache ($XDG_CACHE_HOME/jgrep
+                        or ~/.cache/jgrep)
 
 output
       --json            hits as a JSON array [{file,start,end,p,text}] (v0.3.0 shape);
@@ -481,9 +523,9 @@ modes
   --group, --votes, --verify, --envelopes and --tag apply to code and --diff search
 
 provider and keys
-      --api <name>      typesafe | openrouter | gateway; precedence: --api > $JEV_API
-                        > the first provider with a key (typesafe, openrouter, gateway),
-                        so an OpenRouter key alone selects OpenRouter automatically
+      --api <name>      typesafe | openrouter | gateway; precedence: --api > $JEV_API >
+                        the one `jgrep init` saved > the first with a key (typesafe,
+                        openrouter, gateway): an OpenRouter key alone selects OpenRouter
       --model <id>      model id (default: the provider's; env JEV_MODEL, JGREP_MODEL)
   key lookup per provider: env var > ~/.config/jgrep/<provider>.key (jgrep init)
   > ~/.config/jgrep/env > ./.env of the project
@@ -492,14 +534,17 @@ environment
   TYPESAFE_API_KEY      TypeSafe key
   OPENROUTER_API_KEY    OpenRouter key
   JEV_GATEWAY_URL       gateway: full System One endpoint, https:// or a loopback
-                        http:// server that needs no key (alias JGREP_ENDPOINT;
-                        read from the process env only, never from ./.env)
+                        http:// server that needs no key (alias JGREP_ENDPOINT; process
+                        env only: under bun, a value bun loaded from ./.env is refused)
   JEV_GATEWAY_API_KEY   gateway key
   JEV_API               default provider (--api wins)
-  JEV_MODEL             default model id (alias JGREP_MODEL; --model wins)
+  JEV_MODEL             default model id (alias JGREP_MODEL; --model wins; ignored
+                        with a warning when it does not fit the provider)
   JEV_BUDGET            default --budget in dollars (the flag wins)
   JEV_PRICE_PER_MTOK    dollars per million input tokens for --estimate, --budget and
-                        the cost line when the provider reports none (default 0.042)
+                        the cost line when the provider reports none (default 0.042;
+                        --budget warns when the provider bills more)
+  JGREP_MAX_BYTES       default --max-bytes; JGREP_FOLLOW_SYMLINKS=1: --follow-symlinks
   NO_COLOR              plain output (also plain when stdout is not a terminal)
 
 reliability
@@ -512,10 +557,9 @@ reliability
 
 cost (no cap unless you set one)
       --estimate        dry run: requests, input tokens and cost; sends nothing and
-                        needs no key (with --funcs it prices the plain search)
+                        needs no key (--funcs: pass 1, plus pass 2 as an upper bound)
       --budget <usd>    hard spend cap: each request reserves its estimated cost and
-                        is not sent when it does not fit (search, --verify, --tag,
-                        --funcs, --rows; not --tests); 0 sends nothing
+                        is not sent when it does not fit (every mode); 0 sends nothing
 
   -h, --help            print this help
   -v, -V, --version     print version
@@ -540,7 +584,7 @@ examples:
   jgrep --rows examples/creators.csv --questions examples/beauty.json --out scored.csv
   jgrep --estimate "swallows errors" src/
   jgrep --budget 0.05 "swallows errors" .
-  jgrep --api openrouter "swallows errors" src/
+  jgrep --follow-symlinks --max-bytes 5000000 "reads user input" .
 
 use cases:
   find where X happens in an unfamiliar repo
@@ -578,12 +622,15 @@ full.
   replays for free).
 - `--estimate` and `--budget <usd>`: see [Cost](#cost).
 - `--sarif` prints SARIF 2.1.0 instead of text: one rule per description, one
-  result per hit (file uri + region.startLine) — ingestible by GitHub code
+  result per hit (percent-encoded relative uri, or a `file://` uri for an
+  absolute path, + region.startLine/endLine) — ingestible by GitHub code
   scanning.
-- `--funcs` is two-phase **function navigation**: pass 1 packs all of a file's
-  regex-extracted function/method/class signature lines into one signature chunk
-  per file (a tree-sitter parse is a future upgrade — the regexes are the
-  documented fallback) and judges those first; pass 2 then runs the normal chunk
+- `--funcs` is two-phase **function navigation**: pass 1 packs ALL of a file's
+  regex-extracted function/method/class signature lines into signature chunks
+  (one for a normal file, several context-sized ones for a big file — never cut;
+  a tree-sitter parse is a future upgrade — the regexes are the documented
+  fallback) and judges those first, shortlisting a file when ANY of its
+  signature chunks matches; pass 2 then runs the normal chunk
   search only on the files whose signatures matched, so the search cost tracks
   the shortlist instead of the whole tree. Files in unsupported languages (see
   `funcs.ts` for the extension map) and files with no extractable signatures are
@@ -600,18 +647,31 @@ full.
 
 ## How it works
 
-1. **Files** come from `git ls-files` (untracked included, ignored excluded),
-   or a directory walk. Binaries and files over 1 MB are skipped.
+1. **Files** come from `git ls-files` run inside each directory (untracked
+   included, ignored excluded), or a directory walk. Binaries are skipped; there
+   is no size limit unless you set `--max-bytes` (files over the 100 MB hard
+   ceiling are always skipped and reported). Symlinks found while listing are
+   skipped and reported unless `--follow-symlinks` (then each file is read once
+   by its real path, directory loops are cut, and a link whose name or target
+   looks like a secret — `.env*`, `*.key`, `*.pem`, `id_*`, `credentials`,
+   `kubeconfig`, … — is still refused); a path you name on the command line is
+   always followed, like `grep -r`.
 2. **Chunks**: each file is split at column-0 line starts into 5 to 60 line
    pieces. Markdown files (`.md`/`.mdx`) are split at their headings instead,
    each chunk carrying its section trail (`jgrep > Help`) as context, and fenced
-   code blocks are never split. With `--diff`, each hunk is a chunk and keeps
-   its `+`/`-` markers.
-3. **One request, 16 chunks, 16 questions**: `state.chunks[]` plus a Noul
-   question per chunk, *"look only at chunk c3, does it match: …"*.
+   code blocks are kept whole. With `--diff`, each hunk is a chunk and keeps
+   its `+`/`-` markers. **Nothing is ever truncated to fit Jev's 32k-token
+   context**: a chunk over 16 KB (a giant fence, hunk or minified line) is split
+   at line boundaries with 3 lines of overlap (a single giant line by
+   characters), every request is packed to stay under 40 KB, and a per-file
+   verdict (`--funcs` pass 1, `--tests`, a `--rows` row judged in parts) takes
+   the best part's answer.
+3. **One request, up to 16 chunks, one question each**: `state.chunks[]` plus a
+   Noul question per chunk, *"look only at chunk c3, does it match: …"*.
 4. **Threshold**: probabilities at or above `-t` are printed in file order.
-   Answers are cached by `(model, question, chunk)` in `~/.cache/jgrep/`, so
-   the same query again is free and instant.
+   Answers are cached by `(model, question, chunk)` in the cache directory
+   (`$XDG_CACHE_HOME/jgrep/` or `~/.cache/jgrep/`), so the same query again is
+   free and instant.
 
 | repo                         | chunks | time  | cost    |
 | ---------------------------- | -----: | ----: | ------: |
@@ -733,13 +793,13 @@ Fool-proofing, by design:
   installed — nothing to do" and exits 0.
 - **Agent-skill auto-refresh** — after a local install ([1]/[2]/[3]) the agent
   skill (`skills/jgrep/SKILL.md`) is refreshed too: the vercel `skills`
-  installer (`npx -y skills add ./skills -g -y`) updates every detected
+  installer (`npx -y skills@1.7.0 add ./skills -g -y`, pinned) updates every detected
   harness, falling back to `~/.agents/skills/jgrep` when the installer fails
   or is offline. Without this a dev-folder install would leave AI harnesses
   quoting stale flags (the skill embeds a verbatim copy of `jgrep --help`).
   Upstream-source installs ([4]) skip the refresh (no skill in that tree), and
   the refresh is best-effort — it never fails the install. The manual
-  alternative is unchanged: `npx skills add ./skills -g`.
+  alternative is unchanged: `npx skills@1.7.0 add ./skills -g`.
 
 The menu numbers are a stable contract: they will never be renumbered.
 

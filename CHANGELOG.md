@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `--follow-symlinks` / `JGREP_FOLLOW_SYMLINKS=1`: follow symlinks found while
+  listing (deduped by real path, directory loops cut, secret-looking link names or
+  targets still refused). Default: skipped and reported.
+- `--max-bytes N` / `JGREP_MAX_BYTES`: an opt-in per-file size limit. There is no
+  default limit any more (the silent 1 MB skip is gone); a 100 MB hard ceiling
+  cannot be raised (a larger value exits 1). Over-limit files are reported.
+- `jgrep init --request-timeout <s>`; init remembers the chosen provider (and a
+  gateway URL) in `~/.config/jgrep/env`, read after `--api` / `$JEV_API`.
+- Error kind `forbidden` (OpenRouter 403: moderation or model permission; per
+  chunk, never trips the breaker).
+- `--budget` warns when the provider bills more per token than
+  `JEV_PRICE_PER_MTOK` (the reservation price).
+
+### Changed
+
+- Nothing is truncated to fit Jev's context any more: oversized chunks (giant
+  fences, hunks, minified lines) are split with overlap, requests are packed under
+  a byte budget, `--funcs` keeps every signature (no 200-signature / 8000-char
+  cut), `--tests` sends the whole diff and whole signatures in parts, and an
+  over-context `--rows` row is judged in parts. Per-file verdicts take the best
+  part (noul/score: highest; choice: the most confident part's label).
+- `--estimate --funcs` prices pass 1 exactly and pass 2 as an upper bound (text
+  and `--json` `upper_bound`) instead of the plain search.
+- Run cost totals settle every request like the budget meter (reported cost, else
+  tokens × price), so intermittent cost reporting is not undercounted.
+- `$JEV_MODEL` / `$JGREP_MODEL` apply only when the id fits the provider.
+- The cache honours `$XDG_CACHE_HOME`; a failed save warns once.
+- `git ls-files` runs inside each listed directory (a directory in another repo
+  than the cwd was silently walked without .gitignore); other ls-files failures
+  are reported once.
+- The `skills` installer is pinned (`skills@1.7.0`) in `jgrep init` and
+  install-dev.sh; install-dev.sh installs a missing bun without asking only with
+  an explicit `--yes`.
+
+### Fixed
+
+- `--tests` ignored `--budget` / `$JEV_BUDGET`.
+- A failed request the provider likely billed (malformed 200, timeout, 5xx) now
+  keeps its budget reservation as spend.
+- OpenRouter's 400 "Model X does not exist" is `model_unavailable`; error
+  messages carry the body's `error.message` (no `user_id` in output); a long
+  `Retry-After` reports `rate_limited` instead of `timeout`; the credits hint never
+  names the provider already in use; redirects are never followed.
+- `--diff` / `--tests` decode git's quoted and TAB-terminated `+++` paths.
+- `--tests` no longer treats README/data files under `tests/` as tests, and keeps
+  changed lines such as `+--flag`.
+- votes=1 cache reads require a finite number.
+- `jgrep init`: a valid OpenRouter key on an empty account (402) can be saved, a
+  network failure is "unverified", not "rejected"; the `.env` append starts on its
+  own line.
+
+### Security
+
+- install-dev.sh option 8 resets only a clone it created (marker), whose origin is
+  exactly the fork, with no uncommitted changes, on `main`.
+- Symlinks are not followed by default (a tracked link could send a file outside
+  the repo to the provider).
+- Under bun, `JEV_GATEWAY_URL` / `JGREP_ENDPOINT` / `JEV_API` values that came
+  from an auto-loaded `./.env*` are refused (run the bin under node).
+- Key files, the legacy env file and a project `./.env` are chmod 0600 after every
+  write; the `.env` gitignore check uses `git check-ignore`.
+- SARIF URIs are percent-encoded; terminal output strips control characters; CSV
+  output neutralises formula-looking cells.
+- Workflows: least-privilege CI token, actions on their latest majors pinned to
+  commit SHAs, `persist-credentials: false`, `inputs.limit` validated, npm pinned.
+
 ## [0.7.0] - 2026-10-02 — roadmap completion (issue #1: WI-2, WI-3, WI-4, WI-5, WI-6, WI-7, WI-9, WI-10) and upstream v0.6.0 sync
 
 Completes the deferred roadmap of

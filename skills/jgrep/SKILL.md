@@ -72,7 +72,7 @@ status, examples and use cases:
 ```
 jgrep 0.7.0 — semantic grep powered by Jev
 
-usage: jgrep init                       interactive setup (provider, key, agent skills)
+usage: jgrep init [--request-timeout <s>]   setup: provider, key (checked), agent skills
        jgrep [options] "<description>" [path ...]
        jgrep [options] --diff [ref] "<description>"
        jgrep [options] --tests [ref] [--staged] [path ...]
@@ -93,10 +93,16 @@ search
 
 input and chunking
   paths default to "."; files come from git ls-files (else a walk, max 5000 files);
-  binaries and files over 1 MB are skipped; code splits into 5-60 line chunks,
-  Markdown at its headings, and every diff hunk is one chunk
-  -b, --batch <n>       chunks per request (default 16)
-      --no-cache        ignore and do not write ~/.cache/jgrep
+  binaries are skipped; code splits into 5-60 line chunks, Markdown at headings,
+  a diff per hunk; anything too big for Jev's context is split, never truncated,
+  and a per-file verdict (--funcs, --tests, a split row) takes the best part
+  -b, --batch <n>       chunks per request (default 16; fewer when chunks are big)
+      --max-bytes <n>   skip files over n bytes (default: none; over the 100 MB
+                        hard ceiling always skipped; a larger n exits 1)
+      --follow-symlinks follow symlinks found while listing (default: skip and
+                        report them); secret-looking names/targets stay refused
+      --no-cache        ignore and do not write the cache ($XDG_CACHE_HOME/jgrep
+                        or ~/.cache/jgrep)
 
 output
       --json            hits as a JSON array [{file,start,end,p,text}] (v0.3.0 shape);
@@ -125,9 +131,9 @@ modes
   --group, --votes, --verify, --envelopes and --tag apply to code and --diff search
 
 provider and keys
-      --api <name>      typesafe | openrouter | gateway; precedence: --api > $JEV_API
-                        > the first provider with a key (typesafe, openrouter, gateway),
-                        so an OpenRouter key alone selects OpenRouter automatically
+      --api <name>      typesafe | openrouter | gateway; precedence: --api > $JEV_API >
+                        the one `jgrep init` saved > the first with a key (typesafe,
+                        openrouter, gateway): an OpenRouter key alone selects OpenRouter
       --model <id>      model id (default: the provider's; env JEV_MODEL, JGREP_MODEL)
   key lookup per provider: env var > ~/.config/jgrep/<provider>.key (jgrep init)
   > ~/.config/jgrep/env > ./.env of the project
@@ -136,14 +142,17 @@ environment
   TYPESAFE_API_KEY      TypeSafe key
   OPENROUTER_API_KEY    OpenRouter key
   JEV_GATEWAY_URL       gateway: full System One endpoint, https:// or a loopback
-                        http:// server that needs no key (alias JGREP_ENDPOINT;
-                        read from the process env only, never from ./.env)
+                        http:// server that needs no key (alias JGREP_ENDPOINT; process
+                        env only: under bun, a value bun loaded from ./.env is refused)
   JEV_GATEWAY_API_KEY   gateway key
   JEV_API               default provider (--api wins)
-  JEV_MODEL             default model id (alias JGREP_MODEL; --model wins)
+  JEV_MODEL             default model id (alias JGREP_MODEL; --model wins; ignored
+                        with a warning when it does not fit the provider)
   JEV_BUDGET            default --budget in dollars (the flag wins)
   JEV_PRICE_PER_MTOK    dollars per million input tokens for --estimate, --budget and
-                        the cost line when the provider reports none (default 0.042)
+                        the cost line when the provider reports none (default 0.042;
+                        --budget warns when the provider bills more)
+  JGREP_MAX_BYTES       default --max-bytes; JGREP_FOLLOW_SYMLINKS=1: --follow-symlinks
   NO_COLOR              plain output (also plain when stdout is not a terminal)
 
 reliability
@@ -156,10 +165,9 @@ reliability
 
 cost (no cap unless you set one)
       --estimate        dry run: requests, input tokens and cost; sends nothing and
-                        needs no key (with --funcs it prices the plain search)
+                        needs no key (--funcs: pass 1, plus pass 2 as an upper bound)
       --budget <usd>    hard spend cap: each request reserves its estimated cost and
-                        is not sent when it does not fit (search, --verify, --tag,
-                        --funcs, --rows; not --tests); 0 sends nothing
+                        is not sent when it does not fit (every mode); 0 sends nothing
 
   -h, --help            print this help
   -v, -V, --version     print version
@@ -184,7 +192,7 @@ examples:
   jgrep --rows examples/creators.csv --questions examples/beauty.json --out scored.csv
   jgrep --estimate "swallows errors" src/
   jgrep --budget 0.05 "swallows errors" .
-  jgrep --api openrouter "swallows errors" src/
+  jgrep --follow-symlinks --max-bytes 5000000 "reads user input" .
 
 use cases:
   find where X happens in an unfamiliar repo
@@ -254,8 +262,20 @@ array). Use it to label, triage or filter records instead of reading them one by
 
 ## Cache and cost
 
-Answers are cached by (model, question, chunk) in `~/.cache/jgrep/`, so a re-run
-is free. Trailing whitespace, blank lines and line endings do not re-bill;
-any change in content or leading indentation does. Cost is the provider's
-reported number, else input tokens × `$JEV_PRICE_PER_MTOK` (default $0.042 per
-million, output free). `--budget` is as exact as the estimate (about 15%).
+Answers are cached by (model, question, chunk) in `~/.cache/jgrep/` (or
+`$XDG_CACHE_HOME/jgrep/`), so a re-run is free. Trailing whitespace, blank lines
+and line endings do not re-bill; any change in content or leading indentation
+does. Cost is settled per request: the provider's reported number, else input
+tokens × `$JEV_PRICE_PER_MTOK` (default $0.042 per million, output free).
+`--budget` covers every mode and is as exact as the estimate (about 15%); with
+`--funcs`, `--estimate` prints pass 1 and an upper bound for pass 2.
+
+## Files jgrep reads
+
+Any size up to a 100 MB hard ceiling (`--max-bytes N` sets a lower limit);
+binaries are skipped. Symlinks found while listing are skipped and reported;
+pass `--follow-symlinks` only when the user wants them (secret-looking links stay
+refused). Nothing is truncated to fit Jev's context: big chunks are split and a
+per-file verdict takes the best part. Run the installed `jgrep` (node), not
+`bun src/cli.ts`, in an untrusted repo: under bun a gateway URL that came from
+the repo's `./.env` is refused.
