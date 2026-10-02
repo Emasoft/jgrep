@@ -329,3 +329,19 @@ test("cli main: an invalid JEV_PRICE_PER_MTOK is fatal before any request is mad
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }, 20_000);
+
+// ---- review n1: $JEV_MODEL / $JGREP_MODEL only when the id fits the provider ----------
+
+test("n1 modelFor: an env model id applies only when it fits the provider; --model always applies", async () => {
+  const { modelFor } = await import("./cli");
+  const { BACKENDS } = await import("./providers");
+  // OpenRouter ids are vendor/model; TypeSafe ids have no slash; a gateway takes anything
+  expect(modelFor(BACKENDS.openrouter, "", { JEV_MODEL: "typesafe/jev-1.13" })).toEqual({ model: "typesafe/jev-1.13" });
+  const ts = modelFor(BACKENDS.typesafe, "", { JEV_MODEL: "typesafe/jev-1.13" });
+  expect(ts.model).toBeUndefined(); // the provider default, not an id TypeSafe would reject
+  expect(ts.warning).toContain("JEV_MODEL");
+  expect(modelFor(BACKENDS.openrouter, "", { JGREP_MODEL: "jev-latest" }).warning).toContain("JGREP_MODEL");
+  expect(modelFor({ ...BACKENDS.gateway, url: "http://localhost/x" }, "", { JEV_MODEL: "llama3" })).toEqual({ model: "llama3" });
+  expect(modelFor(BACKENDS.typesafe, "anything/at-all", { JEV_MODEL: "x/y" })).toEqual({ model: "anything/at-all" }); // the flag is explicit
+  expect(modelFor(BACKENDS.typesafe, "", {})).toEqual({});
+});

@@ -340,6 +340,21 @@ export function toSarif(question: string, hits: Hit[]) {
   };
 }
 
+// ---- model selection (review n1) ---------------------------------------------------
+/** --model > $JEV_MODEL > $JGREP_MODEL > the backend default. The env vars are global
+ *  (shell profile) while the provider can change per run, so an env id is applied only
+ *  when it FITS the provider: OpenRouter ids are vendor/model, TypeSafe ids have no
+ *  slash, a gateway takes anything. A misfit is ignored with a warning instead of being
+ *  sent to a provider that rejects it. An explicit --model is always applied. */
+export function modelFor(backend: Backend, flag: string, env: Record<string, string | undefined>): { model?: string; warning?: string } {
+  if (flag) return { model: flag };
+  const name = env.JEV_MODEL ? "JEV_MODEL" : env.JGREP_MODEL ? "JGREP_MODEL" : undefined;
+  if (!name) return {};
+  const id = env[name]!;
+  const fits = backend.name === "gateway" || (backend.name === "openrouter") === id.includes("/");
+  return fits ? { model: id } : { warning: `warning: ignoring ${name}=${id} — not a ${backend.name} model id; using ${backend.model} (pass --model to force it)` };
+}
+
 // ---- --budget (WI-7) ---------------------------------------------------------------
 /** $JEV_BUDGET: the default run budget in dollars (an explicit --budget flag wins).
  *  Invalid values are fatal before anything can be spent — same up-front philosophy
@@ -368,10 +383,12 @@ async function main() {
   // No startup probe (upstream design): OpenRouter is on its stable /api/v1/systemone path,
   // and the first batch's error goes through the typed classifier (401 invalid key, 402
   // credits, retries for transients) — a separate billed ping only misreported those.
+  // JGREP_MODEL is upstream's name for the same override (#19); JEV_MODEL wins when both are set.
+  const picked = modelFor(backend, o.model, process.env);
+  if (picked.warning) console.error(c("33", picked.warning));
   const wiring: Wiring = {
     backend,
-    // JGREP_MODEL is upstream's name for the same override (#19); JEV_MODEL wins when both are set.
-    model: o.model || process.env.JEV_MODEL || process.env.JGREP_MODEL || undefined,
+    model: picked.model,
     timeoutSec: o.timeout, requestTimeoutSec: o.requestTimeout, maxRetries: o.retries,
     ratePerSec: o.rate || undefined, failFast: o.failFast, pricePerMtok,
     estimate: o.estimate ? { requests: 0, chars: 0, files: {} } : undefined,
