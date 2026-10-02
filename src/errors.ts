@@ -4,7 +4,8 @@ export type JevErrorKind =
   | "insufficient_credits" | "invalid_api_key" | "model_unavailable" | "rate_limited"
   | "bad_request" | "malformed_response" | "server_unreachable" | "tls_error"
   | "timeout" | "circuit_breaker_open"
-  | "budget_exhausted"; // WI-7 --budget: run-policy stop, never a provider failure
+  | "budget_exhausted" // WI-7 --budget: run-policy stop, never a provider failure
+  | "forbidden";        // OpenRouter 403: moderation flag or a key/model permission — per request, never fatal
 
 export interface JevErrorOpts { provider: string; status?: number; retryable: boolean; hint?: string; cause?: unknown }
 

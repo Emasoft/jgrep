@@ -408,6 +408,8 @@ function hintFor(kind: JevErrorKind, backend: Backend, snippet: string): string 
         ? `top up credits at ${billing} or switch with --api typesafe if a TypeSafe key exists`
         : "insufficient credits on the gateway provider";
     }
+    case "forbidden":
+      return "OpenRouter refused this request (403): usually its moderation flagged this chunk's text, or the key has no access to the model — the other chunks are unaffected";
     case "invalid_api_key":
       return `use a ${backend.name} key — check ${backend.keyEnv} or ${keyFilePath(backend.name)}, or run \`jgrep init\``;
     case "model_unavailable":
@@ -520,7 +522,10 @@ export async function postSystemOne(
       if (!res.ok) {
         // Read the body BEFORE classifying so a retry never needs it a second time.
         const snippet = errorTextOf(await res.text()).slice(0, SNIPPET_MAX);
-        const cls = classifyStatus(res.status, snippet);
+        let cls = classifyStatus(res.status, snippet);
+        // OpenRouter's 403 is a moderation flag or a model permission on THIS request, not a
+        // bad key (its bad key is 401): non-fatal, so one flagged chunk cannot trip the breaker.
+        if (res.status === 403 && backend.name === "openrouter") cls = { kind: "forbidden", retryable: false };
         if (!cls.retryable) {
           throw new JevProviderError(cls.kind, statusMessage(cls.kind, backend, res.status, snippet), {
             provider: backend.name, status: res.status, retryable: false, hint: hintFor(cls.kind, backend, snippet),

@@ -511,3 +511,15 @@ test("m4: a JSON error body is reduced to error.message — the user_id never le
   expect(m.message).not.toContain("user_");
 });
 
+test("m5: OpenRouter 403 -> forbidden (moderation / permission), non-fatal, not invalid_api_key", async () => {
+  const { calls, fetchImpl } = scriptedFetch(() => resp(403, { error: { message: "Input flagged by moderation", code: 403 } }));
+  const e = await errOf(postSystemOne({}, BACKENDS.openrouter, "k", { fetchImpl }));
+  expect(e.kind).toBe("forbidden");
+  expect(e.retryable).toBe(false);
+  expect(e.hint).toMatch(/moderation/i);
+  expect(e.hint).not.toContain("jgrep init");
+  expect(calls.length).toBe(1);
+  const { isFatalError } = await import("./errors");
+  expect(isFatalError(e)).toBe(false); // one flagged chunk must not trip the breaker for the rest
+});
+
