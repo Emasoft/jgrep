@@ -76,6 +76,11 @@ isolation), and WI-12 (benchmarks); markdown chunking ships here too.
 - markdown-aware chunking: .md/.mdx files split at headings with section-trail
   context; fenced code blocks never split — sub-section extraction via
   -C/--json start-end.
+- Fork publish lock: `package.json` is `"private": true` (npm refuses to
+  publish the fork; GitHub, curl and bun installs are unaffected), and
+  `src/workflows.test.ts` fails CI if any job in `.github/workflows/publish.yml`
+  does not start its `if:` with `github.repository == 'kyu1204/jgrep'` — the
+  `jevgrep` package belongs to upstream.
 
 ### Fixed
 
