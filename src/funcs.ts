@@ -12,12 +12,8 @@
 // is skipped the same way.
 
 export interface Signature { line: number; text: string }
-/** Structural subset of jgrep's Chunk: one SIGNATURE CHUNK per file (no context). */
+/** Structural subset of jgrep's Chunk: a SIGNATURE CHUNK (no context). */
 export interface SignatureChunk { file: string; start: number; end: number; text: string }
-
-/** Cap per file: beyond 200 signatures the list is cut and a truncation marker is
- *  appended (the signature chunk is a hint for the judge, not a transcript). */
-export const MAX_SIGNATURES = 200;
 
 /** Extension → language id for signature extraction; anything else is unsupported. */
 const EXT_LANG: Record<string, string> = {
@@ -103,48 +99,53 @@ SIG_PATTERNS.javascript = SIG_PATTERNS.typescript; // same signature shapes
 SIG_PATTERNS.csharp = SIG_PATTERNS.java;
 
 /**
- * Signatures of one file: 1-based line numbers, trimmed text, at most
- * MAX_SIGNATURES entries. When the file has more, the returned array carries the
- * first MAX_SIGNATURES plus a final `{ line: 0, text: "[truncated: N more
- * signatures]" }` marker (line 0 = not a real location). An unknown language id
- * extracts nothing.
+ * Signatures of one file: 1-based line numbers, trimmed text — ALL of them. USER
+ * 2026-10-02: content is never truncated to fit the context; the old 200-signature cap
+ * (with a "[truncated: N more]" marker) dropped the rest of a big file from pass 1, so a
+ * match there could never shortlist it. signatureChunks splits instead. An unknown
+ * language id extracts nothing.
  */
 export function extractSignatures(text: string, lang: string): Signature[] {
   const patterns = SIG_PATTERNS[lang];
   if (!patterns) return []; // unsupported language: nothing extractable
   const out: Signature[] = [];
-  let overflow = 0;
   const lines = text.split("\n");
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!patterns.some((re) => re.test(line))) continue;
     if ((lang === "c" || lang === "cpp") && /;\s*$/.test(line)) continue; // prototype, not a definition
-    if (out.length >= MAX_SIGNATURES) { overflow++; continue; } // keep counting for the marker
     out.push({ line: i + 1, text: line.trim() });
   }
-  if (overflow > 0) out.push({ line: 0, text: `[truncated: ${overflow} more signatures]` });
   return out;
 }
 
-/** --funcs pass-1 chunk cap, the same per-chunk budget the chunker's callers assume. */
-export const SIGNATURE_CHUNK_MAX_CHARS = 8000;
+/** Per-chunk byte budget for signature chunks: jgrep's MAX_CHUNK_BYTES (not imported —
+ *  jgrep.ts imports this module). */
+export const SIGNATURE_CHUNK_MAX_BYTES = 8000;
 
 /**
- * Pack ALL of a file's signatures into ONE chunk: the signature lines with 1-based
- * "L12: " prefixes (a truncation marker has line 0 and renders bare). `start`/`end`
- * span the first/last signature line shown — the range to open in an editor.
- * Returns null when the file yields no signatures (the caller skips it in --funcs
- * mode); bodies over SIGNATURE_CHUNK_MAX_CHARS are cut at a line boundary with a note.
+ * The --funcs pass-1 chunks of a file: its signature lines with 1-based "L12: " prefixes,
+ * grouped into chunks of at most SIGNATURE_CHUNK_MAX_BYTES (a small file is ONE chunk).
+ * Each chunk's `start`/`end` span its own first/last signature line. Pass 1 shortlists a
+ * file when ANY of its chunks matches — the per-file verdict is the best chunk's (USER:
+ * "consider the highest scored chunk"), never a truncated view. Empty when the file
+ * yields no signatures (the caller skips it in --funcs mode).
  */
-export function signatureChunk(file: string, text: string, lang: string): SignatureChunk | null {
-  const sigs = extractSignatures(text, lang);
-  if (sigs.length === 0) return null;
-  let body = sigs.map((s) => (s.line > 0 ? `L${s.line}: ${s.text}` : s.text)).join("\n");
-  if (body.length > SIGNATURE_CHUNK_MAX_CHARS) {
-    let cut = body.lastIndexOf("\n", SIGNATURE_CHUNK_MAX_CHARS);
-    if (cut <= 0) cut = SIGNATURE_CHUNK_MAX_CHARS; // one absurdly long signature line
-    body = body.slice(0, cut) + `\n[note: signature chunk truncated at ${SIGNATURE_CHUNK_MAX_CHARS} chars]`;
+export function signatureChunks(file: string, text: string, lang: string): SignatureChunk[] {
+  const enc = new TextEncoder();
+  const out: SignatureChunk[] = [];
+  let cur: Signature[] = [];
+  let bytes = 0;
+  const flush = () => {
+    if (!cur.length) return;
+    out.push({ file, start: cur[0].line, end: cur[cur.length - 1].line, text: cur.map((s) => `L${s.line}: ${s.text}`).join("\n") });
+    cur = []; bytes = 0;
+  };
+  for (const s of extractSignatures(text, lang)) {
+    const n = enc.encode(`L${s.line}: ${s.text}`).length + 1;
+    if (cur.length && bytes + n > SIGNATURE_CHUNK_MAX_BYTES) flush();
+    cur.push(s); bytes += n; // a single over-budget line goes alone; jgrep() cuts it further
   }
-  const ls = [...body.matchAll(/^L(\d+):/gm)].map((m) => Number(m[1]));
-  return { file, start: ls.length ? Math.min(...ls) : 1, end: ls.length ? Math.max(...ls) : 1, text: body };
+  flush();
+  return out;
 }

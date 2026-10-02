@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { BACKENDS, DEFAULT_PRICE_PER_MTOK, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
 import { runPool, type PoolResult } from "./pool";
 import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
-import { detectLanguage, signatureChunk } from "./funcs";
+import { detectLanguage, signatureChunks } from "./funcs";
 
 // DI seam for fetch (moved to providers.ts; re-exported so existing imports keep working)
 export type { Fetch };
@@ -328,6 +328,92 @@ export function chunkPaths(paths: string[], opts: ListOptions = {}): Chunk[] {
     if (text !== null) chunks.push(...(isMarkdownPath(file) ? chunkMarkdown(file, text) : chunk(file, text)));
   }
   return chunks;
+}
+
+// ---- context fit --------------------------------------------------------------
+// USER 2026-10-02: "content must never be truncated to fit Jev's context; oversized content
+// is split into context-sized chunks instead." Jev's context is 32k tokens. Budgets are in
+// UTF-8 BYTES of the JSON request at a conservative ~1.5 bytes/token (hex, base64 and CJK
+// tokenize far denser than code's ~3.3), so a request at the cap stays under ~27k tokens.
+export const MAX_REQUEST_BYTES = 40_000;
+/** One chunk's text at most this many bytes: any chunk always fits a request with its question. */
+export const MAX_CHUNK_BYTES = 8_000;
+/** Lines repeated at each cut, so a match spanning the cut is still seen whole by one piece. */
+export const SPLIT_OVERLAP_LINES = 3;
+const SPLIT_OVERLAP_CHARS = 200; // the same idea when a single line has to be cut
+const UTF8 = new TextEncoder();
+export const byteLen = (s: string): number => UTF8.encode(s).length;
+
+/** One over-budget line cut into pieces of at most maxBytes (whole code points), each piece
+ *  starting SPLIT_OVERLAP_CHARS before the previous one ended. Nothing is dropped. */
+export function splitLongLine(line: string, maxBytes: number): string[] {
+  const cps = Array.from(line);
+  const out: string[] = [];
+  for (let i = 0; i < cps.length;) {
+    let j = i, b = 0;
+    while (j < cps.length && b + byteLen(cps[j]) <= maxBytes) b += byteLen(cps[j++]);
+    if (j === i) j = i + 1; // a single code point over the budget (maxBytes < 4): never loop
+    out.push(cps.slice(i, j).join(""));
+    if (j >= cps.length) break;
+    i = Math.max(i + 1, j - SPLIT_OVERLAP_CHARS);
+  }
+  return out;
+}
+
+/** [from, to) line windows of at most maxBytes each (a line's own newline counted), cut at
+ *  line boundaries with SPLIT_OVERLAP_LINES lines of overlap. A single line over the budget
+ *  gets a window of its own (the caller cuts it with splitLongLine). */
+export function lineWindows(lines: string[], maxBytes: number): [number, number][] {
+  const out: [number, number][] = [];
+  for (let i = 0; i < lines.length;) {
+    let j = i, b = 0;
+    while (j < lines.length && b + byteLen(lines[j]) + 1 <= maxBytes) b += byteLen(lines[j++]) + 1;
+    if (j === i) j = i + 1;
+    out.push([i, j]);
+    if (j >= lines.length) break;
+    i = Math.max(i + 1, j - SPLIT_OVERLAP_LINES);
+  }
+  return out;
+}
+
+/** A chunk over MAX_CHUNK_BYTES becomes several chunks at line boundaries (with overlap);
+ *  a single giant line is cut by characters. Ranges map back onto the file: code lines
+ *  advance one per line; in a diff hunk the removed (`-`) lines do not advance the
+ *  new-side line number. Small chunks come back unchanged (same object). */
+export function fitChunk(c: Chunk, kind: Kind = "code", maxBytes: number = MAX_CHUNK_BYTES): Chunk[] {
+  if (byteLen(c.text) <= maxBytes) return [c];
+  const lines = c.text.split("\n");
+  const advances = (l: string) => kind !== "diff" || !l.startsWith("-");
+  const lineNo: number[] = [];
+  let n = c.start;
+  for (const l of lines) { lineNo.push(n); if (advances(l)) n++; }
+  const out: Chunk[] = [];
+  for (const [i, j] of lineWindows(lines, maxBytes)) {
+    if (j === i + 1 && byteLen(lines[i]) + 1 > maxBytes) {
+      for (const piece of splitLongLine(lines[i], maxBytes)) out.push({ ...c, start: Math.min(lineNo[i], c.end), end: Math.min(lineNo[i], c.end), text: piece });
+      continue;
+    }
+    let end = lineNo[i];
+    for (let k = i; k < j; k++) if (advances(lines[k])) end = lineNo[k];
+    // never past the chunk's own end (a diff hunk's text can carry a trailing empty line)
+    out.push({ ...c, start: Math.min(lineNo[i], c.end), end: Math.min(end, c.end), text: lines.slice(i, j).join("\n") });
+  }
+  return out;
+}
+
+/** Groups items into request batches of at most `maxCount` items whose summed byte cost
+ *  stays within `maxBytes` (an item that alone exceeds it goes alone). Order is kept. */
+export function packBatches<T>(items: T[], maxCount: number, maxBytes: number, bytesOf: (t: T) => number): T[][] {
+  const out: T[][] = [];
+  let cur: T[] = [];
+  let b = 0;
+  for (const it of items) {
+    const n = bytesOf(it);
+    if (cur.length && (cur.length >= maxCount || b + n > maxBytes)) { out.push(cur); cur = []; b = 0; }
+    cur.push(it); b += n;
+  }
+  if (cur.length) out.push(cur);
+  return out;
 }
 
 // ---- Jev --------------------------------------------------------------------
@@ -669,8 +755,11 @@ interface TagOutcome { index: number; got: { hit: Hit; tag: string; p: number }[
  *  user handed over the wrong provider's key. */
 export const KEY_WORKED_EARLIER_HINT = "the key worked earlier this run — it may have been expired or revoked";
 
-export async function jgrep(question: string, chunks: Chunk[], o: Options): Promise<Result> {
+export async function jgrep(question: string, input: Chunk[], o: Options): Promise<Result> {
   const kind = o.kind ?? "code";
+  // Context fit (USER: never truncate, split): every over-budget chunk is split here, the
+  // one place every search path (code, --diff, --funcs passes, --estimate) goes through.
+  const chunks = input.flatMap((c) => fitChunk(c, kind));
   const backend = o.backend ?? BACKENDS.typesafe; // the core never picks a provider from env — cli.ts resolves in Step 7
   const model = o.model ?? backend.model;
   const cache = o.cache ?? {};
@@ -722,8 +811,10 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
   // Defensive normalization: a 0/fractional batch would spin the loop forever (+= 0)
   // or overlap batches. parse() rejects those; library callers get clamped instead.
   const batch = Math.max(1, Math.floor(o.batch));
-  const batches: number[][] = [];
-  for (let i = 0; i < todo.length; i += batch) batches.push(todo.slice(i, i + batch));
+  // Batches hold at most `batch` chunks AND at most MAX_REQUEST_BYTES of request: a batch
+  // of 16 big chunks would otherwise overflow the context (each chunk priced as its own
+  // one-chunk request, which over-counts the shared envelope a little: conservative).
+  const batches = packBatches(todo, batch, MAX_REQUEST_BYTES, (ci) => byteLen(JSON.stringify(buildRequest(question, [chunks[ci]], kind, model, votes, envelopes))));
   // One resolution of the retry/deadline options for the whole run (the worker only reads these).
   const timeoutMs = (o.timeoutSec ?? DEFAULT_TIMEOUT_SEC) * 1000;
   const post: PostOpts = {
@@ -881,8 +972,8 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
       else pending.push({ hit: h, cacheKey: ck });
     }
     if (pending.length > 0) {
-      const vBatches: (typeof pending)[] = [];
-      for (let i = 0; i < pending.length; i += batch) vBatches.push(pending.slice(i, i + batch));
+      // Same byte-aware packing as the main pass (the verify request carries the hit's text).
+      const vBatches = packBatches(pending, batch, MAX_REQUEST_BYTES, ({ hit }) => byteLen(VERIFY_PREFIX) + byteLen(JSON.stringify(buildRequest(question, [hit], kind, model, 1, envelopes))));
       const vWorker = async (bp: typeof pending, index: number): Promise<VerifyOutcome> => {
         const req = buildRequest(question, bp.map(({ hit }) => hit), kind, model, 1, envelopes);
         for (const id of Object.keys(req.questions))
@@ -951,8 +1042,7 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
       tags.forEach((t, i) => { criteria[`t${i}`] = t; });
       // <=16 hits per request even when --batch was raised (TAG_BATCH_MAX above).
       const tagBatch = Math.max(1, Math.min(TAG_BATCH_MAX, batch));
-      const tBatches: Hit[][] = [];
-      for (let i = 0; i < hits.length; i += tagBatch) tBatches.push(hits.slice(i, i + tagBatch));
+      const tBatches = packBatches(hits, tagBatch, MAX_REQUEST_BYTES, (h) => byteLen(JSON.stringify(buildTagRequest([h], tags, kind, model))));
       const tWorker = async (bh: Hit[], index: number): Promise<TagOutcome> => {
         // --budget: a tag batch that does not fit throws budget_exhausted into tPool.errors,
         // which this pass drops by policy (hits stay untagged, the run is not errored).
@@ -1029,8 +1119,7 @@ export async function jgrepFuncs(question: string, paths: string[], o: Options):
     if (!lang) continue; // unsupported language: excluded from --funcs search (documented)
     const text = readText(file, o.maxBytes);
     if (text === null) continue; // binary (size was filtered and reported above)
-    const sc = signatureChunk(file, text, lang);
-    if (sc) sigChunks.push(sc);
+    sigChunks.push(...signatureChunks(file, text, lang)); // every signature, split to fit — never cut
   }
   // Pass 1 never tags (--tag stripped): its hits are only a shortlist — never printed
   // — so tagging them would be a wasted request. Pass 2 tags the real hits.

@@ -14,8 +14,8 @@ import * as os from "node:os";
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo
 import * as path from "node:path";
 import {
-  detectLanguage, extractSignatures, signatureChunk,
-  MAX_SIGNATURES, SIGNATURE_CHUNK_MAX_CHARS, type Signature,
+  detectLanguage, extractSignatures,
+  signatureChunks,
 } from "./funcs";
 import type { Fetch } from "./providers";
 import { estimateTokens, jgrepFuncs } from "./jgrep";
@@ -205,51 +205,42 @@ test("extractSignatures: unknown language extracts nothing; prose-only files ext
   expect(extractSignatures("just prose\nno code here\n", "typescript")).toEqual([]);
 });
 
-test("extractSignatures: capped at MAX_SIGNATURES with a [truncated: N more] marker (line 0)", () => {
+test("extractSignatures: never capped — every signature of a big file is kept (USER: never truncate)", () => {
   const py = Array.from({ length: 250 }, (_, i) => `def f${i}():`).join("\n");
   const sigs = extractSignatures(py, "python");
-  expect(sigs).toHaveLength(MAX_SIGNATURES + 1); // 200 real + 1 marker
-  expect(sigs[MAX_SIGNATURES - 1]).toEqual({ line: 200, text: "def f199():" });
-  const marker: Signature = sigs[MAX_SIGNATURES];
-  expect(marker.line).toBe(0);
-  expect(marker.text).toBe("[truncated: 50 more signatures]");
+  expect(sigs).toHaveLength(250); // before: 200 + a "[truncated: 50 more signatures]" marker
+  expect(sigs[249]).toEqual({ line: 250, text: "def f249():" });
 });
 
 // ---- signatureChunk: the pass-1 chunk ------------------------------------------
 
-test("signatureChunk: one chunk per file, L-prefixed lines, start/end span the signatures", () => {
-  const sc = signatureChunk("src/retry.go", GO_FIXTURE, "go");
-  expect(sc).not.toBeNull();
+test("signatureChunks: a small file is one chunk, L-prefixed lines, start/end span the signatures", () => {
+  const scs = signatureChunks("src/retry.go", GO_FIXTURE, "go");
+  expect(scs).toHaveLength(1);
+  const sc = scs[0];
   expect(sc!.file).toBe("src/retry.go");
   expect(sc!.start).toBe(6);
   expect(sc!.end).toBe(10);
   expect(sc!.text).toBe("L6: func Retry(op func() error, tries int) error {\nL10: func (s *Store) Get(key string) (string, bool) {");
 });
 
-test("signatureChunk: a truncation marker renders bare (no L prefix), start/end stay real lines", () => {
-  const py = Array.from({ length: 250 }, (_, i) => `def f${i}():`).join("\n");
-  const sc = signatureChunk("big.py", py, "python")!;
-  expect(sc.start).toBe(1);
-  expect(sc.end).toBe(200);
-  expect(sc.text.split("\n")).toHaveLength(MAX_SIGNATURES + 1);
-  expect(sc.text.endsWith("[truncated: 50 more signatures]")).toBe(true);
-  expect(sc.text).not.toContain("L0:");
+test("signatureChunks: a big file's signatures are split into context-sized chunks, none dropped", () => {
+  const long = Array.from({ length: 300 }, (_, i) => `export function fn${i}(${"a".repeat(90)}: string) {`).join("\n");
+  const scs = signatureChunks("wide.ts", long, "typescript");
+  expect(scs.length).toBeGreaterThan(1); // before: one chunk cut at 8000 chars with a "[note: ... truncated]" line
+  const all = scs.flatMap((c) => c.text.split("\n"));
+  expect(all).toHaveLength(300);
+  expect(all[299]).toStartWith("L300: export function fn299(");
+  for (const c of scs) {
+    expect(new TextEncoder().encode(c.text).length).toBeLessThanOrEqual(8000);
+    const ls = c.text.split("\n").map((l) => Number(/^L(\d+):/.exec(l)![1]));
+    expect(c.start).toBe(Math.min(...ls)); // each chunk spans its own signatures
+    expect(c.end).toBe(Math.max(...ls));
+  }
 });
 
-test("signatureChunk: bodies over SIGNATURE_CHUNK_MAX_CHARS are cut at a line boundary with a note", () => {
-  const long = Array.from({ length: 120 }, (_, i) => `export function fn${i}(${"a".repeat(90)}: string) {`).join("\n");
-  const sc = signatureChunk("wide.ts", long, "typescript")!;
-  expect(long.length).toBeGreaterThan(SIGNATURE_CHUNK_MAX_CHARS);
-  expect(sc.text.length).toBeLessThanOrEqual(SIGNATURE_CHUNK_MAX_CHARS + "[note: signature chunk truncated at 8000 chars]".length + 1);
-  expect(sc.text.endsWith("[note: signature chunk truncated at 8000 chars]")).toBe(true);
-  expect(sc.start).toBe(1);
-  expect(sc.end).toBeGreaterThan(1); // end reflects the LAST INCLUDED signature, not the file
-  // every shown line is intact (no mid-line cut)
-  for (const l of sc.text.split("\n")) expect(l === "" || l.startsWith("L") || l.startsWith("[note:")).toBe(true);
-});
-
-test("signatureChunk: a file with no extractable signatures gets no chunk (skipped in pass 1)", () => {
-  expect(signatureChunk("imports.ts", `import a from "a";\nimport b from "b";\n`, "typescript")).toBeNull();
+test("signatureChunks: a file with no extractable signatures gets no chunk (skipped in pass 1)", () => {
+  expect(signatureChunks("imports.ts", `import a from "a";\nimport b from "b";\n`, "typescript")).toEqual([]);
 });
 
 // ---- jgrepFuncs: the two-phase flow (fake fetch, real temp files) ----------------
@@ -507,3 +498,15 @@ test("cli --estimate --funcs: prints pass 1 and the pass-2 upper bound; --json c
     expect(json.upper_bound.requests).toBeGreaterThan(1); // pass 1 + every candidate's pass-2 requests
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }, 20_000);
+
+test("--funcs pass 1 judges a big file by its BEST signature chunk: a match past the old 8000-char cut still shortlists it", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-funcs-big-"));
+  try {
+    const filler = Array.from({ length: 300 }, (_, i) => `export function filler${i}(${"a".repeat(60)}: string) {\n  return a;\n}`).join("\n");
+    fs.writeFileSync(path.join(dir, "big.ts"), `${filler}\nexport function retryWithBackoff(op: () => void) {\n  // exponential backoff\n  return op();\n}\n`);
+    const { calls, fetchImpl } = funcsFetch();
+    const r = await jgrepFuncs("retries with backoff", [dir], opts(fetchImpl));
+    expect(r.hits.map((h) => path.basename(h.file))).toContain("big.ts"); // before: retryWithBackoff was cut from pass 1
+    expect(calls.length).toBeGreaterThan(1);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
