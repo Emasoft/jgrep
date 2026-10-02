@@ -267,6 +267,7 @@ interface Wiring {
   failFast: boolean;
   pricePerMtok: number; // $/Mtok for the cost estimate — resolved (and validated) up front
   estimate?: Estimate;  // --estimate: dry-run sink; the run counts requests instead of sending them
+  estimateUpper?: Estimate; // --estimate --funcs: pass 2 priced as if every candidate file were shortlisted
   budget?: number;      // --budget > $JEV_BUDGET > undefined (no cap); metered per batch when set
   meter?: BudgetMeter;  // the run's meter when a budget is set — created here so the summary can read its under-pricing check
 }
@@ -287,8 +288,12 @@ function warnUnderpriced(w: Wiring) {
 function reportEstimate(w: Wiring, json: boolean): boolean {
   if (!w.estimate) return false;
   const tokens = estimateTokens(w.estimate);
-  if (json) console.log(JSON.stringify({ requests: w.estimate.requests, tokens, usd: (tokens * w.pricePerMtok) / 1e6, estimate: true }));
-  else {
+  // --funcs: pass 1 is exact; the upper bound adds pass 2 over every candidate file.
+  const upper = w.estimateUpper && { requests: w.estimate.requests + w.estimateUpper.requests, chars: w.estimate.chars + w.estimateUpper.chars };
+  if (json) {
+    const priced = (e: Estimate) => { const t = estimateTokens(e); return { requests: e.requests, tokens: t, usd: (t * w.pricePerMtok) / 1e6 }; };
+    console.log(JSON.stringify({ ...priced(w.estimate), estimate: true, ...(upper ? { upper_bound: priced(upper) } : {}) }));
+  } else {
     const files = Object.entries(w.estimate.files ?? {}).sort((a, b) => (a[0] < b[0] ? -1 : 1));
     if (files.length) {
       const width = Math.max(...files.map(([f]) => f.length), "file".length);
@@ -296,7 +301,11 @@ function reportEstimate(w: Wiring, json: boolean): boolean {
       for (const [file, n] of files) console.log(`${file.padEnd(width)}  ${n}`);
       console.log(`${"total".padEnd(width)}  ${files.reduce((s, [, n]) => s + n, 0)}`);
     }
-    console.log(estimateLine(w.estimate, w.pricePerMtok));
+    if (!upper) console.log(estimateLine(w.estimate, w.pricePerMtok));
+    else {
+      console.log(estimateLine(w.estimate, w.pricePerMtok).replace(/^estimated:/, "estimated --funcs pass 1:"));
+      console.log(estimateLine(upper, w.pricePerMtok).replace(/^estimated:/, "upper bound with pass 2 (every candidate file shortlisted):"));
+    }
   }
   process.exitCode = 0;
   return true;
@@ -410,6 +419,7 @@ async function main() {
     timeoutSec: o.timeout, requestTimeoutSec: o.requestTimeout, maxRetries: o.retries,
     ratePerSec: o.rate || undefined, failFast: o.failFast, pricePerMtok,
     estimate: o.estimate ? { requests: 0, chars: 0, files: {} } : undefined,
+    estimateUpper: o.estimate && o.funcs && !o.diff && !o.tests && !o.rows ? { requests: 0, chars: 0 } : undefined,
     budget: o.budget ?? resolveBudgetEnv(process.env), // --budget (WI-7): flag > $JEV_BUDGET > unlimited
   };
   if (wiring.budget !== undefined) wiring.meter = new BudgetMeter(wiring.budget, pricePerMtok);
@@ -437,9 +447,8 @@ async function main() {
   // --funcs (WI-5) builds its own chunks inside jgrepFuncs (pass-1 signature chunks,
   // then pass-2 normal chunks of the shortlist) — the eager chunking below is skipped.
   // Applies to code search only: --diff keeps judging hunks (funcs ignored there).
-  // --estimate prices the plain search even with --funcs: pass 2 depends on pass-1
-  // answers a dry run never gets (a known overestimate, listed in the CHANGELOG).
-  const chunks = o.funcs && !o.diff && !o.estimate ? null : (o.diff ? diffChunks(gitDiff(o.diff)) : chunkPaths(o.paths.length ? o.paths : ["."], sizeOpts));
+  // --estimate with --funcs runs jgrepFuncs too: pass 1 exact, pass 2 as an upper bound.
+  const chunks = o.funcs && !o.diff ? null : (o.diff ? diffChunks(gitDiff(o.diff)) : chunkPaths(o.paths.length ? o.paths : ["."], sizeOpts));
   if (chunks !== null && !chunks.length) { console.error(o.diff ? "empty diff" : "no text files found"); process.exit(1); }
   const cache = o.cache ? loadCache() : {};
   try {

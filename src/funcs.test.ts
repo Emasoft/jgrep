@@ -468,3 +468,42 @@ test("B3 jgrepFuncs --budget: pass 2 continues the pass-1 meter instead of start
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---- --estimate with --funcs (PR #2 open item): pass 1 exact, pass 2 as an upper bound ----
+
+test("jgrepFuncs --estimate: pass 1 is counted exactly; pass 2 is priced as an upper bound over the candidate files only", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-funcs-est-"));
+  try {
+    writeTree(dir);
+    const { calls, fetchImpl } = funcsFetch();
+    const pass1 = { requests: 0, chars: 0, files: {} as Record<string, number> };
+    const upper = { requests: 0, chars: 0, files: {} as Record<string, number> };
+    await jgrepFuncs("retries", [dir], { ...opts(fetchImpl), estimate: pass1, estimateUpper: upper });
+    expect(calls).toHaveLength(0); // a dry run sends nothing
+    expect(pass1.requests).toBe(1); // two signature chunks, one batch
+    expect(Object.keys(pass1.files).map((f) => path.basename(f)).sort()).toEqual(["parse.ts", "retry.ts"]);
+    expect(upper.requests).toBeGreaterThan(0); // before: the upper bound was never computed
+    // the upper bound covers only files pass 1 could shortlist (supported languages), never notes.md / data.csv
+    expect(Object.keys(upper.files).map((f) => path.basename(f)).sort()).toEqual(["parse.ts", "retry.ts"]);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+declare const Bun: { spawnSync(cmd: string[], opts?: { env?: Record<string, string | undefined> }): { exitCode: number | null; stdout: { toString(): string }; stderr: { toString(): string } } };
+
+test("cli --estimate --funcs: prints pass 1 and the pass-2 upper bound; --json carries both", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-funcs-est-"));
+  try {
+    writeTree(dir);
+    const env = { ...process.env, JGREP_NO_MAIN: "" };
+    const text = Bun.spawnSync(["bun", "src/cli.ts", "--estimate", "--funcs", "--no-cache", "retries", dir], { env });
+    expect(text.exitCode).toBe(0);
+    const out = text.stdout.toString();
+    expect(out).toMatch(/^estimated --funcs pass 1: 1 requests, /m);
+    expect(out).toMatch(/^upper bound with pass 2 \(every candidate file shortlisted\): \d+ requests, /m);
+    expect(out).not.toContain("notes.md");
+    const json = JSON.parse(Bun.spawnSync(["bun", "src/cli.ts", "--estimate", "--funcs", "--json", "--no-cache", "retries", dir], { env }).stdout.toString());
+    expect(json.estimate).toBe(true);
+    expect(json.requests).toBe(1);
+    expect(json.upper_bound.requests).toBeGreaterThan(1); // pass 1 + every candidate's pass-2 requests
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}, 20_000);

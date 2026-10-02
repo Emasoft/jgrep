@@ -627,6 +627,7 @@ export interface Options {
   ratePerSec?: number;         // token-bucket pacing across all requests; 0/undefined = unlimited
   failFast?: boolean;          // rethrow the first fatal error instead of isolating it
   estimate?: Estimate;         // dry run: count requests/chars into this sink, never call the provider
+  estimateUpper?: Estimate;    // --estimate --funcs: pass 2 priced as if every candidate file were shortlisted
   group?: boolean;             // --group: fill result.groups[] (the intra-run signature dedup is always on)
   votes?: number;              // --votes: judge every chunk N times (1-5); the MEDIAN probability wins
   verify?: boolean;            // --verify: strict re-ask of every hit; the hit stands only at p >= threshold * 0.6
@@ -1035,6 +1036,17 @@ export async function jgrepFuncs(question: string, paths: string[], o: Options):
   // — so tagging them would be a wasted request. Pass 2 tags the real hits.
   const meter = o.meter ?? (o.budget !== undefined ? new BudgetMeter(o.budget, o.pricePerMtok ?? DEFAULT_PRICE_PER_MTOK) : undefined);
   const pass1 = await jgrep(question, sigChunks, { ...o, tag: undefined, meter });
+  // --estimate (PR #2 open item): pass 1 above is counted exactly, but pass 2 depends on
+  // pass-1 answers a dry run never gets. Price its UPPER BOUND instead — every file pass 1
+  // could shortlist (the ones with a signature chunk), never unsupported languages — into
+  // its own sink, so the CLI can report both numbers honestly.
+  if (o.estimate) {
+    if (o.estimateUpper) {
+      const candidates = [...new Set(sigChunks.map((c) => c.file))];
+      await jgrep(question, chunkPaths(candidates, { followSymlinks: o.followSymlinks, maxBytes: o.maxBytes }), { ...o, estimate: o.estimateUpper, meter });
+    }
+    return pass1;
+  }
   const shortlist = [...new Set(pass1.hits.map((h) => h.file))];
   if (shortlist.length === 0) return pass1;
   const pass2 = await jgrep(question, chunkPaths(shortlist, { followSymlinks: o.followSymlinks, maxBytes: o.maxBytes }), { ...o, meter });
