@@ -307,3 +307,46 @@ test("under Bun: JEV_GATEWAY_URL / JGREP_ENDPOINT / JEV_API values that also sit
   fs.writeFileSync(path.join(cwd, ".env.local"), `JGREP_ENDPOINT=${evil}\n`);
   expect(() => resolveProvider("gateway", { JGREP_ENDPOINT: evil, JEV_GATEWAY_API_KEY: "k" }, home, cwd)).toThrow(/\.env\.local/);
 });
+
+// ---- key-file permissions and the .env gitignore check (audit MINOR / review n6) ----
+
+test("writeKeyFile tightens a pre-existing world-readable key file (0644 -> 0600) and dir (0755 -> 0700)", () => {
+  if (process.platform === "win32") return;
+  const home = tmp();
+  const p = keyFilePath("openrouter", home);
+  fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o755 });
+  fs.chmodSync(path.dirname(p), 0o755);
+  fs.writeFileSync(p, "old", { mode: 0o644 });
+  fs.chmodSync(p, 0o644);
+  writeKeyFile(p, "new-key");
+  expect(fs.statSync(p).mode & 0o777).toBe(0o600);
+  expect(fs.statSync(path.dirname(p)).mode & 0o777).toBe(0o700);
+});
+
+test("envIsGitignored: asks git (patterns like *.env count), falls back to ./.gitignore outside a repo", async () => {
+  const { envIsGitignored } = await import("./providers");
+  const { execFileSync } = await import("node:child_process");
+  const repo = tmp();
+  execFileSync("git", ["-C", repo, "init", "-q"], { stdio: "ignore" });
+  write(path.join(repo, ".gitignore"), "*.env\n");
+  expect(envIsGitignored(repo)).toBe(true); // the old exact-line check said "not gitignored" here
+  write(path.join(repo, ".gitignore"), "node_modules\n");
+  expect(envIsGitignored(repo)).toBe(false);
+  const plain = tmp();
+  expect(envIsGitignored(plain)).toBeUndefined(); // no repo, no .gitignore: nothing declares anything
+  write(path.join(plain, ".gitignore"), ".env\n");
+  expect(envIsGitignored(plain)).toBe(true);
+});
+
+test("resolveApiKey: no false 'not gitignored' warning when git ignores .env via a pattern", async () => {
+  const home = tmp(), repo = tmp();
+  const { execFileSync } = await import("node:child_process");
+  execFileSync("git", ["-C", repo, "init", "-q"], { stdio: "ignore" });
+  write(path.join(repo, ".gitignore"), "*.env\n");
+  write(path.join(repo, ".env"), "TYPESAFE_API_KEY=k1\n");
+  const spy = spyOn(console, "error");
+  try {
+    expect(resolveApiKey(typesafe, {}, home, repo)).toBe("k1");
+    expect(spy.mock.calls.length).toBe(0);
+  } finally { spy.mockRestore(); }
+});

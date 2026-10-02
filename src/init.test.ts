@@ -214,3 +214,30 @@ test("legacySkillCopies: lists pre-0.4 claude/codex copies that exist, ignores t
   fs.mkdirSync(path.join(home, ".cursor"), { recursive: true }); // unknown agent home: not legacy
   expect(legacySkillCopies(home)).not.toContain(path.join(home, ".cursor", "skills", "jgrep", "SKILL.md"));
 });
+
+// ---- key storage hygiene (audit MINOR / review n6) ---------------------------------
+
+test("saveProjectEnvKey: appends on its own line (no glue onto a last line without newline) and chmods 0600", async () => {
+  const { saveProjectEnvKey } = await import("./init");
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-init-env-"));
+  fs.writeFileSync(path.join(cwd, ".env"), "FOO=1", { mode: 0o644 }); // no trailing newline
+  saveProjectEnvKey(cwd, "OPENROUTER_API_KEY", "sk-or-test");
+  expect(fs.readFileSync(path.join(cwd, ".env"), "utf8")).toBe("FOO=1\nOPENROUTER_API_KEY=sk-or-test\n");
+  if (process.platform !== "win32") expect(fs.statSync(path.join(cwd, ".env")).mode & 0o777).toBe(0o600);
+  const fresh = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-init-env-"));
+  saveProjectEnvKey(fresh, "TYPESAFE_API_KEY", "k");
+  expect(fs.readFileSync(path.join(fresh, ".env"), "utf8")).toBe("TYPESAFE_API_KEY=k\n");
+});
+
+test("saveLegacyEnvKey: tightens a pre-existing 0644 ~/.config/jgrep/env to 0600", async () => {
+  if (process.platform === "win32") return;
+  const { saveLegacyEnvKey } = await import("./init");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-init-home-"));
+  const file = path.join(home, ".config", "jgrep", "env");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "OTHER=1\n", { mode: 0o644 });
+  fs.chmodSync(file, 0o644);
+  saveLegacyEnvKey("TYPESAFE_API_KEY", "k", home);
+  expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+  expect(fs.readFileSync(file, "utf8")).toBe("OTHER=1\nTYPESAFE_API_KEY=k\n");
+});

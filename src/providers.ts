@@ -11,6 +11,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo
 import * as path from "node:path";
+// @ts-expect-error — no @types/node in this zero-dep Bun-only repo
+import { spawnSync } from "node:child_process";
 
 // Ambient so the file typechecks without node types; keep all process usage to this shape.
 declare const process: { env: Record<string, string | undefined>; cwd(): string; platform: string };
@@ -81,10 +83,14 @@ export function readKeyFile(p: string): string | null {
   return null;
 }
 
-/** mkdir -p (0700) + write (0600). chmod 600 is a no-op on Windows — say so. */
+/** mkdir -p (0700) + write (0600). The explicit chmods matter: `mode` on mkdir/write only
+ *  applies when the dir/file is CREATED, so a pre-existing 0644 key file (or 0755 dir)
+ *  stayed world-readable after a rewrite (audit). chmod is a no-op on Windows — say so. */
 export function writeKeyFile(p: string, key: string): void {
   fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
+  fs.chmodSync(path.dirname(p), 0o700);
   fs.writeFileSync(p, key, { mode: 0o600 });
+  fs.chmodSync(p, 0o600);
   if (process.platform === "win32") console.error("warning: chmod 600 is a no-op on Windows — protect %USERPROFILE%\\.config\\jgrep manually");
 }
 
@@ -114,11 +120,23 @@ function findKey(b: Backend, env: Env, homeDir: string, cwd: string): { key: str
 /** A .gitignore line that covers ./.env (plain entry or inside a directory). */
 const GITIGNORE_ENV_RE = /((^|\/|\.)\.env$)/;
 
-/** Key came from cwd .env: warn when a .gitignore exists but does not cover it. */
-function warnIfEnvNotGitignored(keyEnv: string, cwd: string): void {
+/** Is `<cwd>/.env` gitignored? In a git repo git itself answers (`git check-ignore`), so
+ *  patterns such as `*.env`, `/.env` or a parent directory's .gitignore count — the old
+ *  exact-line check warned falsely on those (audit NIT). Outside a repo the project's own
+ *  ./.gitignore is the declaration; with neither, undefined (nothing declares anything).
+ *  One check for both callers: the key-from-.env warning here and `jgrep init` (review n6). */
+export function envIsGitignored(cwd: string): boolean | undefined {
+  const r = spawnSync("git", ["-C", cwd, "check-ignore", "-q", ".env"], { stdio: "ignore" });
+  if (r.status === 0) return true;
+  if (r.status === 1) return false;
   let gitignore: string;
-  try { gitignore = fs.readFileSync(path.join(cwd, ".gitignore"), "utf8"); } catch { return; } // no .gitignore -> nothing declares coverage
-  if (gitignore.split(/\r?\n/).some((l) => GITIGNORE_ENV_RE.test(l.trimEnd()))) return;
+  try { gitignore = fs.readFileSync(path.join(cwd, ".gitignore"), "utf8"); } catch { return undefined; }
+  return gitignore.split(/\r?\n/).some((l: string) => GITIGNORE_ENV_RE.test(l.trimEnd()));
+}
+
+/** Key came from cwd .env: warn when git (or the .gitignore) says it is not ignored. */
+function warnIfEnvNotGitignored(keyEnv: string, cwd: string): void {
+  if (envIsGitignored(cwd) !== false) return;
   const msg = `warning: ${keyEnv} loaded from ./.env which is not gitignored — your key may leak`;
   console.error(process.env.NO_COLOR ? msg : `\x1b[33m${msg}\x1b[0m`);
 }

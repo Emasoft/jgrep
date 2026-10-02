@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 import { execFile, spawnSync } from "node:child_process";
 import * as p from "@clack/prompts";
 import {
-  BACKENDS, PROVIDER_URLS, isLoopbackHttp, keyFilePath, legacyEnvFile, resolveApiKey, verifyApiKey,
+  BACKENDS, PROVIDER_URLS, envIsGitignored, isLoopbackHttp, keyFilePath, legacyEnvFile, resolveApiKey, verifyApiKey,
   writeKeyFile, type Backend,
 } from "./providers";
 
@@ -163,12 +163,28 @@ export function legacySkillCopies(home: string): string[] {
 // Legacy global storage (~/.config/jgrep/env, `KEYENV=<key>`): the file+format the
 // pre-0.4 wizard wrote, preserved so existing installs keep working. Step 8
 // generalizes it to any provider's keyEnv; mergeLegacyEnv does the content math.
-function saveLegacyEnvKey(keyEnv: string, key: string): string {
-  const file = legacyEnvFile();
+// chmod after the write: `mode` only applies when the file is created, so a pre-existing
+// 0644 env file stayed world-readable (audit).
+export function saveLegacyEnvKey(keyEnv: string, key: string, homeDir: string = os.homedir()): string {
+  const file = legacyEnvFile(homeDir);
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.chmodSync(path.dirname(file), 0o700);
   let existing: string | null = null;
   try { existing = fs.readFileSync(file, "utf8"); } catch { /* new file */ }
   fs.writeFileSync(file, mergeLegacyEnv(existing, keyEnv, key), { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
+  return file;
+}
+
+/** "./.env in this directory" storage: append `KEYENV=<key>` on its OWN line (a file whose
+ *  last line has no newline used to get the key glued onto it — review n6) and chmod 0600,
+ *  since the file now holds a secret (audit). */
+export function saveProjectEnvKey(cwd: string, keyEnv: string, key: string): string {
+  const file = path.join(cwd, ".env");
+  let existing = "";
+  try { existing = fs.readFileSync(file, "utf8"); } catch { /* new file */ }
+  fs.appendFileSync(file, `${existing && !existing.endsWith("\n") ? "\n" : ""}${keyEnv}=${key}\n`, { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
   return file;
 }
 
@@ -253,12 +269,12 @@ export async function init() {
     }));
     if (where === "keyfile") writeKeyFile(keyFilePath(backend.name), apiKey); // 0600; Windows chmod warning inside
     else if (where === "legacy") saveLegacyEnvKey(backend.keyEnv, apiKey);
-    else if (where === "project") fs.appendFileSync(".env", `${backend.keyEnv}=${apiKey}\n`);
+    else if (where === "project") saveProjectEnvKey(".", backend.keyEnv, apiKey);
     if (where === "none") p.log.info(storageLine(backend, where));
     else p.log.success(storageLine(backend, where));
-    if (where === "project" && (!fs.existsSync(".gitignore") || !fs.readFileSync(".gitignore", "utf8").split("\n").includes(".env"))) {
-      p.log.warn(".env is not in .gitignore");
-    }
+    // Same check as the key-from-.env warning (git check-ignore, then ./.gitignore): anything
+    // short of "git ignores it" is a key that can be committed.
+    if (where === "project" && envIsGitignored(".") !== true) p.log.warn(".env is not gitignored — add it to .gitignore before you commit");
   }
 
   // 4. agent skills (opt-in): the vercel `skills` installer auto-detects every
