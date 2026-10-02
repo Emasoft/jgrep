@@ -371,7 +371,7 @@ export function resolveBudgetEnv(env: Record<string, string | undefined>): numbe
 }
 
 async function main() {
-  if (process.argv[2] === "init") { const { init } = await import("./init"); return init(); }
+  if (process.argv[2] === "init") { const { init } = await import("./init"); return init(process.argv.slice(3)); }
   const o = parse(process.argv.slice(2));
   // Provider resolution before anything else: unknown --api, or gateway without
   // JEV_GATEWAY_URL, throws JevProviderError straight to the catch (exit 2).

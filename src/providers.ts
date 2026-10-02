@@ -154,7 +154,7 @@ function missingKeyError(b: Backend, env: Env, homeDir: string, cwd: string): Je
     .filter((o) => o.name !== b.name && parseEnvKeyFile(legacy, o.keyEnv)).map((o) => o.keyEnv);
   if (foreign.length) msg += `\n${legacyEnvFile(homeDir)} holds ${foreign.join(", ")} — that key belongs to another provider and is not reused here.`;
   const alts = PROVIDER_ORDER.filter((n) => n !== b.name)
-    .filter((n) => n !== "gateway" || !!gatewayUrlOf(env))
+    .filter((n) => n !== "gateway" || !!gatewayUrlOf(env, homeDir))
     .filter((n) => findKey(BACKENDS[n], env, homeDir, cwd)); // quiet check, no recursion into error building
   if (alts.length) msg += `\nA key is available for ${alts.join(", ")} — run with \`--api ${alts[0]}\` instead.`;
   return new JevProviderError("invalid_api_key", msg, {
@@ -175,11 +175,21 @@ export function resolveApiKey(backend: Backend, env: Env = process.env, homeDir:
 }
 
 // ---- provider resolution (§1.4 precedence) ------------------------------------
-/** Gateway endpoint: JEV_GATEWAY_URL, or upstream's JGREP_ENDPOINT name for the same thing.
- *  Read from the PROCESS env only, never from a project's ./.env: a cloned repo must not be
- *  able to redirect requests (and the Authorization header with them) to its own server. */
-function gatewayUrlOf(env: Env): string | undefined {
-  return env.JEV_GATEWAY_URL?.trim() || env.JGREP_ENDPOINT?.trim() || undefined;
+/** A setting `jgrep init` saved in the user's own ~/.config/jgrep/env (JEV_API,
+ *  JEV_GATEWAY_URL — review m1: init used to save only the key, so the provider picked in
+ *  the wizard was lost on the next plain run, and a gateway could not run at all). This is
+ *  the user's config file, never a project's ./.env. */
+function savedSetting(name: string, homeDir: string): string | undefined {
+  const text = readTextOrNull(legacyEnvFile(homeDir));
+  return (text == null ? null : parseEnvKeyFile(text, name)) ?? undefined;
+}
+
+/** Gateway endpoint: JEV_GATEWAY_URL, or upstream's JGREP_ENDPOINT name for the same thing,
+ *  else the URL `jgrep init` saved. Read from the PROCESS env (and the user's config) only,
+ *  never from a project's ./.env: a cloned repo must not be able to redirect requests (and
+ *  the Authorization header with them) to its own server. */
+function gatewayUrlOf(env: Env, homeDir: string = os.homedir()): string | undefined {
+  return env.JEV_GATEWAY_URL?.trim() || env.JGREP_ENDPOINT?.trim() || savedSetting("JEV_GATEWAY_URL", homeDir);
 }
 
 /** Plain http:// to localhost / 127.0.0.1 / [::1] — a local server, not a cleartext hop. */
@@ -190,15 +200,15 @@ export function isLoopbackHttp(url: string): boolean {
   } catch { return false; }
 }
 
-function withGatewayUrl(b: Backend, env: Env): Backend {
+function withGatewayUrl(b: Backend, env: Env, homeDir: string): Backend {
   if (b.name !== "gateway") return { ...b };
-  const url = gatewayUrlOf(env);
+  const url = gatewayUrlOf(env, homeDir);
   if (!url) {
     throw new JevProviderError(
       "bad_request",
       "gateway provider needs JEV_GATEWAY_URL (or JGREP_ENDPOINT): the env var must point at the full System One endpoint " +
         "(e.g. https://gw.example.com/v1/systemone)",
-      { provider: "gateway", retryable: false, hint: "export JEV_GATEWAY_URL=<full System One endpoint>, or use --api typesafe" },
+      { provider: "gateway", retryable: false, hint: "export JEV_GATEWAY_URL=<full System One endpoint> (or save it with `jgrep init`), or use --api typesafe" },
     );
   }
   // The gateway gets the Authorization header: never over cleartext to a remote host (upstream #19).
@@ -238,28 +248,29 @@ function refuseBunDotenv(names: string[], env: Env, cwd: string): void {
 
 const isProvider = (v: string): v is Backend["name"] => v === "typesafe" || v === "openrouter" || v === "gateway";
 
-/** `--api` flag > `JEV_API` env > first backend with a key (typesafe first). When
+/** `--api` flag > `JEV_API` env > the provider `jgrep init` saved > first backend with a
+ *  key (typesafe first). When
  *  nothing is configured, returns the typesafe default — the missing-key error is
  *  resolveApiKey's job so its message can enumerate every option. */
 export function resolveProvider(name: string | undefined, env: Env = process.env, homeDir: string = os.homedir(), cwd: string = process.cwd()): Backend {
   refuseBunDotenv(name?.trim() ? ["JEV_GATEWAY_URL", "JGREP_ENDPOINT"] : ["JEV_API", "JEV_GATEWAY_URL", "JGREP_ENDPOINT"], env, cwd);
-  for (const requested of [name?.trim(), env.JEV_API?.trim()]) {
+  for (const requested of [name?.trim(), env.JEV_API?.trim(), savedSetting("JEV_API", homeDir)]) {
     if (!requested) continue;
     if (!isProvider(requested)) {
       throw new JevProviderError("bad_request", `unknown provider "${requested}" (valid: ${PROVIDER_ORDER.join(", ")})`, {
         provider: requested, retryable: false, hint: `use one of: ${PROVIDER_ORDER.join(", ")}`,
       });
     }
-    return withGatewayUrl(BACKENDS[requested], env);
+    return withGatewayUrl(BACKENDS[requested], env, homeDir);
   }
   for (const n of PROVIDER_ORDER) {
     if (n === "gateway") {
-      const url = gatewayUrlOf(env);
+      const url = gatewayUrlOf(env, homeDir);
       if (!url) continue; // gateway only counts when its URL is set
-      if (isLoopbackHttp(url) || findKey(BACKENDS[n], env, homeDir, cwd)) return withGatewayUrl(BACKENDS[n], env); // keyless local server
+      if (isLoopbackHttp(url) || findKey(BACKENDS[n], env, homeDir, cwd)) return withGatewayUrl(BACKENDS[n], env, homeDir); // keyless local server
       continue;
     }
-    if (findKey(BACKENDS[n], env, homeDir, cwd)) return withGatewayUrl(BACKENDS[n], env);
+    if (findKey(BACKENDS[n], env, homeDir, cwd)) return withGatewayUrl(BACKENDS[n], env, homeDir);
   }
   return { ...BACKENDS.typesafe };
 }
@@ -646,36 +657,53 @@ export async function postSystemOne(
   }
 }
 
-/** Cheap backend-parameterized key check used by `jgrep init`: same ping
- *  payload as the old jgrep.ts version, 15s timeout, NO retries, never throws —
- *  transport failures come back as { ok: false, status: 0 }. */
+/** OpenRouter's key-info endpoint: free (never billed), 200 for a valid key, 401 otherwise. */
+export const OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key";
+
+/** Outcome of the `jgrep init` key check (review m2): a valid key on an empty account
+ *  ("no_credits") is still a key worth saving, and a check that could not reach the
+ *  provider ("unverified") says nothing about the key — only "rejected" means a bad key. */
+export interface KeyCheck { status: "ok" | "no_credits" | "rejected" | "unverified"; http: number; model?: string; detail?: string }
+
+/** Key check for `jgrep init`. OpenRouter: GET /api/v1/key (free). TypeSafe/gateway: the
+ *  same one-question ping as before (no free endpoint). No retries; never throws.
+ *  `timeoutMs` follows the caller's --request-timeout (review n4), default 15 s. */
 export async function verifyApiKey(
   backend: Backend,
   apiKey: string,
-  fetchImpl?: Fetch,
-): Promise<{ ok: boolean; status: number; model?: string }> {
-  const f = fetchImpl ?? fetch;
+  opts: { fetchImpl?: Fetch; timeoutMs?: number } = {},
+): Promise<KeyCheck> {
+  const f = opts.fetchImpl ?? fetch;
+  const signal = AbortSignal.timeout(abortDelayMs(opts.timeoutMs ?? VERIFY_TIMEOUT_MS)); // integer, like every abort delay
+  const free = backend.name === "openrouter";
+  let res: Response;
   try {
-    const res = await f(backend.url, {
-      method: "POST",
-      headers: headersFor(apiKey, backend.url),
-      body: JSON.stringify({
-        model: backend.model,
-        state: "ping",
-        questions: { ok: { type: "noul", instructions: "Is the state the word ping?" } },
-      }),
-      redirect: "error", // same rule as postSystemOne: the key never follows a redirect
-      signal: AbortSignal.timeout(abortDelayMs(VERIFY_TIMEOUT_MS)), // literal int — floored for uniformity
-    });
-    let model: string | undefined;
-    if (res.ok) {
-      try {
-        const parsed = (await res.json()) as { model?: unknown };
-        if (parsed !== null && typeof parsed === "object" && typeof parsed.model === "string") model = parsed.model;
-      } catch { /* 200 with a non-JSON body: the probe still succeeded */ }
-    }
-    return { ok: res.ok, status: res.status, model };
-  } catch {
-    return { ok: false, status: 0 };
+    res = await f(free ? OPENROUTER_KEY_URL : backend.url, free
+      ? { method: "GET", headers: headersFor(apiKey, OPENROUTER_KEY_URL), signal, redirect: "error" }
+      : {
+          method: "POST",
+          headers: headersFor(apiKey, backend.url),
+          body: JSON.stringify({
+            model: backend.model,
+            state: "ping",
+            questions: { ok: { type: "noul", instructions: "Is the state the word ping?" } },
+          }),
+          signal,
+          redirect: "error", // same rule as postSystemOne: the key never follows a redirect
+        });
+  } catch (e) {
+    return { status: "unverified", http: 0, detail: detailOf(e) };
   }
+  if (res.ok) {
+    let model: string | undefined;
+    try {
+      const parsed = (await res.json()) as { model?: unknown };
+      if (parsed !== null && typeof parsed === "object" && typeof parsed.model === "string") model = parsed.model;
+    } catch { /* 200 with a non-JSON body: the key check still succeeded */ }
+    return { status: "ok", http: res.status, model };
+  }
+  const detail = errorTextOf(await res.text().catch(() => "")).slice(0, SNIPPET_MAX);
+  if (res.status === 402) return { status: "no_credits", http: 402, detail };
+  if (res.status === 429 || res.status >= 500) return { status: "unverified", http: res.status, detail };
+  return { status: "rejected", http: res.status, detail };
 }

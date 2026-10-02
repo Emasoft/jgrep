@@ -113,13 +113,13 @@ test.skipIf(skip)("live invalid key: typed invalid_api_key 401, not retryable (f
   console.log("e2e: invalid key rejected before billing — tokens=0");
 }, 30_000);
 
-test.skipIf(skip)("live key probe: verifyApiKey reports ok + model", async () => {
+test.skipIf(skip)("live key probe: verifyApiKey reports ok (+ model on the ping providers)", async () => {
   console.log(`e2e: key probe via ${backend.name}`);
   const probe = await verifyApiKey(backend, apiKey);
-  expect(probe.ok).toBe(true);
-  expect(typeof probe.model).toBe("string");
-  expect((probe.model ?? "").length).toBeGreaterThan(0);
-  console.log(`e2e: probe status=${probe.status} model=${probe.model}`);
+  expect(probe.status).toBe("ok");
+  // OpenRouter is checked with the free GET /api/v1/key (no model involved); the others ping
+  if (backend.name !== "openrouter") expect((probe.model ?? "").length).toBeGreaterThan(0);
+  console.log(`e2e: probe status=${probe.status} http=${probe.http} model=${probe.model ?? "-"}`);
 }, 30_000);
 
 test.skipIf(skip)("live skill extraction: 'extract the help section from the skill body' finds the CLI help", async () => {

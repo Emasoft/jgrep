@@ -176,6 +176,29 @@ export function saveLegacyEnvKey(keyEnv: string, key: string, homeDir: string = 
   return file;
 }
 
+/** Review m1: remember the provider picked in the wizard (and a gateway's URL) in
+ *  ~/.config/jgrep/env, which resolveProvider reads after --api and $JEV_API — before,
+ *  only the key was saved, so the next plain run auto-detected another provider (or, for
+ *  a gateway, failed for lack of JEV_GATEWAY_URL) and the "Ready (... via X)" outro lied. */
+export function saveProviderChoice(backend: Backend, homeDir: string = os.homedir()): string {
+  const file = saveLegacyEnvKey("JEV_API", backend.name, homeDir);
+  if (backend.name === "gateway") saveLegacyEnvKey("JEV_GATEWAY_URL", backend.url, homeDir);
+  return file;
+}
+
+/** `jgrep init [--request-timeout <s>]` (review n4: the key check now honours the same
+ *  per-attempt timeout flag as a search; default 15 s). */
+export function parseInitArgs(argv: string[]): { requestTimeoutSec: number } {
+  const o = { requestTimeoutSec: 15 };
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--request-timeout") {
+      o.requestTimeoutSec = Number(argv[++i]);
+      if (!Number.isFinite(o.requestTimeoutSec) || o.requestTimeoutSec <= 0) throw new Error("request-timeout must be a positive number");
+    } else throw new Error(`unknown option ${argv[i]} for jgrep init (it takes only --request-timeout <s>)`);
+  }
+  return o;
+}
+
 /** "./.env in this directory" storage: append `KEYENV=<key>` on its OWN line (a file whose
  *  last line has no newline used to get the key glued onto it — review n6) and chmod 0600,
  *  since the file now holds a secret (audit). */
@@ -200,7 +223,8 @@ function openUrl(url: string) {
   execFile(cmd, args, () => { /* best effort; the URL is printed anyway */ });
 }
 
-export async function init() {
+export async function init(argv: string[] = []) {
+  const { requestTimeoutSec } = parseInitArgs(argv);
   p.intro("jgrep init");
 
   // 1. provider (new first step — any of the three backends can be provisioned)
@@ -243,16 +267,22 @@ export async function init() {
     })).trim();
     const s = p.spinner();
     s.start(verifyHost(backend));
-    try {
-      const r = await verifyApiKey(backend, typed);
-      if (r.ok) { s.stop(`Key accepted (${r.model ?? "jev"})`); apiKey = typed; model = r.model; }
-      else {
-        s.error(`Rejected with HTTP ${r.status}`);
-        const hint = rejectionHint(r.status);
-        if (hint) p.log.warn(hint);
-      }
-    } catch (e) {
-      s.error(`Could not reach the API: ${(e as Error).message}`);
+    // verifyApiKey never throws (review m2: the old catch here was dead code). Only
+    // "rejected" means a bad key; an empty account or an unreachable provider is not.
+    const r = await verifyApiKey(backend, typed, { timeoutMs: requestTimeoutSec * 1000 });
+    if (r.status === "ok") { s.stop(`Key accepted (${r.model ?? backend.name})`); apiKey = typed; model = r.model; }
+    else if (r.status === "no_credits") {
+      s.stop("Key accepted — but the account has no credits (HTTP 402)");
+      p.log.warn(`top up at ${PROVIDER_URLS[backend.name].billing || "your gateway's billing"} before searching`);
+      apiKey = typed;
+    } else if (r.status === "rejected") {
+      s.error(`Rejected with HTTP ${r.http}${r.detail ? `: ${r.detail}` : ""}`);
+      const hint = rejectionHint(r.http);
+      if (hint) p.log.warn(hint);
+    } else {
+      s.error(`Could not verify the key (${r.http ? `HTTP ${r.http}` : r.detail ?? "network error"})`);
+      const keep = guard<boolean>(await p.confirm({ message: "Save it anyway, unverified?", initialValue: true }));
+      if (keep) apiKey = typed;
     }
     if (!apiKey) {
       const again = guard<boolean>(await p.confirm({ message: "Try another key?", initialValue: true }));
@@ -276,6 +306,10 @@ export async function init() {
     // short of "git ignores it" is a key that can be committed.
     if (where === "project" && envIsGitignored(".") !== true) p.log.warn(".env is not gitignored — add it to .gitignore before you commit");
   }
+
+  // 3b. the provider choice (and a gateway's URL) — not secret, saved whatever the key storage
+  const saved = saveProviderChoice(backend);
+  p.log.info(`Saved JEV_API=${backend.name}${backend.name === "gateway" ? " and JEV_GATEWAY_URL" : ""} to ${saved} (--api and $JEV_API override it)`);
 
   // 4. agent skills (opt-in): the vercel `skills` installer auto-detects every
   // agent-skills harness (Claude Code, Codex, OpenCode, Cursor, +75 more) and has

@@ -241,3 +241,44 @@ test("saveLegacyEnvKey: tightens a pre-existing 0644 ~/.config/jgrep/env to 0600
   expect(fs.statSync(file).mode & 0o777).toBe(0o600);
   expect(fs.readFileSync(file, "utf8")).toBe("OTHER=1\nTYPESAFE_API_KEY=k\n");
 });
+
+// ---- review m1: init saves the chosen provider (and gateway URL) for the next run ----
+
+test("saveProviderChoice: JEV_API (+ JEV_GATEWAY_URL for gateway) land in ~/.config/jgrep/env, other lines kept", async () => {
+  const { saveProviderChoice } = await import("./init");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-init-prov-"));
+  const file = path.join(home, ".config", "jgrep", "env");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "TYPESAFE_API_KEY=ts\nJEV_API=typesafe\n");
+  saveProviderChoice({ ...BACKENDS.gateway, url: "https://gw.example.com/v1/systemone" }, home);
+  expect(fs.readFileSync(file, "utf8")).toBe("TYPESAFE_API_KEY=ts\nJEV_API=gateway\nJEV_GATEWAY_URL=https://gw.example.com/v1/systemone\n");
+  saveProviderChoice(BACKENDS.openrouter, home);
+  expect(fs.readFileSync(file, "utf8")).toBe("TYPESAFE_API_KEY=ts\nJEV_GATEWAY_URL=https://gw.example.com/v1/systemone\nJEV_API=openrouter\n");
+  if (process.platform !== "win32") expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+});
+
+test("resolveProvider: the provider saved by init beats auto-detection; $JEV_API and --api still win", async () => {
+  const { resolveProvider } = await import("./providers");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-init-prov-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-init-cwd-"));
+  const file = path.join(home, ".config", "jgrep", "env");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const env = { TYPESAFE_API_KEY: "ts", OPENROUTER_API_KEY: "or" }; // auto-detection alone picks typesafe
+  fs.writeFileSync(file, "JEV_API=openrouter\n");
+  expect(resolveProvider(undefined, env, home, cwd).name).toBe("openrouter"); // before: typesafe
+  expect(resolveProvider(undefined, { ...env, JEV_API: "typesafe" }, home, cwd).name).toBe("typesafe");
+  expect(resolveProvider("typesafe", env, home, cwd).name).toBe("typesafe");
+  fs.writeFileSync(file, "JEV_API=gateway\nJEV_GATEWAY_URL=https://gw.example.com/v1/systemone\nJEV_GATEWAY_API_KEY=gw\n");
+  const gw = resolveProvider(undefined, {}, home, cwd);
+  expect(gw.name).toBe("gateway");
+  expect(gw.url).toBe("https://gw.example.com/v1/systemone"); // before: "gateway needs JEV_GATEWAY_URL"
+  expect(resolveProvider(undefined, { JEV_GATEWAY_URL: "https://env.example.com/v1/systemone" }, home, cwd).url).toBe("https://env.example.com/v1/systemone");
+});
+
+test("parseInitArgs (review n4): --request-timeout <s> sets the key-check timeout; junk is rejected", async () => {
+  const { parseInitArgs } = await import("./init");
+  expect(parseInitArgs([])).toEqual({ requestTimeoutSec: 15 });
+  expect(parseInitArgs(["--request-timeout", "40"])).toEqual({ requestTimeoutSec: 40 });
+  expect(() => parseInitArgs(["--request-timeout", "0"])).toThrow(/positive/);
+  expect(() => parseInitArgs(["--bogus"])).toThrow(/unknown option/);
+});

@@ -287,8 +287,8 @@ test("abort-delay contract: plain no-deadline path and verifyApiKey record the l
   const ping = scriptedFetch(() => resp(200, { model: "jev-latest", answers: {} }));
   await withTimeoutRecorder(async (recorded) => {
     await postSystemOne({}, BACKENDS.openrouter, "k", { fetchImpl: ok.fetchImpl });
-    const v = await verifyApiKey(BACKENDS.openrouter, "k", ping.fetchImpl);
-    expect(v.ok).toBe(true);
+    const v = await verifyApiKey(BACKENDS.typesafe, "k", { fetchImpl: ping.fetchImpl });
+    expect(v.status).toBe("ok");
     expect(recorded).toEqual([30_000, 15_000]); // requestTimeoutMs then VERIFY_TIMEOUT_MS
   });
 });
@@ -456,35 +456,54 @@ test("postSystemOne + limiter: an expired batch deadline is thrown by the limite
 
 // ---- verifyApiKey ----
 
-test("verifyApiKey: ok path parses the model and sends the ping payload", async () => {
+test("verifyApiKey (typesafe/gateway): ok path parses the model and sends the ping payload", async () => {
   const { calls, fetchImpl } = scriptedFetch(() => resp(200, { model: "jev-latest", answers: {} }));
-  const r = await verifyApiKey(BACKENDS.openrouter, "k", fetchImpl);
-  expect(r.ok).toBe(true);
-  expect(r.status).toBe(200);
+  const r = await verifyApiKey(BACKENDS.typesafe, "k", { fetchImpl });
+  expect(r.status).toBe("ok");
+  expect(r.http).toBe(200);
   expect(r.model).toBe("jev-latest");
   expect(calls.length).toBe(1);
-  expect(calls[0].url).toBe(BACKENDS.openrouter.url);
+  expect(calls[0].url).toBe(BACKENDS.typesafe.url);
   expect(calls[0].init.method).toBe("POST");
   expect(JSON.parse(calls[0].init.body!)).toEqual({
-    model: "~typesafe/jev-latest",
+    model: "jev-latest",
     state: "ping",
     questions: { ok: { type: "noul", instructions: "Is the state the word ping?" } },
   });
-  expect(calls[0].init.headers).toMatchObject({ Authorization: "Bearer k", "Content-Type": "application/json", "X-Title": "jgrep" });
+  expect(calls[0].init.headers).toMatchObject({ Authorization: "Bearer k", "Content-Type": "application/json" });
 });
 
-test("verifyApiKey: 401 -> ok:false with the status; transport throw -> status 0", async () => {
-  const rejected = scriptedFetch(() => resp(401, "nope"));
-  const r1 = await verifyApiKey(BACKENDS.typesafe, "k", rejected.fetchImpl);
-  expect(r1.ok).toBe(false);
-  expect(r1.status).toBe(401);
-  expect(r1.model).toBeUndefined();
+test("verifyApiKey (review m2): OpenRouter is checked with the FREE GET /api/v1/key, never a billed ping", async () => {
+  const { calls, fetchImpl } = scriptedFetch(() => resp(200, { data: { label: "sk-or-v1-abc...", limit: null } }));
+  const r = await verifyApiKey(BACKENDS.openrouter, "k", { fetchImpl });
+  expect(r.status).toBe("ok");
+  expect(calls).toHaveLength(1);
+  expect(calls[0].url).toBe("https://openrouter.ai/api/v1/key");
+  expect(calls[0].init.method).toBe("GET");
+  expect(calls[0].init.body).toBeUndefined();
+  expect(calls[0].init.headers).toMatchObject({ Authorization: "Bearer k" });
+});
 
-  const boom = scriptedFetch(() => { throw new Error("socket hang-up"); });
-  const r2 = await verifyApiKey(BACKENDS.typesafe, "k", boom.fetchImpl);
-  expect(r2.ok).toBe(false);
-  expect(r2.status).toBe(0);
-  expect(r2.model).toBeUndefined();
+test("verifyApiKey (review m2): 402 is a VALID key with no credits; 401 rejected; network failure is unverified, not rejected", async () => {
+  const credits = await verifyApiKey(BACKENDS.typesafe, "k", { fetchImpl: scriptedFetch(() => resp(402, "no credits")).fetchImpl });
+  expect(credits.status).toBe("no_credits");
+  const bad = await verifyApiKey(BACKENDS.openrouter, "k", { fetchImpl: scriptedFetch(() => resp(401, { error: { message: "User not found." } })).fetchImpl });
+  expect(bad.status).toBe("rejected");
+  expect(bad.http).toBe(401);
+  const boom = await verifyApiKey(BACKENDS.typesafe, "k", { fetchImpl: scriptedFetch(() => { throw new Error("socket hang-up"); }).fetchImpl });
+  expect(boom.status).toBe("unverified");
+  expect(boom.http).toBe(0);
+  expect(boom.detail).toContain("socket hang-up");
+  const busy = await verifyApiKey(BACKENDS.openrouter, "k", { fetchImpl: scriptedFetch(() => resp(503, "down")).fetchImpl });
+  expect(busy.status).toBe("unverified"); // the provider could not answer: the key is not known to be bad
+});
+
+test("verifyApiKey (review n4): the timeout follows the caller's request timeout", async () => {
+  const ping = scriptedFetch(() => resp(200, { model: "jev-latest", answers: {} }));
+  await withTimeoutRecorder(async (recorded) => {
+    await verifyApiKey(BACKENDS.typesafe, "k", { fetchImpl: ping.fetchImpl, timeoutMs: 42_000 });
+    expect(recorded).toEqual([42_000]);
+  });
 });
 
 // ---- OpenRouter review follow-ups (live bodies captured 2026-10-02) ----------------
