@@ -8,6 +8,7 @@ import { test, expect } from "bun:test";
 import { type Fetch } from "./providers";
 import { estimateTokens, jgrep, type Chunk } from "./jgrep";
 import { scoreRows } from "./rows";
+import { selectTests } from "./tests";
 
 const PRICE = 1000; // $/Mtok: one ~300-token request ≈ $0.3, so the budget math is readable
 
@@ -125,6 +126,32 @@ test("B4 --rows --budget: packs reserve before sending; spend stays under the bu
 test("B4 --rows without a budget: no cap — every pack runs", async () => {
   const { st, fetchImpl } = billingFetch({ tokens: () => 1_000_000_000 });
   const r = await scoreRows(rowsOf(40), Q, { batch: 1, concurrency: 8, pricePerMtok: PRICE, apiKey: "k", fetchImpl, cache: {} });
+  expect(st.requests).toBe(40);
+  expect(r.errors).toEqual([]);
+});
+
+// ---- --tests honours --budget with the same reservation (audit MAJOR) ------------
+
+const DIFF = "diff --git a/src/widget.ts b/src/widget.ts\n--- a/src/widget.ts\n+++ b/src/widget.ts\n@@ -1 +1 @@\n-old\n+new\n";
+const testFiles = (n: number) => Array.from({ length: n }, (_, i) => ({ file: `spec/case${i}.test.ts`, signature: `describe("case ${i}")` }));
+
+test("--tests --budget: test packs reserve before sending; spend stays under the budget", async () => {
+  const one = billingFetch();
+  await selectTests(DIFF, testFiles(1), { threshold: 0.5, batch: 1, concurrency: 1, apiKey: "k", fetchImpl: one.fetchImpl, cache: {} });
+  expect(one.st.requests).toBe(1);
+  const budget = one.st.spent * 3.5; // room for 3 one-test packs
+  const { st, fetchImpl } = billingFetch();
+  const r = await selectTests(DIFF, testFiles(40), { threshold: 0.5, batch: 1, concurrency: 8, budget, pricePerMtok: PRICE, apiKey: "k", fetchImpl, cache: {} });
+  expect(st.spent).toBeLessThanOrEqual(budget + 1e-12);
+  expect(st.requests).toBe(3);
+  expect(r.requests).toBe(3); // the summary's request count excludes packs the budget never sent
+  expect(r.errors).toHaveLength(37);
+  expect(r.errors.every((e) => e.kind === "budget_exhausted" && e.hint === "raise --budget")).toBe(true);
+});
+
+test("--tests without a budget: no cap — every pack runs", async () => {
+  const { st, fetchImpl } = billingFetch({ tokens: () => 1_000_000_000 });
+  const r = await selectTests(DIFF, testFiles(40), { threshold: 0.5, batch: 1, concurrency: 8, pricePerMtok: PRICE, apiKey: "k", fetchImpl, cache: {} });
   expect(st.requests).toBe(40);
   expect(r.errors).toEqual([]);
 });

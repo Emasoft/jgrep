@@ -13,9 +13,9 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, KEY_WORKED_EARLIER_HINT,
-  listFiles, type Cache, type Estimate,
+  BudgetMeter, listFiles, type Cache, type Estimate,
 } from "./jgrep";
-import { BACKENDS, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
+import { BACKENDS, DEFAULT_PRICE_PER_MTOK, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
 import { runPool, type PoolResult } from "./pool";
 import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
 
@@ -161,6 +161,8 @@ export interface SelectOptions {
   ratePerSec?: number;         // token-bucket pacing across all requests; 0/undefined = unlimited
   failFast?: boolean;          // rethrow the first fatal error instead of isolating it
   estimate?: Estimate;         // dry run: count requests/chars into this sink, never call the provider
+  budget?: number;             // --budget: hard cap via reservation, same as jgrep()/scoreRows(); undefined = no cap
+  pricePerMtok?: number;       // $/Mtok for the budget reservation and token-priced spend (default DEFAULT_PRICE_PER_MTOK)
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
 
@@ -219,6 +221,10 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
   // invalid_api_key expired-vs-wrong-key hint. Tracked HERE (not PoolResult) because
   // failFast throws the pool result away.
   let hadSuccess = false;
+  // --budget (audit MAJOR): --tests used to have no meter, so --budget / $JEV_BUDGET were
+  // silently ignored here while every other mode honoured them. Same opt-in reservation
+  // meter as jgrep()/scoreRows(); no budget = no meter.
+  const meter = o.budget !== undefined ? new BudgetMeter(o.budget, o.pricePerMtok ?? DEFAULT_PRICE_PER_MTOK) : undefined;
   const worker = async (b: number[], index: number): Promise<BatchOutcome> => {
     const state = { diff: compact, tests: b.map((i, j) => ({ id: `t${j}`, file: tests[i].file, signature: tests[i].signature })) };
     const questions: Record<string, unknown> = {};
@@ -228,10 +234,11 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
     const req = { model, state, questions };
     // --estimate: count before apiKeyOf() so a dry run needs no key.
     if (o.estimate) { o.estimate.requests++; o.estimate.chars += JSON.stringify(req).length; return { index, entries: [], malformed: [] }; }
-    const res = await postSystemOne(req, backend, apiKeyOf(), {
+    const go = () => postSystemOne(req, backend, apiKeyOf(), {
       ...post,
       deadlineMs: Date.now() + timeoutMs, // per-batch deadline, retries included
     });
+    const res = await (meter ? meter.run(req, backend.name, go) : go()); // throws budget_exhausted unsent
     tokens += res.usage?.input_tokens ?? 0;
     if (res.cost !== undefined) cost = (cost ?? 0) + res.cost;
     // Finite p-values go straight into the in-memory cache object: cli.ts persists it in
@@ -298,7 +305,10 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
   const answered = all.filter((s): s is Selected => s !== undefined);
   const selected = answered.filter((s) => s.p >= o.threshold).sort((a, b) => b.p - a.p);
   const byCode = answered.filter((s) => s.reason === "direct" || s.reason === "import" || s.reason === "package").length;
-  return { selected, all: answered, tokens, ...(cost !== undefined ? { cost } : {}), requests: batches.length - (pool.aborted ? pool.unprocessed : 0), cached: tests.length - byCode - todo.length, errors };
+  // `requests` counts only packs actually sent (same rule as scoreRows): packs the breaker
+  // never dispatched and packs --budget refused before sending are not requests.
+  const budgetRefused = pool.errors.filter((e) => e.error.kind === "budget_exhausted").length;
+  return { selected, all: answered, tokens, ...(cost !== undefined ? { cost } : {}), requests: batches.length - (pool.aborted ? pool.unprocessed : 0) - budgetRefused, cached: tests.length - byCode - todo.length, errors };
 }
 
 export function loadTests(paths: string[] = ["."]): TestFile[] {

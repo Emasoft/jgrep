@@ -480,7 +480,9 @@ async function testsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
     else for (const s of rows) console.log(o.all || process.stdout.isTTY ? `${s.file}${c("90", `  p=${s.p.toFixed(2)} ${s.reason}`)}` : s.file);
     const cost = r.cost ?? (r.tokens * wiring.pricePerMtok) / 1e6;
     const byCode = r.all.filter((s) => s.reason === "direct" || s.reason === "import" || s.reason === "package").length;
-    const summary = `${r.selected.length} of ${tests.length} tests selected (${byCode} by name/import, ${r.cached} cached) · ${r.requests} requests · ${r.tokens} tokens · $${cost.toFixed(4)} · ${((Date.now() - t0) / 1000).toFixed(1)}s`;
+    const budgetStopped = r.errors.some((e) => e.kind === "budget_exhausted"); // same suffix as code mode
+    const summary = `${r.selected.length} of ${tests.length} tests selected (${byCode} by name/import, ${r.cached} cached) · ${r.requests} requests · ${r.tokens} tokens · $${cost.toFixed(4)} · ${((Date.now() - t0) / 1000).toFixed(1)}s`
+      + (budgetStopped ? ` · stopped by --budget at $${cost.toFixed(4)} (limit $${wiring.budget})` : "");
     console.error(c("90", r.errors.length ? summary + erroredSuffix(r.errors) : summary));
     printExamples(r.errors.map((e) => ({ line: `  ${e.kind}: ${e.file} ${e.message.slice(0, 120)}`, hint: e.hint })));
     // grep semantics when clean; 2 when any batch errored (partial failure) — same rule as code mode.
