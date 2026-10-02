@@ -124,6 +124,28 @@ export function chunkMarkdown(file: string, text: string, opts = { minLines: 5, 
   return out;
 }
 
+const C_ESCAPES: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+
+/** Path of a `+++ ` diff header line (without the `b/` prefix). git C-quotes a name with
+ *  special characters (`"b/q\"t.ts"`, `\303\274` octal bytes for non-ASCII unless
+ *  core.quotePath=false) and appends a TAB after a name that contains a space; taking the
+ *  raw text produced wrong file names (audit NIT). */
+export function diffHeaderPath(line: string): string {
+  let s = line.slice(4);
+  if (s.startsWith('"')) {
+    const bytes: number[] = [];
+    const enc = new TextEncoder();
+    for (let i = 1; i < s.length && s[i] !== '"'; i++) {
+      if (s[i] !== "\\") { const ch = String.fromCodePoint(s.codePointAt(i)!); bytes.push(...enc.encode(ch)); i += ch.length - 1; continue; } // whole code point (astral chars are 2 UTF-16 units)
+      const oct = /^[0-7]{3}/.exec(s.slice(i + 1));
+      if (oct) { bytes.push(parseInt(oct[0], 8)); i += 3; }
+      else { bytes.push(C_ESCAPES[s[i + 1]] ?? s.charCodeAt(i + 1)); i++; }
+    }
+    s = new TextDecoder().decode(new Uint8Array(bytes));
+  } else s = s.replace(/\t$/, "");
+  return s.replace(/^b\//, "");
+}
+
 /** Hunks of `git diff <args>` as chunks; text keeps the +/- markers. */
 export function diffChunks(diff: string): Chunk[] {
   const out: Chunk[] = [];
@@ -131,7 +153,7 @@ export function diffChunks(diff: string): Chunk[] {
   let cur: Chunk | null = null;
   const push = () => { if (cur && cur.text.trim()) out.push(cur); cur = null; };
   for (const line of diff.split("\n")) {
-    if (line.startsWith("+++ ")) { push(); file = line.slice(4).replace(/^b\//, ""); continue; }
+    if (line.startsWith("+++ ")) { push(); file = diffHeaderPath(line); continue; }
     const m = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
     if (m) {
       push();
@@ -148,7 +170,9 @@ export function diffChunks(diff: string): Chunk[] {
 }
 
 export function gitDiff(args: string[], cwd = process.cwd()): string {
-  return execFileSync("git", ["diff", "--no-color", "--unified=3", ...args], { cwd, encoding: "utf8", maxBuffer: 64 << 20 });
+  // core.quotePath=false: non-ASCII names print verbatim instead of as octal escapes
+  // (diffHeaderPath decodes both forms either way).
+  return execFileSync("git", ["-c", "core.quotePath=false", "diff", "--no-color", "--unified=3", ...args], { cwd, encoding: "utf8", maxBuffer: 64 << 20 });
 }
 
 // ---- files ------------------------------------------------------------------

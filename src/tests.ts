@@ -13,7 +13,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, KEY_WORKED_EARLIER_HINT,
-  BudgetMeter, listFiles, settledCost, type Cache, type Estimate, type ListOptions,
+  BudgetMeter, diffHeaderPath, listFiles, settledCost, type Cache, type Estimate, type ListOptions,
 } from "./jgrep";
 import { BACKENDS, DEFAULT_PRICE_PER_MTOK, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
 import { runPool, type PoolResult } from "./pool";
@@ -45,8 +45,10 @@ export function directMatches(changedFiles: string[], tests: string[]): Set<stri
   return new Set(tests.filter((t) => changedTests.has(t) || changedStems.has(stem(t))));
 }
 
+/** New-side paths of every file in the diff (deletions, `+++ /dev/null`, excluded);
+ *  diffHeaderPath decodes git's quoted / TAB-terminated header forms. */
 export function changedFilesOf(diff: string): string[] {
-  return [...diff.matchAll(/^\+\+\+ b\/(.+)$/gm)].map((m) => m[1]);
+  return diff.split("\n").filter((l) => l.startsWith("+++ b/") || l.startsWith('+++ "b/')).map(diffHeaderPath);
 }
 
 const NOISE_RE = /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lock|Cargo\.lock|go\.sum|poetry\.lock|Gemfile\.lock)$|\.(md|mdx|txt|svg|png|jpe?g|gif|ico|lock|snap)$|(^|\/)(dist|build|node_modules|vendor)\//;
@@ -57,8 +59,12 @@ export function compactDiff(diff: string, maxChars = 8000, perFile = 2000): stri
   const files: { name: string; lines: string[] }[] = [];
   let cur: { name: string; lines: string[] } | null = null;
   for (const l of diff.split("\n")) {
-    const m = /^\+\+\+ b\/(.+)$/.exec(l);
-    if (m) { cur = NOISE_RE.test(m[1]) ? null : { name: m[1], lines: [] }; if (cur) files.push(cur); continue; }
+    if (l.startsWith("+++ b/") || l.startsWith('+++ "b/')) {
+      const name = diffHeaderPath(l);
+      cur = NOISE_RE.test(name) ? null : { name, lines: [] };
+      if (cur) files.push(cur);
+      continue;
+    }
     if (cur && /^(@@ |[+-][^+-])/.test(l)) cur.lines.push(l);
   }
   const header = "changed files:\n" + files.map((f) => "  " + f.name).join("\n") + "\n\n";
