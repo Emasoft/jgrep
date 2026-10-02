@@ -27,7 +27,7 @@ declare const Bun: {
     port: number;
     stop(closeActiveConnections?: boolean): void;
   };
-  spawn(cmd: string[], opts?: { env?: Record<string, string | undefined> }): {
+  spawn(cmd: string[], opts?: { env?: Record<string, string | undefined>; stdout?: "pipe"; stderr?: "pipe" }): {
     stdout: ReadableStream<Uint8Array>;
     stderr: ReadableStream<Uint8Array>;
     exited: Promise<number>;
@@ -143,7 +143,7 @@ test("--tag: one tag request with a choice question per hit, criteria keys t0/t1
 });
 
 test("buildTagRequest: batch-local h{i} ids, kind-keyed chunk bodies, one criteria object per question", () => {
-  const req = buildTagRequest([mk("a.ts", 2, 9, "const x = 1;")], ["real bug", "idiomatic"], "diff", "m");
+  const req = buildTagRequest([{ ...mk("a.ts", 2, 9, "const x = 1;"), p: 0.9 }], ["real bug", "idiomatic"], "diff", "m");
   expect(req.model).toBe("m");
   expect(req.state.chunks).toEqual([{ id: "h0", file: "a.ts", lines: "2-9", diff: "const x = 1;" }]);
   expect(req.questions.h0).toEqual({

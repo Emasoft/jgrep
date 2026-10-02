@@ -219,7 +219,7 @@ export interface FixtureSpec {
   labels: string[];   // class labels, matrix order
   questions: Questions;
   /** predicted label, or "" when the answer is unusable (row excluded from metrics) */
-  predict: (a: Record<string, Answer> | undefined) => string;
+  predict: (a: Record<string, Answer> | null | undefined) => string; // null = an errored row (RowsResult.answers is dense)
 }
 
 export const FIXTURES: Record<"sms" | "agnews", FixtureSpec> = {

@@ -28,7 +28,7 @@ declare const Bun: {
     port: number;
     stop(closeActiveConnections?: boolean): void;
   };
-  spawn(cmd: string[], opts?: { env?: Record<string, string | undefined> }): {
+  spawn(cmd: string[], opts?: { env?: Record<string, string | undefined>; stdout?: "pipe"; stderr?: "pipe" }): {
     stdout: ReadableStream<Uint8Array>;
     stderr: ReadableStream<Uint8Array>;
     exited: Promise<number>;
@@ -204,9 +204,9 @@ test("budget_exhausted: non-retryable but never fatal — a long budget stop doe
 // ---- CLI surface: parse flags + env override ----------------------------------------
 
 test("cli parse: --estimate/--sarif/--envelopes are boolean flags; --budget takes dollars (0 legal)", () => {
-  expect(parse(["q"])).toMatchObject({ estimate: false, sarif: false, envelopes: false, budget: null });
+  expect(parse(["q"])).toMatchObject({ estimateOnly: false, sarif: false, envelopes: false, budget: null });
   expect(parse(["--estimate", "--sarif", "--envelopes", "q", "src/"])).toMatchObject({
-    estimate: true, sarif: true, envelopes: true, question: "q", paths: ["src/"],
+    estimateOnly: true, sarif: true, envelopes: true, question: "q", paths: ["src/"],
   });
   expect(parse(["--budget", "0.05", "q"])).toMatchObject({ budget: 0.05 });
   expect(parse(["--budget", "0", "q"]).budget).toBe(0); // legal: nothing is sent

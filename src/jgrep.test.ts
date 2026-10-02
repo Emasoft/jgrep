@@ -121,7 +121,7 @@ test("rows: request keys, batching cap, cache and flatten", async () => {
   const per = Math.min(16, Math.floor(MAX_QUESTIONS_PER_REQUEST / 3)); // batch cap wins: 16 rows per request
   expect(calls.every((c) => Object.keys(c.questions).length <= MAX_QUESTIONS_PER_REQUEST)).toBe(true);
   expect(r.requests).toBe(Math.ceil(40 / per));
-  expect(flatten(r.answers[1])).toEqual({ beauty: 0.9, cat: "skincare", cat_p: 0.85, fit: 1.7, fit_conf: 0.6 });
+  expect(flatten(r.answers[1]!)).toEqual({ beauty: 0.9, cat: "skincare", cat_p: 0.85, fit: 1.7, fit_conf: 0.6 });
   const r2 = await scoreRows(rows, questions, { batch: 16, concurrency: 4, apiKey: "k", fetchImpl, cache });
   expect(r2.requests).toBe(0);
   expect(r2.cached).toBe(40);
@@ -142,7 +142,7 @@ test("--estimate counts the built requests, never fetches, needs no key", async 
   expect(est.requests).toBe(2);
   expect(est.chars).toBe(JSON.stringify(buildRequest("q", chunks.slice(0, 2))).length + JSON.stringify(buildRequest("q", chunks.slice(2))).length);
   expect(estimateLine(est, 0.042)).toContain(`~${estimateTokens(est)} input tokens`);
-  expect(parse(["--estimate", "q"]).estimate).toBe(true);
+  expect(parse(["--estimate", "q"]).estimateOnly).toBe(true);
 });
 
 test("estimateTokens is within 15% of provider-billed tokens (upstream live measurement 2026-09-28)", async () => {

@@ -33,16 +33,16 @@ const { resolveProvider } = await import("./providers");
 
 test("cli parse: new flags parse with correct types and defaults", () => {
   const o = parse(["q"]);
-  expect(o).toMatchObject({ api: "", model: "", timeout: 15, requestTimeout: 30, retries: 4, rate: 0, failFast: false, estimate: false });
+  expect(o).toMatchObject({ api: "", model: "", timeout: 15, requestTimeout: 30, retries: 4, rate: 0, failFast: false, estimateOnly: false });
   expect(typeof o.timeout).toBe("number");
   expect(typeof o.retries).toBe("number");
   expect(typeof o.failFast).toBe("boolean");
-  expect(typeof o.estimate).toBe("boolean");
+  expect(typeof o.estimateOnly).toBe("boolean");
 
   const o2 = parse(["--api", "openrouter", "--model", "typesafe/jev-1.13", "--timeout", "30", "--request-timeout", "60", "--retries", "2", "--rate", "5", "--fail-fast", "--estimate", "q", "src/"]);
   expect(o2).toMatchObject({
     api: "openrouter", model: "typesafe/jev-1.13", timeout: 30, requestTimeout: 60,
-    retries: 2, rate: 5, failFast: true, estimate: true, question: "q", paths: ["src/"],
+    retries: 2, rate: 5, failFast: true, estimateOnly: true, question: "q", paths: ["src/"],
   });
 });
 
@@ -96,7 +96,7 @@ test("cli parse: old and new flags coexist (--diff positional heuristic untouche
   const o = parse(["--diff", "--json", "--fail-fast", "--api", "openrouter", "--staged", "q"]);
   expect(o).toMatchObject({ json: true, failFast: true, api: "openrouter", diff: ["--staged"], question: "q" });
   const o2 = parse(["--diff", "origin/main", "--estimate", "--rate", "10", "q", "src/"]);
-  expect(o2).toMatchObject({ diff: ["origin/main"], estimate: true, rate: 10, question: "q", paths: ["src/"] });
+  expect(o2).toMatchObject({ diff: ["origin/main"], estimateOnly: true, rate: 10, question: "q", paths: ["src/"] });
 });
 
 test("cli: JGREP_NO_MAIN import pattern still works (parse importable, main not auto-run)", () => {

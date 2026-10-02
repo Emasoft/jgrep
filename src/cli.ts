@@ -171,7 +171,10 @@ export const safeText = (s: string): string => s.replace(/[\x00-\x08\x0b-\x1f\x7
 export function parse(argv: string[]) {
   const o = {
     threshold: 0.7, batch: 16, concurrency: 16, all: false, show: false, group: false, votes: 1, verify: false, json: false, jsonErrors: false, cache: true,
-    estimate: false, sarif: false, envelopes: false, funcs: false, budget: null as number | null, followSymlinks: false, maxBytes: null as number | null,
+    // estimateOnly, not `estimate`: main() spreads `o` next to the Wiring whose `estimate` is
+    // the dry-run SINK (an Estimate object); a same-named boolean typed the merged field
+    // `boolean | Estimate`, one omitted key away from `true.requests++` (audit, NaN silently).
+    estimateOnly: false, sarif: false, envelopes: false, funcs: false, budget: null as number | null, followSymlinks: false, maxBytes: null as number | null,
     diff: null as string[] | null, rows: "", questions: "", out: "", tests: false, tag: "",
     api: "", model: "", timeout: 15, requestTimeout: 30, retries: 4, rate: 0, failFast: false,
   };
@@ -190,7 +193,7 @@ export function parse(argv: string[]) {
     else if (a === "--envelopes") o.envelopes = true;
     else if (a === "--funcs") o.funcs = true;
     else if (a === "--tag") o.tag = argv[++i] ?? ""; // comma-separated categories; validated below
-    else if (a === "--estimate") o.estimate = true;
+    else if (a === "--estimate") o.estimateOnly = true;
     else if (a === "--json") o.json = true;
     else if (a === "--json-errors") { o.jsonErrors = true; o.json = true; } // implies --json
     else if (a === "--sarif") o.sarif = true; // machine-readable SARIF 2.1.0 (its own shape, not --json's)
@@ -266,9 +269,11 @@ interface Wiring {
   ratePerSec?: number;
   failFast: boolean;
   pricePerMtok: number; // $/Mtok for the cost estimate — resolved (and validated) up front
-  estimate?: Estimate;  // --estimate: dry-run sink; the run counts requests instead of sending them
+  // estimate/budget are REQUIRED keys (value may be undefined): main() spreads `o` before the
+  // Wiring, and only a key that is always present is typed as overriding o's own field.
+  estimate: Estimate | undefined; // --estimate: dry-run sink; the run counts requests instead of sending them
   estimateUpper?: Estimate; // --estimate --funcs: pass 2 priced as if every candidate file were shortlisted
-  budget?: number;      // --budget > $JEV_BUDGET > undefined (no cap); metered per batch when set
+  budget: number | undefined; // --budget > $JEV_BUDGET > undefined (no cap); metered per batch when set
   meter?: BudgetMeter;  // the run's meter when a budget is set — created here so the summary can read its under-pricing check
 }
 
@@ -418,8 +423,8 @@ async function main() {
     model: picked.model,
     timeoutSec: o.timeout, requestTimeoutSec: o.requestTimeout, maxRetries: o.retries,
     ratePerSec: o.rate || undefined, failFast: o.failFast, pricePerMtok,
-    estimate: o.estimate ? { requests: 0, chars: 0, files: {} } : undefined,
-    estimateUpper: o.estimate && o.funcs && !o.diff && !o.tests && !o.rows ? { requests: 0, chars: 0 } : undefined,
+    estimate: o.estimateOnly ? { requests: 0, chars: 0, files: {} } : undefined,
+    estimateUpper: o.estimateOnly && o.funcs && !o.diff && !o.tests && !o.rows ? { requests: 0, chars: 0 } : undefined,
     budget: o.budget ?? resolveBudgetEnv(process.env), // --budget (WI-7): flag > $JEV_BUDGET > unlimited
   };
   if (wiring.budget !== undefined) wiring.meter = new BudgetMeter(wiring.budget, pricePerMtok);
