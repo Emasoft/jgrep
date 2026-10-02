@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo; the surface used is trivial
 import fs from "node:fs";
-import { chunkPaths, diffChunks, gitDiff, jgrep, loadCache, saveCache, type Hit, type Kind } from "./jgrep";
+import { chunkPaths, diffChunks, estimateLine, estimateTokens, gitDiff, jgrep, loadCache, saveCache, type Estimate, type Hit, type Kind } from "./jgrep";
 import { readRows, loadQuestions, scoreRows, flattenAnswers, toCsv } from "./rows";
 import { loadTests, selectTests } from "./tests";
-import { resolveApiKey, resolvePricePerMtok, resolveProvider, verifyApiKey, type Backend } from "./providers";
+import { resolvePricePerMtok, resolveProvider, type Backend } from "./providers";
 import { JevProviderError } from "./errors";
 
 // Ambient so the file typechecks without node types (same pattern as providers.ts);
@@ -19,10 +19,10 @@ declare const process: {
   stderr: { isTTY?: boolean; write(s: string): void };
 };
 
-const VERSION = "0.4.0";
+const VERSION = "0.6.0";
 // Exported so src/skill.test.ts can pin skills/jgrep/SKILL.md's embedded help
 // block to this exact text (the template already embeds the rendered VERSION).
-export const USAGE = `jgrep ${VERSION} — semantic grep powered by Jev (TypeSafe)
+export const USAGE = `jgrep ${VERSION} — semantic grep powered by Jev
 
 usage: jgrep init                       interactive setup (provider, key, agent skills)
        jgrep [options] "<description>" [path ...]
@@ -61,7 +61,8 @@ usage: jgrep init                       interactive setup (provider, key, agent 
       --retries <n>     failed attempts tolerated per batch (default 4)
       --rate <req/s>    global request pacing (token bucket); 0 = unlimited
       --fail-fast       abort on the first fatal error instead of isolating it
-      --no-probe        skip the openrouter startup probe
+      --estimate        print requests, input tokens and cost a run would need, then
+                        exit 0 without calling the API (no key needed)
       --no-cache        ignore and do not write ~/.cache/jgrep
   -v, --version         print version
 
@@ -69,7 +70,7 @@ exit status: 0 when something matched, 1 when nothing did, 2 on error or when an
 chunk errored (partial failure: hits and errors are both reported; every failed
 chunk carries a typed kind — timeout, rate_limited, insufficient_credits, ... —
 with an actionable hint on stderr).
-CI lint:    ! jgrep --diff origin/main "adds an endpoint without an auth check"
+CI lint:    jgrep --diff origin/main "adds an endpoint without an auth check"; [ $? -eq 1 ]  # not !: 2 = could not run
 
 examples:
   jgrep "catches an error and silently ignores it" src/
@@ -86,7 +87,7 @@ export function parse(argv: string[]) {
   const o = {
     threshold: 0.7, batch: 16, concurrency: 16, all: false, show: false, json: false, jsonErrors: false, cache: true,
     diff: null as string[] | null, rows: "", questions: "", out: "", tests: false,
-    api: "", model: "", timeout: 15, requestTimeout: 30, retries: 4, rate: 0, failFast: false, noProbe: false,
+    api: "", model: "", timeout: 15, requestTimeout: 30, retries: 4, rate: 0, failFast: false, estimate: false,
   };
   const rest: string[] = [];
   const positionalsAfter = (i: number) => argv.slice(i + 1).filter((x) => !x.startsWith("-")).length;
@@ -107,7 +108,7 @@ export function parse(argv: string[]) {
     else if (a === "--retries") o.retries = Number(argv[++i]);
     else if (a === "--rate") o.rate = Number(argv[++i]);
     else if (a === "--fail-fast") o.failFast = true;
-    else if (a === "--no-probe") o.noProbe = true;
+    else if (a === "--estimate") o.estimate = true;
     else if (a === "--staged") (o.diff ??= []).push("--staged");
     else if (a === "--rows") o.rows = argv[++i] ?? "";
     else if (a === "--questions") o.questions = argv[++i] ?? "";
@@ -146,14 +147,27 @@ export function parse(argv: string[]) {
 /** Resolved provider + reliability options handed to BOTH jgrep() and scoreRows(). */
 interface Wiring {
   backend: Backend;
-  apiKey?: string;  // resolved by the openrouter startup probe; otherwise lazy inside the run
-  model?: string;   // --model > $JEV_MODEL > the backend's default (applied in jgrep/scoreRows)
+  model?: string;   // --model > $JEV_MODEL > $JGREP_MODEL > the backend's default (applied in jgrep/scoreRows)
   timeoutSec: number;
   requestTimeoutSec: number;
   maxRetries: number;
   ratePerSec?: number;
   failFast: boolean;
   pricePerMtok: number; // $/Mtok for the cost estimate — resolved (and validated) up front
+  estimate?: Estimate;  // --estimate: dry-run sink; the run counts requests instead of sending them
+}
+
+/** --estimate (upstream #14): print the dry-run line (and the JSON object with --json), exit 0.
+ *  Returns false on a real run so the caller goes on to print results. */
+function reportEstimate(w: Wiring, json: boolean): boolean {
+  if (!w.estimate) return false;
+  console.error(estimateLine(w.estimate, w.pricePerMtok));
+  if (json) {
+    const tokens = estimateTokens(w.estimate);
+    console.log(JSON.stringify({ requests: w.estimate.requests, tokens, usd: (tokens * w.pricePerMtok) / 1e6, estimate: true }));
+  }
+  process.exitCode = 0;
+  return true;
 }
 
 /** ` · 4 errored (3 timeout, 1 rate_limited)` — kind counts ordered by count desc, then kind asc. */
@@ -187,24 +201,16 @@ async function main() {
   // JEV_PRICE_PER_MTOK must be fatal before the run can bill anything, not at
   // summary time when the tokens have already been spent.
   const pricePerMtok = resolvePricePerMtok();
-  // Startup probe — openrouter only (plan §1.6 deviation 3): the alpha decisions
-  // surface is the one that may move, so it gets one cheap ping before the run;
-  // --no-probe skips it. typesafe/gateway surfaces are stable and skip the probe.
-  let apiKey: string | undefined;
-  if (backend.name === "openrouter" && !o.noProbe) {
-    apiKey = resolveApiKey(backend); // resolved once here, shared with the run below
-    const probe = await verifyApiKey(backend, apiKey);
-    if (!probe.ok)
-      throw new JevProviderError("model_unavailable", `OpenRouter probe failed (HTTP ${probe.status})`, {
-        provider: "openrouter", retryable: false,
-        hint: "the alpha decisions surface may have changed — pin a version with --model (e.g. ~typesafe/jev-1.13), skip with --no-probe, or switch with --api typesafe",
-      });
-  }
+  // No startup probe (upstream design): OpenRouter is on its stable /api/v1/systemone path,
+  // and the first batch's error goes through the typed classifier (401 invalid key, 402
+  // credits, retries for transients) — a separate billed ping only misreported those.
   const wiring: Wiring = {
-    backend, apiKey,
-    model: o.model || process.env.JEV_MODEL || undefined,
+    backend,
+    // JGREP_MODEL is upstream's name for the same override (#19); JEV_MODEL wins when both are set.
+    model: o.model || process.env.JEV_MODEL || process.env.JGREP_MODEL || undefined,
     timeoutSec: o.timeout, requestTimeoutSec: o.requestTimeout, maxRetries: o.retries,
     ratePerSec: o.rate || undefined, failFast: o.failFast, pricePerMtok,
+    estimate: o.estimate ? { requests: 0, chars: 0 } : undefined,
   };
   if (o.tests) return testsMain(o, wiring);
   if (o.rows) return rowsMain(o, wiring);
@@ -221,6 +227,7 @@ async function main() {
       onProgress: (d, n) => { if (process.stderr.isTTY) process.stderr.write(`\r${d}/${n} requests`); },
     });
     if (process.stderr.isTTY) process.stderr.write("\r\x1b[K");
+    if (reportEstimate(wiring, o.json)) return;
 
     const rows: Hit[] = o.all ? [...r.all].sort((a, b) => b.p - a.p) : r.hits;
     if (o.json) {
@@ -256,8 +263,8 @@ async function main() {
 
 /** Upstream's --tests mode, wired through the fork's provider plumbing: backend,
  *  model, timeouts, pacing and the price come from the shared Wiring (resolved in
- *  main()), the API key stays lazy inside selectTests (scoreRows pattern — the
- *  openrouter probe already resolved it eagerly when one runs). */
+ *  main()), the API key stays lazy inside selectTests (scoreRows pattern). Errors are
+ *  isolated per batch like the other modes (upstream's pool-based selectTests). */
 async function testsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
   const t0 = Date.now();
   const diff = gitDiff(o.diff ?? []);
@@ -267,16 +274,27 @@ async function testsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
   if (!tests.length) { console.error("no test files found"); process.exit(1); }
   const threshold = o.threshold === 0.7 ? 0.5 : o.threshold; // recall matters more here
   const cache = o.cache ? loadCache() : {};
-  const r = await selectTests(diff, tests, { ...o, threshold, cache, ...wiring,
-    onProgress: (d, n) => { if (process.stderr.isTTY) process.stderr.write(`\r${d}/${n} requests`); } });
-  if (o.cache) saveCache(cache);
-  if (process.stderr.isTTY) process.stderr.write("\r\x1b[K");
-  const rows = o.all ? [...r.all].sort((a, b) => b.p - a.p) : r.selected;
-  if (o.json) console.log(JSON.stringify(rows, null, 2));
-  else for (const s of rows) console.log(o.all || process.stdout.isTTY ? `${s.file}${c("90", `  p=${s.p.toFixed(2)} ${s.reason}`)}` : s.file);
-  const cost = r.cost ?? (r.tokens * wiring.pricePerMtok) / 1e6;
-  console.error(c("90", `${r.selected.length} of ${tests.length} tests selected (${r.all.filter((s) => s.reason === "direct" || s.reason === "import").length} by name/import, ${r.cached} cached) · ${r.requests} requests · ${r.tokens} tokens · $${cost.toFixed(4)} · ${((Date.now() - t0) / 1000).toFixed(1)}s`));
-  process.exit(r.selected.length ? 0 : 1);
+  try {
+    const r = await selectTests(diff, tests, {
+      ...o, threshold, cache, ...wiring,
+      onProgress: (d, n) => { if (process.stderr.isTTY) process.stderr.write(`\r${d}/${n} requests`); },
+    });
+    if (process.stderr.isTTY) process.stderr.write("\r\x1b[K");
+    if (reportEstimate(wiring, o.json)) return;
+    const rows = o.all ? [...r.all].sort((a, b) => b.p - a.p) : r.selected;
+    if (o.json) console.log(JSON.stringify(rows, null, 2));
+    else for (const s of rows) console.log(o.all || process.stdout.isTTY ? `${s.file}${c("90", `  p=${s.p.toFixed(2)} ${s.reason}`)}` : s.file);
+    const cost = r.cost ?? (r.tokens * wiring.pricePerMtok) / 1e6;
+    const byCode = r.all.filter((s) => s.reason === "direct" || s.reason === "import" || s.reason === "package").length;
+    const summary = `${r.selected.length} of ${tests.length} tests selected (${byCode} by name/import, ${r.cached} cached) · ${r.requests} requests · ${r.tokens} tokens · $${cost.toFixed(4)} · ${((Date.now() - t0) / 1000).toFixed(1)}s`;
+    console.error(c("90", r.errors.length ? summary + erroredSuffix(r.errors) : summary));
+    printExamples(r.errors.map((e) => ({ line: `  ${e.kind}: ${e.file} ${e.message.slice(0, 120)}`, hint: e.hint })));
+    // grep semantics when clean; 2 when any batch errored (partial failure) — same rule as code mode.
+    process.exitCode = r.errors.length > 0 ? 2 : (r.selected.length ? 0 : 1);
+  } finally {
+    // Same rule as code mode: save on success, partial failure and a --fail-fast throw.
+    if (o.cache) saveCache(cache);
+  }
 }
 
 async function rowsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
@@ -292,6 +310,7 @@ async function rowsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
       onProgress: (d, n) => { if (process.stderr.isTTY) process.stderr.write(`\r${d}/${n} requests`); },
     });
     if (process.stderr.isTTY) process.stderr.write("\r\x1b[K");
+    if (reportEstimate(wiring, o.json)) return;
 
     const flat = flattenAnswers(r); // dense: errored rows are null, never holes
     let hits = rows.length;

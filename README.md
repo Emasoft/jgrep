@@ -2,7 +2,8 @@
 
 # jgrep
 
-**grep for what code *does*, not what it's called.**
+**grep for what code *does*, not what it's called.**<br>
+**Gate PRs on it. Run only the tests a diff can affect.**
 
 ```
 jgrep "catches an error and silently ignores it" src/
@@ -12,8 +13,15 @@ jgrep "catches an error and silently ignores it" src/
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![deps](https://img.shields.io/badge/runtime%20deps-0-brightgreen)](package.json)
 [![model](https://img.shields.io/badge/powered%20by-Jev%20%C2%B7%20TypeSafe-8a2be2)](https://docs.typesafe.ai)
+[![openrouter](https://img.shields.io/badge/also%20via-OpenRouter-6467f2)](https://openrouter.ai/typesafe)
 
 *No index. No embeddings. No LLM round-trips. A whole `src/` tree in ~2 s for about a cent.*
+
+*On five OSS repos, `--tests` picked 12% of the test files and still caught over 90% of the
+tests each commit's author changed, for $0.11 across 60 commits ([bench](bench/tests/README.md)).*
+
+<sub>Not [dzhng/jevgrep](https://github.com/dzhng/jevgrep) (`jg`), a separate code-discovery CLI.
+This project is `jgrep`, published on npm as `jevgrep`.</sub>
 
 <img src="docs/demo.gif" alt="jgrep demo: semantic search over src/ and a git diff" width="900">
 
@@ -30,7 +38,8 @@ jgrep "catches an error and silently ignores it" src/
 | "endpoint with no auth check" *in my diff* | ❌             | ❌          | ✅ $$   | ✅ **¢**   |
 | needs an index / vector DB                 | no            | yes        | no     | **no**    |
 
-jgrep runs on [Jev](https://docs.typesafe.ai), a *System One* model: it never
+jgrep runs on [Jev](https://docs.typesafe.ai), through TypeSafe or
+[OpenRouter](https://openrouter.ai/typesafe), a *System One* model: it never
 generates text, it answers typed yes/no questions with calibrated
 probabilities, in parallel, at $0.042 per million input tokens with output free.
 jgrep packs 16 code chunks and 16 questions into one request and turns the
@@ -76,6 +85,8 @@ and optionally installs the jgrep skill into your AI agents (every harness,
 via the vercel `skills` installer). Get a key at
 [console.typesafe.ai](https://console.typesafe.ai) or
 [openrouter.ai/keys](https://openrouter.ai/keys).
+`jgrep --estimate ...` shows what a run would cost before spending anything
+(no key needed).
 
 Install this fork from source:
 
@@ -105,7 +116,7 @@ find a key.
 | backend      | endpoint                                                    | default model                            | key                    |
 | ------------ | ----------------------------------------------------------- | ---------------------------------------- | ---------------------- |
 | `typesafe`   | `https://api.typesafe.ai/v1/systemone`                      | `jev-latest`                             | `TYPESAFE_API_KEY`     |
-| `openrouter` | `https://openrouter.ai/api/alpha/decisions`                 | `~typesafe/jev-latest`                   | `OPENROUTER_API_KEY`   |
+| `openrouter` | `https://openrouter.ai/api/v1/systemone`                    | `~typesafe/jev-latest`                   | `OPENROUTER_API_KEY`   |
 | `gateway`    | `$JEV_GATEWAY_URL` (full System One endpoint, e.g. LiteLLM) | `jev-latest` (override with `--model`)   | `JEV_GATEWAY_API_KEY`  |
 
 Provider precedence: `--api` > `$JEV_API` > first backend with a key (typesafe
@@ -117,16 +128,24 @@ on Windows — init warns there too).
 ```bash
 OPENROUTER_API_KEY=sk-or-... jgrep "swallows errors" src/   # key found, provider auto-selected
 jgrep --api openrouter "swallows errors" src/               # forced
-JEV_GATEWAY_URL=http://localhost:4000/systemone JEV_GATEWAY_API_KEY=... \
+JEV_GATEWAY_URL=https://gw.example.com/v1/systemone JEV_GATEWAY_API_KEY=... \
   jgrep --api gateway "swallows errors" src/                # any System One-speaking endpoint
+JEV_GATEWAY_URL=http://127.0.0.1:11434/v1/systemone \
+  jgrep --api gateway --model nimble --tests HEAD~1         # a local server (e.g. Ollama): no key needed
 ```
 
-OpenRouter's `alpha` decisions surface is the one that may move, so jgrep pings
-it once before the run (`--no-probe` skips the ping). If the probe fails, pin a
-version (`--model ~typesafe/jev-1.13`) or fall back to `--api typesafe`.
+The gateway URL must be `https://`, except a loopback `http://` server
+(`localhost`, `127.0.0.1`, `[::1]`), which also needs no key. It is read from the
+environment only, never from a project's `./.env`, so a cloned repo cannot
+redirect your key to its own server. `JGREP_ENDPOINT` and `JGREP_MODEL` (the
+upstream project's names) are accepted as aliases of `JEV_GATEWAY_URL` and
+`JEV_MODEL`; unlike upstream, `JGREP_ENDPOINT` selects the gateway backend and
+its own key — it never re-routes a TypeSafe or OpenRouter key.
 
-Note: the OpenRouter alpha decisions surface expects `choice` criteria as a
-record keyed by label (not an array) — jgrep sends the record form.
+Requests to openrouter.ai carry OpenRouter's app-attribution headers
+(`HTTP-Referer`, `X-OpenRouter-Title` and its older alias `X-Title`, both `jgrep`,
+`X-OpenRouter-Categories: cli-agent`); no other endpoint gets them. Answers are
+cached per model id, so switching models never reuses another model's answers.
 
 Cost is the provider's reported number when it sends one (OpenRouter), else
 `tokens × $JEV_PRICE_PER_MTOK` (default `$0.042` per million input tokens,
@@ -151,13 +170,36 @@ jgrep --diff origin/main "adds an HTTP endpoint that has no auth check"
 jgrep --diff origin/main "changes billing logic without touching a test"
 ```
 
-Exit status is grep's (`0` matched, `1` nothing, `2` error or partial failure),
-so CI negates it:
+Exit status is grep's: `0` matched, `1` nothing matched, `2` jgrep could not run
+or a chunk errored (bad key, API down, malformed response, partial failure). In
+CI keep the three apart: a plain `!` would turn an outage or an expired secret
+into a passing check.
 
 ```yaml
 - run: npm i -g jevgrep
-- run: '! jgrep --diff origin/${{ github.base_ref }} "adds an HTTP endpoint that has no auth check"'
-  env: { TYPESAFE_API_KEY: "${{ secrets.TYPESAFE_API_KEY }}" }
+- name: no unauthenticated endpoints
+  env: { TYPESAFE_API_KEY: "${{ secrets.TYPESAFE_API_KEY }}" }   # or OPENROUTER_API_KEY
+  run: |
+    set +e
+    jgrep --diff "origin/${{ github.base_ref }}" "adds an HTTP endpoint that has no auth check"
+    case $? in
+      0) echo "::error::jgrep found a match"; exit 1 ;;
+      1) ;;                                          # clean
+      *) echo "::error::jgrep failed to run";  exit 1 ;;
+    esac
+```
+
+#### GitHub Action
+
+The same gate as a one-liner, maintained upstream (it installs the npm `jevgrep`
+package, not this fork). For test selection use `mode: tests` instead
+(see [jgrep-action](https://github.com/kyu1204/jgrep-action)).
+
+```yaml
+- uses: actions/checkout@v5
+  with: { fetch-depth: 0 }
+- uses: kyu1204/jgrep-action@v1
+  with: { mode: diff, rule: "adds an HTTP endpoint that has no auth check", api-key: "${{ secrets.TYPESAFE_API_KEY }}" }
 ```
 
 ### Run only the tests a change can affect
@@ -168,7 +210,8 @@ jgrep --tests --staged -a                         # every test file with its pro
 ```
 
 Three layers, cheapest first: tests named after a changed file (`foo.ts` → `foo.test.ts`)
-and tests that import a changed module are selected in code; the rest are asked of Jev
+and tests that import a changed module (or the package root, when the package entry file
+(`src/index.*`, `index.*` or `__init__.py`) changed) are selected in code; the rest are asked of Jev
 with the compacted diff (source files only, changed lines only) and each test file's
 imports and test names, one Noul per file. Default threshold is 0.5 here because a
 missed test costs more than an extra one. Run the full suite afterwards; this is for the
@@ -183,6 +226,11 @@ Measured on a 142-file TypeScript suite, 3 commits touching 12 source files (202
 
 Selection itself: 7 requests, 56k tokens, $0.0024, 1.0 s. The suite above is fast, so
 runner startup dominates; the ratio matters more on suites that take minutes.
+
+On five OSS repos (hono, zod, fastify, flask, requests; 60 commits that changed both source
+and tests), `--tests` selected 12% of test files and caught 93% of the tests each commit's
+author had touched, versus 45% from name, import and package-root matching alone; $0.11 total
+(upstream's measurement). Method and per-commit rows: [bench/tests](bench/tests/README.md).
 
 ### Score a table (CSV / JSONL), not just code
 
@@ -204,7 +252,9 @@ jgrep --rows creators.csv --questions beauty.json --out scored.csv
 }
 ```
 
-Question objects are passed to the API verbatim, so anything Jev accepts works.
+Question objects are passed to the API verbatim, so anything Jev accepts works
+(a `choice` question's `criteria` must be a record keyed by label, as above; an
+array is rejected with HTTP 400).
 Output columns: `beauty` (probability), `category` + `category_p`, `fit` + `fit_conf`.
 Eight creators and five questions is one request, 3k tokens, well under a cent;
 see [`examples/`](examples/). This is the "AI map-reduce" shape: scrape N
@@ -226,6 +276,13 @@ jgrep --json-errors "spawns a child process" src/ | jq '.hits[].file'  # opt-in 
 Codex, OpenCode, Cursor, +75 more) via the vercel `skills` installer, falling
 back to the standard `~/.agents/skills/jgrep` folder. Manually:
 `npx skills add <pkg-root>/skills -g` (from a repo checkout: `npx skills add ./skills -g`).
+
+Or install the skill as a Claude Code plugin (the `jgrep` command must be installed too):
+
+```
+/plugin marketplace add Emasoft/jgrep
+/plugin install jgrep@jgrep
+```
 
 The skill also has the agent run a few `--diff --staged` rules on its own
 change before committing: a second model checking the first one's work, for
@@ -287,7 +344,7 @@ are separate from typesafe's `jev-latest`: those queries re-bill once on the
 first run after upgrading, default typesafe queries keep their old keys. And a
 failed batch is retried as a whole: keeping per-answer results from a failed
 batch depends on the provider returning per-question answers alongside errors,
-which is still to be verified on the OpenRouter alpha surface.
+which is still to be verified on OpenRouter.
 
 ## All options
 
@@ -329,7 +386,8 @@ jgrep [options] --tests [ref] [--staged] [path ...]
       --retries <n>     failed attempts tolerated per batch (default 4)
       --rate <req/s>    global request pacing (token bucket); 0 = unlimited
       --fail-fast       abort on the first fatal error instead of isolating it
-      --no-probe        skip the openrouter startup probe
+      --estimate        print requests, input tokens and cost a run would need, then
+                        exit 0 without calling the API (no key needed)
       --no-cache        ignore and do not write ~/.cache/jgrep
   -v, --version         print version
 ```
@@ -399,7 +457,7 @@ bun run build     # dist/jgrep.js, plain node, deps bundled
 
 `src/e2e.live.test.ts` exercises the real OpenRouter path: 4 live calls — a
 behavioral code query, a rows classification, the invalid-key error taxonomy,
-and the key probe — costing about **$0.005** per full run.
+and the `jgrep init` key check — costing about **$0.005** per full run.
 
 ```bash
 JGREP_E2E_LIVE=1 bun test src/e2e.live.test.ts   # needs OPENROUTER_API_KEY

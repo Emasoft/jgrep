@@ -88,7 +88,7 @@ test("timeout-then-success: one retry with jittered backoff, headers on every at
   expect(sleeps[0]).toBeGreaterThanOrEqual(0); // full jitter for attempt 0 — floored, so 0 is possible
   expect(sleeps[0]).toBeLessThanOrEqual(1000); // loose upper bound (exact cap is 500)
   for (const c of calls) {
-    expect(c.init.headers).toMatchObject({ "X-Title": "jevgrep", Authorization: "Bearer k", "Content-Type": "application/json" });
+    expect(c.init.headers).toMatchObject({ "X-Title": "jgrep", Authorization: "Bearer k", "Content-Type": "application/json" });
   }
 });
 
@@ -295,13 +295,16 @@ test("abort-delay contract: plain no-deadline path and verifyApiKey record the l
 
 // ---- postSystemOne: request shape, cost extraction ----
 
-test("headers and URL: three headers on every request, URL from the backend", async () => {
+test("headers and URL: auth + OpenRouter attribution headers, URL from the backend", async () => {
   const { calls, fetchImpl } = scriptedFetch(() => resp(200, GOOD));
   await postSystemOne({ model: "m" }, BACKENDS.openrouter, "sekrit", { fetchImpl });
   expect(calls.length).toBe(1);
   expect(calls[0].url).toBe(BACKENDS.openrouter.url);
   expect(calls[0].init.method).toBe("POST");
-  expect(calls[0].init.headers).toEqual({ Authorization: "Bearer sekrit", "Content-Type": "application/json", "X-Title": "jevgrep" });
+  expect(calls[0].init.headers).toEqual({
+    Authorization: "Bearer sekrit", "Content-Type": "application/json",
+    "HTTP-Referer": "https://github.com/Emasoft/jgrep", "X-OpenRouter-Title": "jgrep", "X-Title": "jgrep", "X-OpenRouter-Categories": "cli-agent",
+  });
 });
 
 test("cost extraction: cost beats usage.cost beats cost_usd; model passthrough", async () => {
@@ -446,7 +449,7 @@ test("verifyApiKey: ok path parses the model and sends the ping payload", async 
     state: "ping",
     questions: { ok: { type: "noul", instructions: "Is the state the word ping?" } },
   });
-  expect(calls[0].init.headers).toMatchObject({ Authorization: "Bearer k", "Content-Type": "application/json", "X-Title": "jevgrep" });
+  expect(calls[0].init.headers).toMatchObject({ Authorization: "Bearer k", "Content-Type": "application/json", "X-Title": "jgrep" });
 });
 
 test("verifyApiKey: 401 -> ok:false with the status; transport throw -> status 0", async () => {

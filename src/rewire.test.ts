@@ -57,8 +57,8 @@ test("jgrep with backend: openrouter + apiKey hits the openrouter URL with its m
   });
   expect(r.hits).toHaveLength(1);
   expect(calls).toHaveLength(1);
-  expect(calls[0].url).toBe("https://openrouter.ai/api/alpha/decisions");
-  expect(calls[0].init.headers).toMatchObject({ Authorization: "Bearer k", "X-Title": "jevgrep" });
+  expect(calls[0].url).toBe("https://openrouter.ai/api/v1/systemone");
+  expect(calls[0].init.headers).toMatchObject({ Authorization: "Bearer k", "X-Title": "jgrep" });
   expect(JSON.parse(calls[0].init.body!).model).toBe("~typesafe/jev-latest"); // backend.model, not the typesafe default
 });
 

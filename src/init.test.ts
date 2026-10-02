@@ -34,11 +34,14 @@ test("gatewayBackend: accepts an http(s) URL and returns a BACKENDS.gateway copy
   expect(gatewayBackend("  https://gw.example.com/v1/systemone  ").url).toBe("https://gw.example.com/v1/systemone"); // trimmed
 });
 
-test("gatewayBackend: rejects ftp://, garbage and empty with a plain, clear Error", () => {
+test("gatewayBackend: rejects ftp://, remote http://, garbage and empty with a plain, clear Error", () => {
   const e = errOf(() => gatewayBackend("ftp://x/v1/systemone"));
   expect(e.constructor).toBe(Error); // plain Error — the wizard re-prompts on message, not on JevProviderError
-  expect(e.message).toContain("must be http(s)");
+  expect(e.message).toContain("must be https://");
   expect(e.message).toContain("ftp:");
+  // cleartext to a remote host would carry the key in the clear (upstream #19 rule); loopback is a local server
+  expect(errOf(() => gatewayBackend("http://gw.example.com/v1/systemone")).message).toContain("must be https://");
+  expect(gatewayBackend("http://localhost:11434/v1/systemone").url).toBe("http://localhost:11434/v1/systemone");
   expect(errOf(() => gatewayBackend("not a url")).message).toContain("not a valid URL");
   expect(errOf(() => gatewayBackend("")).message).toContain("not a valid URL");
   expect(errOf(() => gatewayBackend("   ")).message).toContain("not a valid URL");
@@ -47,7 +50,7 @@ test("gatewayBackend: rejects ftp://, garbage and empty with a plain, clear Erro
 test("PROVIDER_CHOICES: the three backends in registry order, labels name host/protocol", () => {
   expect(PROVIDER_CHOICES.map((o) => o.value)).toEqual(["typesafe", "openrouter", "gateway"]);
   expect(PROVIDER_CHOICES[0].label).toContain("api.typesafe.ai");
-  expect(PROVIDER_CHOICES[1].label).toContain("openrouter.ai/api/alpha/decisions");
+  expect(PROVIDER_CHOICES[1].label).toContain("openrouter.ai/api/v1/systemone");
   expect(PROVIDER_CHOICES[2].label).toContain("gateway");
 });
 
@@ -65,8 +68,8 @@ test("verifyHost: names the actual backend host, never a hardcoded one", () => {
   expect(verifyHost(gatewayBackend("https://gw.example.com/v1/systemone"))).toBe("Checking the key against gw.example.com");
 });
 
-test("rejectionHint: only 404 gets the alpha pin-version hint", () => {
-  expect(rejectionHint(404)).toBe("the alpha surface may need an explicit --model version");
+test("rejectionHint: only 404 gets the pin-version hint", () => {
+  expect(rejectionHint(404)).toBe("the provider may need an explicit --model version");
   expect(rejectionHint(401)).toBeUndefined();
   expect(rejectionHint(403)).toBeUndefined();
   expect(rejectionHint(0)).toBeUndefined(); // transport failure, not a rejection status
@@ -158,6 +161,42 @@ test("installToAgentsDir: overwrites an older copy with the new content", () => 
   fs.writeFileSync(src, "new");
   installToAgentsDir(src, home);
   expect(fs.readFileSync(path.join(agentsSkillDir(home), "SKILL.md"), "utf8")).toBe("new");
+});
+
+// Ported from upstream's installSkills symlink tests (jgrep.test.ts there).
+test("installToAgentsDir: replaces a dangling or live symlink with a real dir, link target untouched", () => {
+  for (const live of [false, true]) {
+    const home = tmp(), src = path.join(tmp(), "SKILL.md");
+    fs.writeFileSync(src, "new");
+    const repo = path.join(home, "repo-skill");
+    fs.mkdirSync(repo);
+    fs.writeFileSync(path.join(repo, "SKILL.md"), "old");
+    fs.mkdirSync(path.dirname(agentsSkillDir(home)), { recursive: true });
+    fs.symlinkSync(live ? repo : path.join(home, "gone"), agentsSkillDir(home));
+    installToAgentsDir(src, home);
+    expect(fs.lstatSync(agentsSkillDir(home)).isSymbolicLink()).toBe(false);
+    expect(fs.readFileSync(path.join(agentsSkillDir(home), "SKILL.md"), "utf8")).toBe("new");
+    expect(fs.readFileSync(path.join(repo, "SKILL.md"), "utf8")).toBe("old");
+  }
+});
+
+test("installToAgentsDir: throws instead of copying through a symlink it could not remove", () => {
+  if ((process as unknown as { getuid?: () => number }).getuid?.() === 0) return; // root ignores the read-only dir
+  const home = tmp(), src = path.join(tmp(), "SKILL.md");
+  fs.writeFileSync(src, "new");
+  const repo = path.join(home, "repo-skill");
+  fs.mkdirSync(repo);
+  fs.writeFileSync(path.join(repo, "SKILL.md"), "old");
+  const skills = path.dirname(agentsSkillDir(home));
+  fs.mkdirSync(skills, { recursive: true });
+  fs.symlinkSync(repo, agentsSkillDir(home));
+  fs.chmodSync(skills, 0o555);
+  try {
+    expect(() => installToAgentsDir(src, home)).toThrow();
+  } finally {
+    fs.chmodSync(skills, 0o755);
+  }
+  expect(fs.readFileSync(path.join(repo, "SKILL.md"), "utf8")).toBe("old");
 });
 
 test("legacySkillCopies: lists pre-0.4 claude/codex copies that exist, ignores the rest", () => {

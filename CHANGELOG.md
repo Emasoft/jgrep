@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Synced from upstream (kyu1204/jgrep v0.5.0–v0.6.0, version now 0.6.0)
+
+- `--estimate`: prints requests, input tokens and cost a run would need (code, `--diff`, `--rows`, `--tests`), exits 0, sends nothing and needs no key; `--json` prints `{requests,tokens,usd,estimate:true}`. Cost uses `JEV_PRICE_PER_MTOK`.
+- `--tests`: type-test suffixes (`.tst.ts`, `.test-d.ts`, `_test.ts`), dynamic `import()` and `export … from` in signatures, and package-root selection (tests importing the package by name or `../src` are selected in code when the package entry file changes; reason `package`).
+- `--tests` now isolates failures per batch like the other modes: a failed batch becomes per-test errors (exit 2, hints on stderr) instead of rejecting the run, a partial 200 is `malformed_response` instead of a `p:NaN` entry, `--fail-fast` and the circuit breaker apply, and the cache is saved in a `finally`.
+- OpenRouter moved to the stable `https://openrouter.ai/api/v1/systemone` path; the billed startup probe and `--no-probe` are gone (the first batch's typed error already distinguishes a bad key, no credits and transient failures).
+- OpenRouter app-attribution headers (`HTTP-Referer`, `X-OpenRouter-Title`, `X-Title: jgrep`, `X-OpenRouter-Categories`) are sent to openrouter.ai only; TypeSafe and gateways no longer get `X-Title`.
+- Gateway: a loopback `http://` server (e.g. a local Ollama System One endpoint) needs no key and is auto-selected; a remote gateway must be `https://`. `JGREP_ENDPOINT` / `JGREP_MODEL` are accepted as aliases of `JEV_GATEWAY_URL` / `JEV_MODEL` (process env only, never `./.env`).
+- `~/.agents/skills/jgrep` that is a symlink (old dev installs) is replaced by a real dir instead of copying through it.
+- Claude Code plugin manifest (`/plugin marketplace add Emasoft/jgrep`), release-on-merge publish workflow (still upstream-only), `bench/tests` harness and results, README/skill CI recipe that keeps exit 2 distinct from exit 1.
+
 ### Added
 
 - install-dev.sh: remote/curl install path — `curl -fsSL https://raw.githubusercontent.com/Emasoft/jgrep/main/install-dev.sh | bash -s -- --choice 8` (new menu `[8]`, appended, never renumbered) clones or updates a script-managed fork clone at `~/.local/share/jgrep` (`JGREP_DEV_DIR` overrides the location), then runs the full local setup (deps, build, system-wide bin symlink, agent-skill refresh), autodetects and replaces previous installs with `.bak` archival exactly like option 1, and auto-installs bun when missing (node stays a runtime requirement); the interactive menu refuses through a pipe (exit 2 with the two documented one-liners), and the fork can never publish npm (`publish.yml` now runs only in the upstream `kyu1204/jgrep` repo).
@@ -34,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Multi-provider layer**: `typesafe`, `openrouter`, and `gateway` (any System One-speaking endpoint, e.g. LiteLLM) speak the same protocol. Pick with `--api`, `$JEV_API`, or let jgrep find a key (typesafe first). `--model` / `$JEV_MODEL` override the model id; `JEV_GATEWAY_URL` + `JEV_GATEWAY_API_KEY` point at a self-hosted gateway.
 - **Key chain**, per provider: env var > `~/.config/jgrep/<name>.key` (written 0600) > the legacy `~/.config/jgrep/env` > `./.env` in the project — with a warning when the `.env` key is not covered by `.gitignore`. `chmod 600` is a no-op on Windows; init warns there too.
-- **Reliability engine**: full-jitter exponential backoff (500 ms base, 30 s cap), provider `Retry-After` honored (capped at 5 min), transport-error retries (`ECONNRESET`/`ETIMEDOUT`/`ECONNREFUSED`/`EAI_AGAIN`), `--retries` (default 4 → 5 attempts), `--request-timeout` (30 s per attempt), `--timeout` (15 s per-batch deadline including retries), `--rate REQ/SEC` token-bucket pacing, `--fail-fast`, and an OpenRouter-only startup probe (`--no-probe` skips it).
+- **Reliability engine**: full-jitter exponential backoff (500 ms base, 30 s cap), provider `Retry-After` honored (capped at 5 min), transport-error retries (`ECONNRESET`/`ETIMEDOUT`/`ECONNREFUSED`/`EAI_AGAIN`), `--retries` (default 4 → 5 attempts), `--request-timeout` (30 s per attempt), `--timeout` (15 s per-batch deadline including retries), `--rate REQ/SEC` token-bucket pacing, `--fail-fast`, and an OpenRouter-only startup probe (`--no-probe` skips it; removed again in the upstream sync).
 - **Error taxonomy**: failures surface as one of 10 typed kinds — `insufficient_credits`, `invalid_api_key`, `model_unavailable`, `rate_limited`, `bad_request`, `malformed_response`, `server_unreachable`, `tls_error`, `timeout`, `circuit_breaker_open` — each with an actionable hint; `invalid_api_key` distinguishes a key that worked earlier this run (expired/revoked) from one that never worked.
 - **Partial-failure isolation**: a failed batch marks only its chunks in `errors[]` and the run continues; answers already paid for stay in the cache; exit code is 2 when any chunk errored. A circuit breaker aborts after 3 consecutive fatal failures and reports untouched chunks as `circuit_breaker_open`.
 - `--json-errors` (implies `--json`): opt-in object shape `{hits, errors}` (code) / `{answers, errors}` (rows) including per-row/per-chunk typed errors.

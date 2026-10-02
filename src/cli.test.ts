@@ -33,16 +33,16 @@ const { resolveProvider } = await import("./providers");
 
 test("cli parse: new flags parse with correct types and defaults", () => {
   const o = parse(["q"]);
-  expect(o).toMatchObject({ api: "", model: "", timeout: 15, requestTimeout: 30, retries: 4, rate: 0, failFast: false, noProbe: false });
+  expect(o).toMatchObject({ api: "", model: "", timeout: 15, requestTimeout: 30, retries: 4, rate: 0, failFast: false, estimate: false });
   expect(typeof o.timeout).toBe("number");
   expect(typeof o.retries).toBe("number");
   expect(typeof o.failFast).toBe("boolean");
-  expect(typeof o.noProbe).toBe("boolean");
+  expect(typeof o.estimate).toBe("boolean");
 
-  const o2 = parse(["--api", "openrouter", "--model", "~typesafe/jev-1.13", "--timeout", "30", "--request-timeout", "60", "--retries", "2", "--rate", "5", "--fail-fast", "--no-probe", "q", "src/"]);
+  const o2 = parse(["--api", "openrouter", "--model", "~typesafe/jev-1.13", "--timeout", "30", "--request-timeout", "60", "--retries", "2", "--rate", "5", "--fail-fast", "--estimate", "q", "src/"]);
   expect(o2).toMatchObject({
     api: "openrouter", model: "~typesafe/jev-1.13", timeout: 30, requestTimeout: 60,
-    retries: 2, rate: 5, failFast: true, noProbe: true, question: "q", paths: ["src/"],
+    retries: 2, rate: 5, failFast: true, estimate: true, question: "q", paths: ["src/"],
   });
 });
 
@@ -95,8 +95,8 @@ test("cli parse: --batch must be a positive integer — 0 would spin the batchin
 test("cli parse: old and new flags coexist (--diff positional heuristic untouched)", () => {
   const o = parse(["--diff", "--json", "--fail-fast", "--api", "openrouter", "--staged", "q"]);
   expect(o).toMatchObject({ json: true, failFast: true, api: "openrouter", diff: ["--staged"], question: "q" });
-  const o2 = parse(["--diff", "origin/main", "--no-probe", "--rate", "10", "q", "src/"]);
-  expect(o2).toMatchObject({ diff: ["origin/main"], noProbe: true, rate: 10, question: "q", paths: ["src/"] });
+  const o2 = parse(["--diff", "origin/main", "--estimate", "--rate", "10", "q", "src/"]);
+  expect(o2).toMatchObject({ diff: ["origin/main"], estimate: true, rate: 10, question: "q", paths: ["src/"] });
 });
 
 test("cli: JGREP_NO_MAIN import pattern still works (parse importable, main not auto-run)", () => {
@@ -117,7 +117,7 @@ test("cli parse: --json-errors implies --json; --json alone keeps the array shap
 
 const run = (args: string[]) =>
   Bun.spawnSync(["bun", "src/cli.ts", ...args], {
-    env: { ...process.env, JGREP_NO_MAIN: "", JEV_GATEWAY_URL: "" },
+    env: { ...process.env, JGREP_NO_MAIN: "", JEV_GATEWAY_URL: "", JGREP_ENDPOINT: "" },
   });
 
 test("cli main: --api unknown exits 2 with the typed error and the three choices", () => {

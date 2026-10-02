@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 import { execFile, spawnSync } from "node:child_process";
 import * as p from "@clack/prompts";
 import {
-  BACKENDS, PROVIDER_URLS, keyFilePath, legacyEnvFile, resolveApiKey, verifyApiKey,
+  BACKENDS, PROVIDER_URLS, isLoopbackHttp, keyFilePath, legacyEnvFile, resolveApiKey, verifyApiKey,
   writeKeyFile, type Backend,
 } from "./providers";
 
@@ -36,7 +36,7 @@ const SKILL_SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", 
 /** First wizard step: which System One-speaking provider to provision (default typesafe). */
 export const PROVIDER_CHOICES: { value: Backend["name"]; label: string }[] = [
   { value: "typesafe", label: "TypeSafe — api.typesafe.ai, the original System One provider" },
-  { value: "openrouter", label: "OpenRouter — same Jev protocol via openrouter.ai/api/alpha/decisions" },
+  { value: "openrouter", label: "OpenRouter — same Jev protocol via openrouter.ai/api/v1/systemone" },
   { value: "gateway", label: "Self-hosted gateway — any System One endpoint (e.g. LiteLLM)" },
 ];
 
@@ -48,8 +48,8 @@ export function gatewayBackend(url: string): Backend {
   try { parsed = new URL(trimmed); } catch {
     throw new Error(`not a valid URL: "${trimmed || "(empty)"}" — expected the full System One endpoint, e.g. https://gw.example.com/v1/systemone`);
   }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error(`the gateway URL must be http(s), got "${parsed.protocol}"`);
+  if (parsed.protocol !== "https:" && !isLoopbackHttp(trimmed)) {
+    throw new Error(`the gateway URL must be https:// (or http:// on localhost), got "${trimmed}"`);
   }
   return { ...BACKENDS.gateway, url: trimmed };
 }
@@ -73,10 +73,10 @@ export function verifyHost(backend: Backend): string {
   return `Checking the key against ${new URL(backend.url).host}`;
 }
 
-/** Extra hint after a rejected key: a 404 on the alpha surface usually means the
- *  floating model id needs an explicit version. */
+/** Extra hint after a rejected key: a 404 usually means the floating model id needs
+ *  an explicit version. */
 export function rejectionHint(status: number): string | undefined {
-  return status === 404 ? "the alpha surface may need an explicit --model version" : undefined;
+  return status === 404 ? "the provider may need an explicit --model version" : undefined;
 }
 
 /** Storage choices for a NEW key; the first entry is the select's default. */
@@ -141,6 +141,10 @@ export function agentsSkillDir(home: string): string {
  *  copy the old per-harness installSkills did, into the one standard location. */
 export function installToAgentsDir(skillSrc: string, home: string): void {
   const dir = agentsSkillDir(home);
+  // A symlink here (dev installs pointed it at a repo checkout) is dangling, or would make the
+  // copy overwrite the repo's own SKILL.md — replace it with a real dir (upstream installSkills fix).
+  // unlinkSync throws when it cannot remove the link, so the copy never goes through it.
+  if (fs.lstatSync(dir, { throwIfNoEntry: false })?.isSymbolicLink()) fs.unlinkSync(dir);
   fs.mkdirSync(dir, { recursive: true });
   fs.copyFileSync(skillSrc, path.join(dir, "SKILL.md"));
 }

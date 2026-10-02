@@ -240,6 +240,21 @@ export const DEFAULT_TIMEOUT_SEC = 15;         // per-batch deadline INCLUDING r
 export const DEFAULT_REQUEST_TIMEOUT_SEC = 30; // per attempt
 export const DEFAULT_MAX_RETRIES = 4;          // => 5 total attempts
 
+/** --estimate dry-run sink (upstream #14): each request that WOULD be sent adds 1 request
+ *  and its JSON body length; nothing is sent and no key is resolved. */
+export interface Estimate { requests: number; chars: number }
+// Upstream's fit to 4 live requests (1/3/10/30 chunks, 673-38538 body chars, 2026-09-28): the
+// provider bills input_tokens = ~236 + 0.30 * body chars, i.e. a fixed per-request overhead
+// plus ~3.3 chars/token, not chars/4. Re-measure if the model changes.
+export const EST_TOKENS_PER_REQUEST = 240;
+export const EST_TOKENS_PER_CHAR = 0.3;
+export const estimateTokens = (e: Estimate): number => Math.ceil(e.requests * EST_TOKENS_PER_REQUEST + e.chars * EST_TOKENS_PER_CHAR);
+/** One stderr line; cost at the resolved $/Mtok (JEV_PRICE_PER_MTOK or the default). */
+export const estimateLine = (e: Estimate, pricePerMtok: number): string => {
+  const tokens = estimateTokens(e);
+  return `estimate: ${e.requests} requests · ~${tokens} input tokens · ~$${(tokens * pricePerMtok / 1e6).toFixed(4)} (list price, cached chunks free; nothing was sent)`;
+};
+
 export interface Options {
   threshold: number; batch: number; concurrency: number; apiKey?: string; kind?: Kind;
   backend?: Backend; model?: string;
@@ -248,6 +263,7 @@ export interface Options {
   maxRetries?: number;         // failed attempts tolerated before the final error
   ratePerSec?: number;         // token-bucket pacing across all requests; 0/undefined = unlimited
   failFast?: boolean;          // rethrow the first fatal error instead of isolating it
+  estimate?: Estimate;         // dry run: count requests/chars into this sink, never call the provider
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
 export interface ChunkError { file: string; start: number; end: number; kind: JevErrorKind; message: string; hint?: string }
@@ -301,7 +317,10 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
   // hint. Tracked HERE (not PoolResult) because failFast throws the pool result away.
   let hadSuccess = false;
   const worker = async (b: number[], index: number): Promise<BatchOutcome> => {
-    const res = await postSystemOne(buildRequest(question, b.map((i) => chunks[i]), kind, model), backend, apiKeyOf(), {
+    const req = buildRequest(question, b.map((i) => chunks[i]), kind, model);
+    // --estimate: count before apiKeyOf() so a dry run needs no key.
+    if (o.estimate) { o.estimate.requests++; o.estimate.chars += JSON.stringify(req).length; return { index, entries: [], malformed: [] }; }
+    const res = await postSystemOne(req, backend, apiKeyOf(), {
       ...post,
       deadlineMs: Date.now() + timeoutMs, // per-batch deadline, retries included (§1.6.1)
     });

@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { BACKENDS, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
 import { runPool, type PoolResult } from "./pool";
 import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
-import { DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, KEY_WORKED_EARLIER_HINT, type Cache } from "./jgrep";
+import { DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, KEY_WORKED_EARLIER_HINT, type Cache, type Estimate } from "./jgrep";
 
 export type Row = Record<string, string>;
 export type Questions = Record<string, { type: "noul" | "choice" | "score"; instructions: string; [k: string]: unknown }>;
@@ -84,6 +84,7 @@ export interface RowsOptions {
   maxRetries?: number;         // failed attempts tolerated before the final error
   ratePerSec?: number;         // token-bucket pacing across all requests; 0/undefined = unlimited
   failFast?: boolean;          // rethrow the first fatal error instead of isolating it
+  estimate?: Estimate;         // dry run: count requests/chars into this sink, never call the provider
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
 
@@ -130,7 +131,10 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
   // pool result away.
   let hadSuccess = false;
   const worker = async (b: number[], index: number): Promise<PackOutcome> => {
-    const res = await postSystemOne(buildRowsRequest(b.map((i) => rows[i]), questions, model), backend, apiKeyOf(), {
+    const req = buildRowsRequest(b.map((i) => rows[i]), questions, model);
+    // --estimate: count before apiKeyOf() so a dry run needs no key.
+    if (o.estimate) { o.estimate.requests++; o.estimate.chars += JSON.stringify(req).length; return { index, rowResults: [] }; }
+    const res = await postSystemOne(req, backend, apiKeyOf(), {
       ...post,
       deadlineMs: Date.now() + timeoutMs, // per-batch deadline, retries included (§1.6.1)
     });

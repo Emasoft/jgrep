@@ -24,7 +24,7 @@ const errOf = (fn: () => unknown): JevProviderError => {
 
 test("BACKENDS + PROVIDER_URLS registry is exact (byte-for-byte per plan §1.4)", () => {
   expect(BACKENDS.typesafe).toEqual({ name: "typesafe", url: "https://api.typesafe.ai/v1/systemone", model: "jev-latest", keyEnv: "TYPESAFE_API_KEY", keyFile: "typesafe.key" });
-  expect(BACKENDS.openrouter).toEqual({ name: "openrouter", url: "https://openrouter.ai/api/alpha/decisions", model: "~typesafe/jev-latest", keyEnv: "OPENROUTER_API_KEY", keyFile: "openrouter.key" });
+  expect(BACKENDS.openrouter).toEqual({ name: "openrouter", url: "https://openrouter.ai/api/v1/systemone", model: "~typesafe/jev-latest", keyEnv: "OPENROUTER_API_KEY", keyFile: "openrouter.key" });
   expect(BACKENDS.gateway).toEqual({ name: "gateway", url: "", model: "jev-latest", keyEnv: "JEV_GATEWAY_API_KEY", keyFile: "gateway.key" });
   expect(PROVIDER_URLS.typesafe).toEqual({ console: "https://console.typesafe.ai", billing: "https://console.typesafe.ai" });
   expect(PROVIDER_URLS.openrouter).toEqual({ console: "https://openrouter.ai", billing: "https://openrouter.ai/credits" });
@@ -198,3 +198,89 @@ test("resolvePricePerMtok: default 0.042, JEV_PRICE_PER_MTOK override, invalid -
     expect(e.message).toContain("JEV_PRICE_PER_MTOK");
   }
 });
+
+// ---- ported from upstream #17 / #19 (provider.test.ts there), adapted to the backend registry ----
+
+test("headersFor: OpenRouter hosts get attribution headers, other backends none; empty key sends no Authorization", async () => {
+  const { headersFor } = await import("./providers");
+  const h = headersFor("k", openrouter.url);
+  expect(h["HTTP-Referer"]).toBe("https://github.com/Emasoft/jgrep");
+  expect(h["X-OpenRouter-Title"]).toBe("jgrep");
+  expect(h["X-Title"]).toBe("jgrep");
+  expect(h["X-OpenRouter-Categories"]).toBe("cli-agent");
+  for (const url of [typesafe.url, "http://127.0.0.1:9999/x", "https://evil.example/openrouter.ai", ""]) {
+    expect(Object.keys(headersFor("k", url)).sort()).toEqual(["Authorization", "Content-Type"]);
+  }
+  expect(headersFor("", "http://127.0.0.1:9999/x")).toEqual({ "Content-Type": "application/json" });
+});
+
+test("resolveProvider: JGREP_ENDPOINT is an alias of JEV_GATEWAY_URL; JEV_GATEWAY_URL wins when both are set", () => {
+  const home = tmp(), cwd = tmp();
+  expect(resolveProvider("gateway", { JGREP_ENDPOINT: "https://gw.example.com/v1/systemone" }, home, cwd).url).toBe("https://gw.example.com/v1/systemone");
+  expect(resolveProvider("gateway", { JEV_GATEWAY_URL: "https://a/x", JGREP_ENDPOINT: "https://b/x" }, home, cwd).url).toBe("https://a/x");
+});
+
+test("resolveProvider: the gateway URL is never read from a project's ./.env (a cloned repo must not redirect the key)", () => {
+  const home = tmp(), cwd = tmp();
+  write(path.join(cwd, ".env"), "JGREP_ENDPOINT=https://attacker.example/x\nJEV_GATEWAY_URL=https://attacker.example/x\nJEV_GATEWAY_API_KEY=gw\n");
+  expect(resolveProvider(undefined, {}, home, cwd).name).toBe("typesafe"); // URL only from the process env
+  expect(errOf(() => resolveProvider("gateway", {}, home, cwd)).message).toContain("needs JEV_GATEWAY_URL");
+});
+
+test("resolveProvider: gateway rejects plain http:// to a remote host, allows loopback http (IPv4, IPv6, localhost)", () => {
+  const home = tmp(), cwd = tmp();
+  const e = errOf(() => resolveProvider("gateway", { JEV_GATEWAY_URL: "http://gw.example.com/v1/systemone" }, home, cwd));
+  expect(e.kind).toBe("bad_request");
+  expect(e.message).toContain("must be https://");
+  for (const u of ["http://127.0.0.1:11434/v1/systemone", "http://[::1]:11434/v1/systemone", "http://localhost:11434/v1/systemone"])
+    expect(resolveProvider("gateway", { JGREP_ENDPOINT: u }, home, cwd).url).toBe(u);
+});
+
+test("resolveProvider + resolveApiKey: a loopback gateway auto-selects and needs no key (local System One server)", () => {
+  const home = tmp(), cwd = tmp();
+  const b = resolveProvider(undefined, { JGREP_ENDPOINT: "http://127.0.0.1:11434/v1/systemone" }, home, cwd);
+  expect(b.name).toBe("gateway");
+  expect(resolveApiKey(b, {}, home, cwd)).toBe("");
+  // a remote https gateway still needs its key
+  const remote = resolveProvider("gateway", { JEV_GATEWAY_URL: "https://gw/x" }, home, cwd);
+  expect(errOf(() => resolveApiKey(remote, {}, home, cwd)).kind).toBe("invalid_api_key");
+});
+
+test("e2e: a loopback JGREP_ENDPOINT with JGREP_MODEL runs with no key at all (local System One servers)", async () => {
+  const requests: { auth: string | null; model: unknown }[] = [];
+  // @ts-expect-error — Bun global; no bun-types in this repo
+  const server = Bun.serve({
+    port: 0,
+    fetch: async (req: Request) => {
+      const body = await req.json() as { model: unknown; questions?: Record<string, unknown> };
+      requests.push({ auth: req.headers.get("authorization"), model: body.model });
+      return Response.json({ answers: Object.fromEntries(Object.keys(body.questions ?? {}).map((k) => [k, { type: "noul", noul: 0.9 }])) });
+    },
+  });
+  const dir = tmp();
+  const home = path.join(dir, "home"); // empty HOME: no key files, no ~/.cache
+  fs.mkdirSync(home, { recursive: true });
+  try {
+    fs.writeFileSync(path.join(dir, "probe.ts"), "const answer = 42;\n".repeat(6));
+    // spawn (async), not spawnSync: a sync spawn would starve the in-process stub server.
+    // @ts-expect-error — Bun global; no bun-types in this repo
+    const child = Bun.spawn(["bun", path.join((import.meta as { dir: string }).dir, "cli.ts"), "--no-cache", "some description", "probe.ts"], {
+      cwd: dir,
+      env: {
+        ...process.env, JGREP_NO_MAIN: "", HOME: home, JEV_API: "",
+        TYPESAFE_API_KEY: "", OPENROUTER_API_KEY: "", JEV_GATEWAY_API_KEY: "", JEV_GATEWAY_URL: "", JEV_MODEL: "",
+        JGREP_ENDPOINT: `http://127.0.0.1:${server.port}/v1/systemone`, JGREP_MODEL: "nimble",
+      },
+      stdout: "pipe", stderr: "pipe",
+    });
+    // @ts-expect-error — Bun global; no bun-types in this repo
+    const [code, stderr] = await Promise.all([child.exited, Bun.readableStreamToText(child.stderr)]);
+    expect(stderr).not.toMatch(/error|API key/i);
+    expect(code).toBe(0);
+    expect(requests.length).toBeGreaterThan(0);
+    for (const r of requests) { expect(r.model).toBe("nimble"); expect(r.auth).toBeNull(); }
+  } finally {
+    server.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}, 10_000);

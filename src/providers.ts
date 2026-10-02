@@ -28,7 +28,8 @@ export interface Backend {
 
 export const BACKENDS: Record<Backend["name"], Backend> = {
   typesafe:   { name: "typesafe",   url: "https://api.typesafe.ai/v1/systemone",      model: "jev-latest",           keyEnv: "TYPESAFE_API_KEY",    keyFile: "typesafe.key" },
-  openrouter: { name: "openrouter", url: "https://openrouter.ai/api/alpha/decisions", model: "~typesafe/jev-latest", keyEnv: "OPENROUTER_API_KEY",  keyFile: "openrouter.key" },
+  // Stable v1 path (upstream #10): same body/response as the alpha decisions surface, which may move.
+  openrouter: { name: "openrouter", url: "https://openrouter.ai/api/v1/systemone",    model: "~typesafe/jev-latest", keyEnv: "OPENROUTER_API_KEY",  keyFile: "openrouter.key" },
   gateway:    { name: "gateway",    url: "",                                          model: "jev-latest",           keyEnv: "JEV_GATEWAY_API_KEY", keyFile: "gateway.key" },
 };
 
@@ -135,7 +136,7 @@ function missingKeyError(b: Backend, env: Env, homeDir: string, cwd: string): Je
     .filter((o) => o.name !== b.name && parseEnvKeyFile(legacy, o.keyEnv)).map((o) => o.keyEnv);
   if (foreign.length) msg += `\n${legacyEnvFile(homeDir)} holds ${foreign.join(", ")} — that key belongs to another provider and is not reused here.`;
   const alts = PROVIDER_ORDER.filter((n) => n !== b.name)
-    .filter((n) => n !== "gateway" || !!env.JEV_GATEWAY_URL?.trim())
+    .filter((n) => n !== "gateway" || !!gatewayUrlOf(env))
     .filter((n) => findKey(BACKENDS[n], env, homeDir, cwd)); // quiet check, no recursion into error building
   if (alts.length) msg += `\nA key is available for ${alts.join(", ")} — run with \`--api ${alts[0]}\` instead.`;
   return new JevProviderError("invalid_api_key", msg, {
@@ -150,20 +151,45 @@ export function resolveApiKey(backend: Backend, env: Env = process.env, homeDir:
   const found = findKey(backend, env, homeDir, cwd);
   if (found?.origin === "dotenv") warnIfEnvNotGitignored(backend.keyEnv, cwd);
   if (found) return found.key;
+  // A local System One server (e.g. Ollama on loopback http) needs no key (upstream #19).
+  if (backend.name === "gateway" && isLoopbackHttp(backend.url)) return "";
   throw missingKeyError(backend, env, homeDir, cwd);
 }
 
 // ---- provider resolution (§1.4 precedence) ------------------------------------
+/** Gateway endpoint: JEV_GATEWAY_URL, or upstream's JGREP_ENDPOINT name for the same thing.
+ *  Read from the PROCESS env only, never from a project's ./.env: a cloned repo must not be
+ *  able to redirect requests (and the Authorization header with them) to its own server. */
+function gatewayUrlOf(env: Env): string | undefined {
+  return env.JEV_GATEWAY_URL?.trim() || env.JGREP_ENDPOINT?.trim() || undefined;
+}
+
+/** Plain http:// to localhost / 127.0.0.1 / [::1] — a local server, not a cleartext hop. */
+export function isLoopbackHttp(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return u.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname);
+  } catch { return false; }
+}
+
 function withGatewayUrl(b: Backend, env: Env): Backend {
   if (b.name !== "gateway") return { ...b };
-  const url = env.JEV_GATEWAY_URL?.trim();
+  const url = gatewayUrlOf(env);
   if (!url) {
     throw new JevProviderError(
       "bad_request",
-      "gateway provider needs JEV_GATEWAY_URL: the env var must point at the full System One endpoint " +
+      "gateway provider needs JEV_GATEWAY_URL (or JGREP_ENDPOINT): the env var must point at the full System One endpoint " +
         "(e.g. https://gw.example.com/v1/systemone)",
       { provider: "gateway", retryable: false, hint: "export JEV_GATEWAY_URL=<full System One endpoint>, or use --api typesafe" },
     );
+  }
+  // The gateway gets the Authorization header: never over cleartext to a remote host (upstream #19).
+  let https = false;
+  try { https = new URL(url).protocol === "https:"; } catch { /* not a URL: rejected below */ }
+  if (!https && !isLoopbackHttp(url)) {
+    throw new JevProviderError("bad_request", `gateway URL must be https:// (or a loopback http:// server): ${url}`, {
+      provider: "gateway", retryable: false, hint: "use an https:// endpoint, or http://localhost for a local server",
+    });
   }
   return { ...b, url };
 }
@@ -184,7 +210,12 @@ export function resolveProvider(name: string | undefined, env: Env = process.env
     return withGatewayUrl(BACKENDS[requested], env);
   }
   for (const n of PROVIDER_ORDER) {
-    if (n === "gateway" && !env.JEV_GATEWAY_URL?.trim()) continue; // gateway only counts when its URL is set
+    if (n === "gateway") {
+      const url = gatewayUrlOf(env);
+      if (!url) continue; // gateway only counts when its URL is set
+      if (isLoopbackHttp(url) || findKey(BACKENDS[n], env, homeDir, cwd)) return withGatewayUrl(BACKENDS[n], env); // keyless local server
+      continue;
+    }
     if (findKey(BACKENDS[n], env, homeDir, cwd)) return withGatewayUrl(BACKENDS[n], env);
   }
   return { ...BACKENDS.typesafe };
@@ -334,11 +365,22 @@ export interface PostOpts {
   limiter?: RateLimiter;                 // shared token bucket
 }
 
-const headersFor = (apiKey: string): Record<string, string> => ({
-  Authorization: `Bearer ${apiKey}`,
-  "Content-Type": "application/json",
-  "X-Title": "jevgrep", // OpenRouter app attribution; the other backends ignore it
-});
+/** Auth headers; OpenRouter hosts also get app-attribution headers (upstream #17,
+ *  openrouter.ai/docs/app-attribution) — never sent to TypeSafe or a self-hosted gateway.
+ *  An empty key (keyless local gateway) sends no Authorization header at all. */
+export const headersFor = (apiKey: string, url: string): Record<string, string> => {
+  const h: Record<string, string> = { "Content-Type": "application/json" };
+  if (apiKey) h.Authorization = `Bearer ${apiKey}`;
+  let host = "";
+  try { host = new URL(url).hostname; } catch { /* not a URL: no attribution */ }
+  if (host === "openrouter.ai" || host.endsWith(".openrouter.ai")) {
+    h["HTTP-Referer"] = "https://github.com/Emasoft/jgrep";
+    h["X-OpenRouter-Title"] = "jgrep";
+    h["X-Title"] = "jgrep";
+    h["X-OpenRouter-Categories"] = "cli-agent";
+  }
+  return h;
+};
 
 const detailOf = (err: unknown): string => {
   if (err != null && typeof err === "object") {
@@ -459,7 +501,7 @@ export async function postSystemOne(
     try {
       const res = await fetchImpl(backend.url, {
         method: "POST",
-        headers: headersFor(apiKey),
+        headers: headersFor(apiKey, backend.url),
         body: json,
         signal,
       });
@@ -531,7 +573,7 @@ export async function postSystemOne(
   }
 }
 
-/** Cheap backend-parameterized probe (init + the openrouter startup check): same ping
+/** Cheap backend-parameterized key check used by `jgrep init`: same ping
  *  payload as the old jgrep.ts version, 15s timeout, NO retries, never throws —
  *  transport failures come back as { ok: false, status: 0 }. */
 export async function verifyApiKey(
@@ -543,7 +585,7 @@ export async function verifyApiKey(
   try {
     const res = await f(backend.url, {
       method: "POST",
-      headers: headersFor(apiKey),
+      headers: headersFor(apiKey, backend.url),
       body: JSON.stringify({
         model: backend.model,
         state: "ping",

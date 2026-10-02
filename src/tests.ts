@@ -4,22 +4,26 @@
 // selected in code without asking.
 //
 // Fork adaptation: requests go through providers.ts' multi-backend
-// postSystemOne(body, backend, apiKey, opts) instead of upstream's
-// single-endpoint jgrep.ts version. Backend/model resolution, the lazy API-key
-// lookup and the PostOpts wiring (deadlines, retries, pacing) follow
-// scoreRows() in rows.ts exactly; the cache key is scoped by the RESOLVED
-// model id, the same rule every other mode uses.
+// postSystemOne(body, backend, apiKey, opts). Backend/model resolution, the lazy
+// API-key lookup and the PostOpts wiring follow scoreRows() in rows.ts; the cache
+// key is scoped by the RESOLVED model id, the same rule every other mode uses.
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, listFiles, type Cache } from "./jgrep";
+import {
+  DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, KEY_WORKED_EARLIER_HINT,
+  listFiles, type Cache, type Estimate,
+} from "./jgrep";
 import { BACKENDS, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
+import { runPool, type PoolResult } from "./pool";
+import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
 
 export interface TestFile { file: string; signature: string }
-export interface Selected { file: string; p: number; reason: "direct" | "import" | "jev" | "cached" }
+export interface Selected { file: string; p: number; reason: "direct" | "import" | "package" | "jev" | "cached" }
 
 // ponytail: patterns cover js/ts, python, go, ruby, rust, java, elixir; add flags when a stack is missing.
-export const TEST_FILE_RE = /(^|\/)(tests?|__tests__|spec|specs)\/|(\.|_)(test|spec)\.[cm]?[jt]sx?$|(^|\/)test_[^/]*\.py$|_test\.(py|go|rb|exs)$|_spec\.rb$|(^|\/)[^/]*Tests?\.(java|kt|swift|cs)$|(^|\/)tests\.rs$/;
+export const TEST_FILE_RE = /(^|\/)(tests?|__tests__|spec|specs)\/|(\.|_)(test|spec|tst|test-d)\.[cm]?[jt]sx?$|(^|\/)test_[^/]*\.py$|_test\.(py|go|rb|exs)$|_spec\.rb$|(^|\/)[^/]*Tests?\.(java|kt|swift|cs)$|(^|\/)tests\.rs$/;
 
 export function findTestFiles(files: string[]): string[] {
   return files.filter((f) => TEST_FILE_RE.test(f));
@@ -27,12 +31,12 @@ export function findTestFiles(files: string[]): string[] {
 
 /** Imports plus test/describe names: enough for Jev to know what the file exercises, ~5% of its tokens. */
 export function signature(file: string, text = fs.readFileSync(file, "utf8")): string {
-  const keep = /^\s*(import |from .+ import |const .+ = require\(|require\(|use |using |package |describe\(|it\(|test\(|it\.each|test\.each|def test_|async def test_|func Test|fn test_|#\[test\]|@Test|class .*Test|context\(|scenario\(|feature\()/;
+  const keep = /^\s*(}\s*from\s+["']|export .+ from |.*\bimport\(\s*["']|import |from .+ import |const .+ = require\(|require\(|use |using |package |describe\(|it\(|test\(|it\.each|test\.each|def test_|async def test_|func Test|fn test_|#\[test\]|@Test|class .*Test|context\(|scenario\(|feature\()/;
   const lines = text.split("\n").filter((l) => keep.test(l)).map((l) => l.trim().slice(0, 160));
   return lines.slice(0, 60).join("\n");
 }
 
-const stem = (f: string) => path.basename(f).replace(/\.(test|spec)\.[cm]?[jt]sx?$|_(test|spec)\.(py|go|rb|exs)$|^test_|\.[^.]+$/g, "").toLowerCase();
+const stem = (f: string) => path.basename(f).replace(/[._](test|spec|tst|test-d)\.[cm]?[jt]sx?$|_(test|spec)\.(py|go|rb|exs)$|^test_|\.[^.]+$/g, "").toLowerCase();
 
 /** Tests whose name mirrors a changed source file (foo.ts -> foo.test.ts, foo.py -> test_foo.py). */
 export function directMatches(changedFiles: string[], tests: string[]): Set<string> {
@@ -74,7 +78,7 @@ export function importMatches(changedFiles: string[], tests: TestFile[]): Set<st
   const changedStems = new Set(changedFiles.filter((f) => !TEST_FILE_RE.test(f) && !NOISE_RE.test(f)).map(stem));
   const out = new Set<string>();
   for (const t of tests) {
-    for (const m of t.signature.matchAll(/(?:from|require\(|import)\s*["']([^"']+)["']/g)) {
+    for (const m of t.signature.matchAll(/(?:from|require\(|import\(?)\s*["']([^"']+)["']/g)) {
       const target = m[1];
       if (target.startsWith(".") || target.startsWith("/") || target.includes("/src/")) {
         const base = target.split("/").pop()?.replace(/\.(js|ts|mjs|cjs|jsx|tsx|py|go|rb|rs)$/, "") ?? "";
@@ -85,6 +89,68 @@ export function importMatches(changedFiles: string[], tests: TestFile[]): Set<st
   return out;
 }
 
+let top: { root: string; prefix: string } | undefined;
+/** Repo root (changed paths are relative to it) and cwd's offset inside it (test paths are relative to cwd). */
+function repoTop() {
+  if (!top) {
+    try {
+      const g = (a: string) => execFileSync("git", ["rev-parse", a], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+      top = { root: g("--show-toplevel"), prefix: g("--show-prefix") };
+    } catch { top = { root: process.cwd(), prefix: "" }; }
+  }
+  return top;
+}
+const rd = (f: string) => { try { return fs.readFileSync(path.join(repoTop().root, f), "utf8"); } catch { return ""; } };
+const exists = (f: string) => { try { return fs.statSync(path.join(repoTop().root, f)).isFile(); } catch { return false; } };
+
+/** Root-importing tests ("import zod", "../src", "import flask") selected in code when a changed file is part of
+ *  that package's public surface: its entry file (src/index.*, index.*, __init__.py; package.json main/exports are ignored).
+ *  Package name and entry come from package.json / the __init__.py tree, no network. Paths are repo-root relative;
+ *  `prefix` is where the test paths' cwd sits inside the repo. */
+export function packageMatches(changedFiles: string[], tests: TestFile[], read = rd, has = exists, prefix = repoTop().prefix): Set<string> {
+  const out = new Set<string>();
+  const roots: ((t: TestFile) => boolean)[] = [];
+  for (const f of changedFiles) {
+    if (TEST_FILE_RE.test(f) || NOISE_RE.test(f)) continue;
+    const dirs = f.split("/").slice(0, -1);
+    let name = "", entry = "";
+    if (/\.py$/.test(f)) { // the consecutive __init__.py chain above f's dir gives the dotted name (pkg.sub)
+      let i = dirs.length;
+      while (i > 0 && has([...dirs.slice(0, i), "__init__.py"].join("/"))) i--;
+      if (i < dirs.length) { name = dirs.slice(i).join("."); entry = [...dirs, "__init__.py"].join("/"); }
+    } else {
+      for (let i = dirs.length; i >= 0 && !name; i--) {
+        const pj = [...dirs.slice(0, i), "package.json"].join("/");
+        if (!has(pj)) continue;
+        try { name = JSON.parse(read(pj)).name ?? ""; } catch { /* unreadable package.json: no package rule */ }
+        const base = dirs.slice(0, i).join("/");
+        entry = ["src/index", "index"].flatMap((e) => ["ts", "js", "mts", "mjs", "tsx"].map((x) => [base, `${e}.${x}`].filter(Boolean).join("/"))).find(has) ?? "";
+      }
+    }
+    if (!name || !entry) continue;
+    if (f !== entry) continue; // ponytail: entry file only; counting its re-exports selects ~every test in small libs (flask 0.11 -> 0.39 ratio)
+    const n = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (entry.endsWith(".py")) {
+      const re = new RegExp(`^\\s*(import\\s+([\\w.]+\\s*,\\s*)*${n}\\b|from\\s+${n}(\\.\\w+)*\\s+import)`, "m");
+      roots.push((t) => re.test(t.signature));
+    } else {
+      // A relative spec counts only if, resolved from the test's own directory, it lands on the entry file or its directory.
+      const entryNoExt = entry.replace(/\.\w+$/, ""), entryDir = path.posix.dirname(entry);
+      const named = new RegExp(`^${n}(/.*)?$`); // subpaths too: "zod" and "zod/v4" export the same v4/classic API
+      roots.push((t) => [...t.signature.matchAll(/(?:from|require\(|import\(?)\s*["']([^"']+)["']/g)].some(([, spec]) => {
+        if (named.test(spec)) return true;
+        if (!spec.startsWith(".")) return false;
+        const r = path.posix.join(path.posix.dirname(path.posix.join(prefix, t.file.replace(/\\/g, "/"))), spec).replace(/\.\w+$/, "");
+        return r === entryNoExt || r === entryDir || (r === "." && entryDir === ".");
+      }));
+    }
+  }
+  if (roots.length) for (const t of tests) if (roots.some((r) => r(t))) out.add(t.file);
+  return out;
+}
+
+export interface TestError { file: string; kind: JevErrorKind; message: string; hint?: string }
+
 export interface SelectOptions {
   threshold: number; batch: number; concurrency: number;
   apiKey?: string;             // explicit key wins; else resolved lazily at the first request (scoreRows pattern)
@@ -93,30 +159,53 @@ export interface SelectOptions {
   requestTimeoutSec?: number;  // per attempt
   maxRetries?: number;         // failed attempts tolerated before the final error
   ratePerSec?: number;         // token-bucket pacing across all requests; 0/undefined = unlimited
+  failFast?: boolean;          // rethrow the first fatal error instead of isolating it
+  estimate?: Estimate;         // dry run: count requests/chars into this sink, never call the provider
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
 
-export async function selectTests(diff: string, tests: TestFile[], o: SelectOptions): Promise<{ selected: Selected[]; all: Selected[]; tokens: number; requests: number; cached: number; cost?: number }> {
-  // Backend/model resolution identical to scoreRows(): explicit backend wins,
-  // else the typesafe default; --model > $JEV_MODEL > the backend's default.
+export interface SelectResult { selected: Selected[]; all: Selected[]; tokens: number; cost?: number; requests: number; cached: number; errors: TestError[] }
+
+/** One request-pack's outcome; runPool results are completion-ordered, so the batch
+ *  index rides along and `all` is re-associated after the pool settles. A partial 200
+ *  (the provider answered some tests but not others) is NOT an answer: unanswered test
+ *  indices come back in `malformed` and become malformed_response errors — never a
+ *  p:NaN entry in all/selected. */
+interface BatchOutcome { index: number; entries: { testIndex: number; p: number }[]; malformed: number[] }
+
+export async function selectTests(diff: string, tests: TestFile[], o: SelectOptions): Promise<SelectResult> {
+  // Same resolution as scoreRows(): explicit backend wins, else typesafe; --model > $JEV_MODEL > the backend's default.
   const backend = o.backend ?? BACKENDS.typesafe;
   const model = o.model ?? backend.model;
+  let apiKey = o.apiKey;
+  const apiKeyOf = (): string => { apiKey ??= resolveApiKey(backend); return apiKey; };
   const f = o.fetchImpl ?? fetch;
   const cache = o.cache ?? {};
   const compact = compactDiff(diff);
   const changed = changedFilesOf(diff);
   const direct = directMatches(changed, tests.map((t) => t.file));
   const viaImport = importMatches(changed, tests);
+  const viaPackage = packageMatches(changed, tests);
   const diffHash = createHash("sha1").update(compact).digest("hex");
   // Model-scoped keys (same rule as jgrep()/rows): a different model re-judges.
   const key = (t: TestFile) => createHash("sha1").update(`${model}\0tests\0${diffHash}\0${t.file}\0${t.signature}`).digest("hex");
 
-  // Lazy key resolution, same rule as scoreRows(): explicit apiKey wins, else
-  // resolved once at the first request so fully-cached runs and tests never
-  // touch the filesystem.
-  let apiKey = o.apiKey;
-  const apiKeyOf = (): string => { apiKey ??= resolveApiKey(backend); return apiKey; };
-  // Same defaults and PostOpts wiring as scoreRows().
+  const all: (Selected | undefined)[] = new Array(tests.length); // errored tests stay unset
+  const todo: number[] = [];
+  tests.forEach((t, i) => {
+    if (direct.has(t.file)) all[i] = { file: t.file, p: 1, reason: "direct" };
+    else if (viaImport.has(t.file)) all[i] = { file: t.file, p: 1, reason: "import" };
+    else if (viaPackage.has(t.file)) all[i] = { file: t.file, p: 1, reason: "package" };
+    else if (typeof cache[key(t)] === "number") all[i] = { file: t.file, p: cache[key(t)], reason: "cached" };
+    else todo.push(i);
+  });
+  // Defensive normalization (same rule as jgrep()/scoreRows()): a 0/fractional batch
+  // would spin the batching loop forever (+= 0) or overlap batches. parse() rejects
+  // those; library callers get floored and clamped at 1 instead.
+  const batch = Math.max(1, Math.floor(o.batch));
+  const batches: number[][] = [];
+  for (let i = 0; i < todo.length; i += batch) batches.push(todo.slice(i, i + batch));
+  // Same defaults and PostOpts wiring as jgrep()/scoreRows() — resolved once, read-only in the worker.
   const timeoutMs = (o.timeoutSec ?? DEFAULT_TIMEOUT_SEC) * 1000;
   const post: PostOpts = {
     fetchImpl: f,
@@ -124,45 +213,92 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
     maxRetries: o.maxRetries ?? DEFAULT_MAX_RETRIES,
     limiter: o.ratePerSec && o.ratePerSec > 0 ? new RateLimiter(o.ratePerSec, Math.max(1, o.concurrency)) : undefined,
   };
-
-  const all: Selected[] = new Array(tests.length);
-  const todo: number[] = [];
-  tests.forEach((t, i) => {
-    if (direct.has(t.file)) all[i] = { file: t.file, p: 1, reason: "direct" };
-    else if (viaImport.has(t.file)) all[i] = { file: t.file, p: 1, reason: "import" };
-    else if (typeof cache[key(t)] === "number") all[i] = { file: t.file, p: cache[key(t)], reason: "cached" };
-    else todo.push(i);
-  });
-  const batches: number[][] = [];
-  for (let i = 0; i < todo.length; i += o.batch) batches.push(todo.slice(i, i + o.batch));
-  let tokens = 0, done = 0, next = 0;
+  let tokens = 0;
   let cost: number | undefined; // stays undefined unless a provider reports a cost
-  const worker = async () => {
-    while (next < batches.length) {
-      const b = batches[next++];
-      const state = { diff: compact, tests: b.map((i, j) => ({ id: `t${j}`, file: tests[i].file, signature: tests[i].signature })) };
-      const questions: Record<string, unknown> = {};
-      b.forEach((_, j) => {
-        questions[`t${j}`] = { type: "noul", instructions: `Look only at the test file with id "t${j}". Given the diff, is this test plausibly affected by the change: it imports or exercises a changed module or function, or asserts behaviour the diff alters? Unrelated tests should be no.` };
-      });
-      const res = await postSystemOne({ model, state, questions }, backend, apiKeyOf(), {
-        ...post,
-        deadlineMs: Date.now() + timeoutMs, // per-batch deadline, retries included (§1.6.1)
-      });
-      tokens += res.usage?.input_tokens ?? 0;
-      if (res.cost !== undefined) cost = (cost ?? 0) + res.cost;
-      b.forEach((i, j) => {
-        const p = res.answers[`t${j}`]?.noul;
-        all[i] = { file: tests[i].file, p: typeof p === "number" ? p : NaN, reason: "jev" };
-        if (typeof p === "number") cache[key(tests[i])] = p;
-      });
-      o.onProgress?.(++done, batches.length);
-    }
+  // Run-level success flag, same rule as jgrep()/scoreRows(): drives the
+  // invalid_api_key expired-vs-wrong-key hint. Tracked HERE (not PoolResult) because
+  // failFast throws the pool result away.
+  let hadSuccess = false;
+  const worker = async (b: number[], index: number): Promise<BatchOutcome> => {
+    const state = { diff: compact, tests: b.map((i, j) => ({ id: `t${j}`, file: tests[i].file, signature: tests[i].signature })) };
+    const questions: Record<string, unknown> = {};
+    b.forEach((_, j) => {
+      questions[`t${j}`] = { type: "noul", instructions: `Look only at the test file with id "t${j}". Given the diff, is this test plausibly affected by the change: it imports or exercises a changed module or function, or asserts behaviour the diff alters? Unrelated tests should be no.` };
+    });
+    const req = { model, state, questions };
+    // --estimate: count before apiKeyOf() so a dry run needs no key.
+    if (o.estimate) { o.estimate.requests++; o.estimate.chars += JSON.stringify(req).length; return { index, entries: [], malformed: [] }; }
+    const res = await postSystemOne(req, backend, apiKeyOf(), {
+      ...post,
+      deadlineMs: Date.now() + timeoutMs, // per-batch deadline, retries included
+    });
+    tokens += res.usage?.input_tokens ?? 0;
+    if (res.cost !== undefined) cost = (cost ?? 0) + res.cost;
+    // Finite p-values go straight into the in-memory cache object: cli.ts persists it in
+    // a finally, so answers paid for survive even when other batches fail.
+    const entries: { testIndex: number; p: number }[] = [];
+    const malformed: number[] = [];
+    b.forEach((ti, j) => {
+      const p = res.answers[`t${j}`]?.noul;
+      if (Number.isFinite(p)) {
+        cache[key(tests[ti])] = p;
+        entries.push({ testIndex: ti, p });
+      } else malformed.push(ti);
+    });
+    hadSuccess = true; // this batch's request succeeded — set before returning
+    return { index, entries, malformed };
   };
-  await Promise.all(Array.from({ length: Math.min(o.concurrency, batches.length) }, worker));
-  const selected = all.filter((s) => s.p >= o.threshold).sort((a, b) => b.p - a.p);
-  const byCode = all.filter((s) => s.reason === "direct" || s.reason === "import").length;
-  return { selected, all, tokens, requests: batches.length, cached: tests.length - byCode - todo.length, ...(cost !== undefined ? { cost } : {}) };
+  let pool: PoolResult<BatchOutcome>;
+  try {
+    pool = await runPool(batches, {
+      concurrency: o.concurrency,
+      failFast: o.failFast,
+      onProgress: o.onProgress,
+    }, worker);
+  } catch (e) {
+    // failFast: runPool rethrows the first fatal error and PoolResult.hadSuccess is lost
+    // with it, so the run-level flag above is the only remaining evidence that the key
+    // worked earlier this run. Amend the hint; otherwise rethrow untouched.
+    if (e instanceof JevProviderError && isFatalError(e) && e.kind === "invalid_api_key" && hadSuccess)
+      e.hint = [e.hint, KEY_WORKED_EARLIER_HINT].filter(Boolean).join(" ");
+    throw e;
+  }
+  for (const r of pool.results) for (const e of r.entries) all[e.testIndex] = { file: tests[e.testIndex].file, p: e.p, reason: "jev" };
+  // Not failFast: recorded 401/403s get the same expired-vs-wrong-key distinction. One
+  // clean place — mutate the JevProviderError's hint in pool.errors BEFORE mapping onto
+  // tests, so the amended hint is what TestError carries down to the CLI.
+  if (pool.hadSuccess) {
+    for (const e of pool.errors) {
+      if (e.error.kind === "invalid_api_key") e.error.hint = [e.error.hint, KEY_WORKED_EARLIER_HINT].filter(Boolean).join(" ");
+    }
+  }
+  const errors: TestError[] = pool.errors.flatMap((e) =>
+    batches[e.index].map((ti) => ({
+      file: tests[ti].file, kind: e.error.kind, message: e.error.message,
+      // The provider error's actionable hint rides along (cli.ts prints it under the
+      // error line) — incl. the KEY_WORKED_EARLIER_HINT amended above.
+      ...(e.error.hint !== undefined ? { hint: e.error.hint } : {}),
+    })));
+  // A 200 that answered only some tests of a batch: the unanswered tests are recorded
+  // per test here (the batch itself succeeded, so the pool saw no error).
+  for (const r of pool.results)
+    for (const ti of r.malformed)
+      errors.push({ file: tests[ti].file, kind: "malformed_response", message: "provider returned no usable answer for this test" });
+  if (pool.aborted) {
+    // Batches that were dispatched all reported (success or their own error); whatever
+    // was never attempted is reported as a breaker error. No cache entries, no answers.
+    const settled = new Set<number>(pool.results.map((r) => r.index).concat(pool.errors.map((e) => e.index)));
+    for (let bi = 0; bi < batches.length; bi++) {
+      if (settled.has(bi)) continue;
+      for (const ti of batches[bi]) errors.push({ file: tests[ti].file, kind: "circuit_breaker_open", message: "not attempted: provider failing consistently (circuit breaker open)" });
+    }
+  }
+  // Errored tests never enter all/selected (same rule as jgrep()'s errored chunks);
+  // they surface through the returned errors and the caller's exit code.
+  const answered = all.filter((s): s is Selected => s !== undefined);
+  const selected = answered.filter((s) => s.p >= o.threshold).sort((a, b) => b.p - a.p);
+  const byCode = answered.filter((s) => s.reason === "direct" || s.reason === "import" || s.reason === "package").length;
+  return { selected, all: answered, tokens, ...(cost !== undefined ? { cost } : {}), requests: batches.length - (pool.aborted ? pool.unprocessed : 0), cached: tests.length - byCode - todo.length, errors };
 }
 
 export function loadTests(paths: string[] = ["."]): TestFile[] {

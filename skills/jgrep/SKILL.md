@@ -22,7 +22,8 @@ Read only the ranges you need.
 
 ## Install
 
-jgrep is usually already installed; if not:
+First run `command -v jgrep`. If it prints nothing, tell the user to install it
+(below) and stop; do not install it yourself.
 
 ```bash
 npm i -g jevgrep     # installs the `jgrep` command
@@ -64,6 +65,12 @@ export JEV_GATEWAY_URL=https://gw.example.com/v1/systemone  # full System One en
 export JEV_GATEWAY_API_KEY=...                              # or ~/.config/jgrep/gateway.key
 ```
 
+A local System One server (e.g. Ollama) on loopback `http://` needs no key:
+`JEV_GATEWAY_URL=http://localhost:11434/v1/systemone jgrep --api gateway --model <name> "..."`
+(`JGREP_ENDPOINT` / `JGREP_MODEL` are accepted as aliases of `JEV_GATEWAY_URL` / `JEV_MODEL`).
+The gateway URL must be `https://` unless it is loopback, and is read only from the
+environment, never from a project's `./.env`.
+
 Env vars win over key files, and `--api` overrides auto-detection
 (`--api` > `$JEV_API` > first key found, typesafe first).
 
@@ -96,7 +103,7 @@ jgrep --api openrouter "rule" src/       # pick a provider: typesafe | openroute
 `jgrep --help` prints the full reference — every flag, default, and exit status:
 
 ```
-jgrep 0.4.0 — semantic grep powered by Jev (TypeSafe)
+jgrep 0.6.0 — semantic grep powered by Jev
 
 usage: jgrep init                       interactive setup (provider, key, agent skills)
        jgrep [options] "<description>" [path ...]
@@ -135,7 +142,8 @@ usage: jgrep init                       interactive setup (provider, key, agent 
       --retries <n>     failed attempts tolerated per batch (default 4)
       --rate <req/s>    global request pacing (token bucket); 0 = unlimited
       --fail-fast       abort on the first fatal error instead of isolating it
-      --no-probe        skip the openrouter startup probe
+      --estimate        print requests, input tokens and cost a run would need, then
+                        exit 0 without calling the API (no key needed)
       --no-cache        ignore and do not write ~/.cache/jgrep
   -v, --version         print version
 
@@ -143,7 +151,7 @@ exit status: 0 when something matched, 1 when nothing did, 2 on error or when an
 chunk errored (partial failure: hits and errors are both reported; every failed
 chunk carries a typed kind — timeout, rate_limited, insufficient_credits, ... —
 with an actionable hint on stderr).
-CI lint:    ! jgrep --diff origin/main "adds an endpoint without an auth check"
+CI lint:    jgrep --diff origin/main "adds an endpoint without an auth check"; [ $? -eq 1 ]  # not !: 2 = could not run
 
 examples:
   jgrep "catches an error and silently ignores it" src/
@@ -177,7 +185,8 @@ as worth a look, below 0.5 as no. After a run, Read only the listed ranges
 Retries use full-jitter backoff and honor `Retry-After` (`--retries`, default 4);
 `--timeout` bounds each batch including retries, `--request-timeout` each attempt;
 `--rate REQ/SEC` paces requests. A circuit breaker aborts after 3 consecutive fatal
-failures (`--fail-fast` restores abort-on-the-first); `--no-probe` skips the startup probe.
+failures (`--fail-fast` restores abort-on-the-first). `--estimate` prints the
+requests, tokens and cost a run would need without calling the API (no key needed).
 
 ## Self-review before committing
 
@@ -240,20 +249,22 @@ jgrep --diff origin/main "adds an HTTP endpoint that has no auth check"
 jgrep --diff origin/main "changes billing logic without touching a test"
 ```
 
-Exit 0 means a rule matched, so CI negates it. With a TypeSafe key:
+Exit status is grep's: `0` a rule matched, `1` nothing matched, `2` jgrep could
+not run (bad key, API down, malformed response). In CI keep the three apart: a
+plain `!` would turn an outage or an expired secret into a passing check.
 
 ```yaml
 - run: npm i -g jevgrep
-- run: '! jgrep --diff origin/${{ github.base_ref }} "adds an HTTP endpoint that has no auth check"'
-  env: { TYPESAFE_API_KEY: "${{ secrets.TYPESAFE_API_KEY }}" }
-```
-
-With an OpenRouter key:
-
-```yaml
-- run: npm i -g jevgrep
-- run: '! jgrep --diff origin/${{ github.base_ref }} "adds an HTTP endpoint that has no auth check"'
-  env: { OPENROUTER_API_KEY: "${{ secrets.OPENROUTER_API_KEY }}" }
+- name: no unauthenticated endpoints
+  env: { TYPESAFE_API_KEY: "${{ secrets.TYPESAFE_API_KEY }}" }   # or OPENROUTER_API_KEY
+  run: |
+    set +e
+    jgrep --diff "origin/${{ github.base_ref }}" "adds an HTTP endpoint that has no auth check"
+    case $? in
+      0) echo "::error::jgrep found a match"; exit 1 ;;
+      1) ;;                                          # clean
+      *) echo "::error::jgrep failed to run";  exit 1 ;;
+    esac
 ```
 
 For CI that must not send code to third parties, `--api gateway` with
