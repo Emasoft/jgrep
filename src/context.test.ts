@@ -110,7 +110,7 @@ test("--rows: a pack whose rows exceed the budget is split into smaller packs; e
   expect(r.errors).toEqual([]);
 });
 
-test("--rows: ONE row over the context is judged in parts; noul = best part, choice = label of the most confident part", async () => {
+test("--rows: ONE row over the context is judged in parts; noul = best part, choice = the label with the highest probability in any part", async () => {
   const bio = Array.from({ length: 3000 }, (_, i) => `post ${i}: travel diary entry`).join("\n") + "\nfinal post: BEAUTY tutorial";
   const rows = [{ name: "big", bio }];
   const bodies: string[] = [];
@@ -133,7 +133,19 @@ test("--rows: ONE row over the context is judged in parts; noul = best part, cho
   const sent = bodies.map((b) => JSON.parse(b).state.rows.map((x: { bio: string }) => x.bio).join("\n")).join("\n");
   for (const l of bio.split("\n")) expect(sent.includes(l)).toBe(true); // nothing truncated
   expect(r.answers[0]!.match.noul).toBe(0.95);   // best part, not the first and not an average
-  expect(r.answers[0]!.topic.choice).toBe("beauty"); // label of the most confident part (0.9 > 0.6)
+  expect(r.answers[0]!.topic.choice).toBe("beauty"); // beauty's best part 0.9 beats travel's best 0.6
+});
+
+test("combineParts choice: each label's highest probability over the parts decides; a part's own choice and confidence do not", async () => {
+  const { combineParts } = await import("./rows");
+  const parts = [
+    { q: { type: "choice", choice: "filler", probabilities: { filler: 0.55, bug: 0.45 }, confidence: 0.99 } },
+    { q: { type: "choice", choice: "filler", probabilities: { filler: 0.2, bug: 0.8 }, confidence: 0.1 } }, // its own choice disagrees with its probabilities
+  ];
+  expect(combineParts(parts).q).toEqual({ type: "choice", choice: "bug", probabilities: { filler: 0.2, bug: 0.8 }, confidence: 0.1 });
+  // noul and score stay the max over the parts
+  expect(combineParts([{ a: { type: "noul", noul: 0.2 } }, { a: { type: "noul", noul: 0.7 } }]).a.noul).toBe(0.7);
+  expect(combineParts([{ s: { type: "score", score: 0.9 } }, { s: { type: "score", score: 0.4 } }]).s.score).toBe(0.9);
 });
 
 test("--tests: a big diff is never truncated — it is split into parts, and a test's p is its best part", async () => {

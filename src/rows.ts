@@ -137,18 +137,34 @@ export function rowParts(row: Row, maxBytes: number = ROW_PART_BYTES): Row[] {
   return Array.from({ length: n }, (_, i) => ({ ...row, ...small, ...Object.fromEntries(pieces.map(([k, ps]) => [k, ps[i] ?? ""])) }));
 }
 
+/** A choice answer's most probable label and its probability (its own `choice` and any
+ *  `confidence` field are not consulted). */
+const topLabel = (a: Answer): [string, number] | undefined => {
+  if (a.type !== "choice" || !a.probabilities) return undefined;
+  let top: [string, number] | undefined;
+  for (const [label, p] of Object.entries(a.probabilities)) if (Number.isFinite(p) && (!top || p > top[1])) top = [label, p];
+  return top;
+};
+
 /** USER 2026-10-02: a per-ROW verdict judged in parts takes the best part: noul -> the
- *  highest probability, score -> the highest score, choice -> the label of the most
- *  confident part. Missing answers lose to any real one. */
+ *  highest probability, score -> the highest score. Choice (coordinator correction
+ *  2026-10-02, from Quicksilver's live tests: "the most confident part" lets a confident
+ *  filler part win with the wrong label): for each label take its highest probability over
+ *  the parts; the label with the highest such maximum wins, reported with the part that
+ *  holds it. Missing answers lose to any real one. */
 export function combineParts(parts: Record<string, Answer>[]): Record<string, Answer> {
   if (parts.length === 1) return parts[0];
   const strength = (a: Answer): number =>
     a.type === "noul" ? (a.noul ?? -Infinity)
       : a.type === "score" ? (a.score ?? -Infinity)
-      : a.type === "choice" ? (a.probabilities?.[a.choice ?? ""] ?? -Infinity)
+      : a.type === "choice" ? (topLabel(a)?.[1] ?? -Infinity)
       : -Infinity; // "missing"
   const out: Record<string, Answer> = {};
-  for (const name of Object.keys(parts[0])) out[name] = parts.map((p) => p[name]).reduce((best, a) => (strength(a) > strength(best) ? a : best));
+  for (const name of Object.keys(parts[0])) {
+    const best = parts.map((p) => p[name]).reduce((b, a) => (strength(a) > strength(b) ? a : b));
+    const top = topLabel(best);
+    out[name] = top ? { ...best, choice: top[0] } : best;
+  }
   return out;
 }
 

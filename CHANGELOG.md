@@ -64,7 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a byte budget, `--funcs` keeps every signature (no 200-signature / 8000-char
   cut), `--tests` sends the whole diff and whole signatures in parts, and an
   over-context `--rows` row is judged in parts. Per-file verdicts take the best
-  part (noul/score: highest; choice: the most confident part's label).
+  part (noul/score: highest; choice: the label whose highest probability over the
+  parts is the highest, never "the most confident part").
 - `--estimate --funcs` prices pass 1 exactly and pass 2 as an upper bound (text
   and `--json` `upper_bound`) instead of the plain search.
 - Run cost totals settle every request like the budget meter (reported cost, else
