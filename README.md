@@ -382,6 +382,12 @@ jgrep --rows examples/creators.csv --questions examples/beauty.json --out scored
 Question objects are passed to the API verbatim, so anything Jev accepts works
 (a `choice` question's `criteria` must be a record keyed by label, as above; an
 array is rejected with HTTP 400).
+A row too big for one request is judged in parts. For a `choice` the best real
+evidence wins: the catch-all label is the last criterion (`other` above) unless
+`--default <label>` names another (an unknown label exits 1); a part votes only
+when its top label is not the catch-all, the voting part with the highest
+probability decides, and a row where no part votes gets the catch-all at its best
+probability. noul and score take the highest part.
 Output columns: `beauty` (probability), `category` + `category_p`, `fit` + `fit_conf`.
 Eight creators and five questions is one request, 3k tokens, well under a cent;
 see [`examples/`](examples/). This is the "AI map-reduce" shape: scrape N
@@ -558,6 +564,8 @@ modes
       --verify          re-ask every hit strictly; it stands at p >= 0.6 x threshold
       --envelopes       append each chunk's numbers to its text (steadier counting)
       --tag <a,b,...>   classify each hit into one of 2+ categories, printed as [tag]
+      --default <label> catch-all category of --tag or a --questions choice (default:
+                        the last); a row judged in parts takes its best other label
       --tests [ref]     print the test files a diff plausibly affects (by name, by
                         import, then by Jev); pipe the list into your test runner
       --rows <file>     judge the rows of a CSV / JSONL file instead of code
@@ -709,7 +717,8 @@ full.
    at line boundaries with 3 lines of overlap (a single giant line by
    characters), every request is packed to stay under 40 KB, and a per-file
    verdict (`--funcs` pass 1, `--tests`, a `--rows` row judged in parts) takes
-   the best part's answer.
+   the best part's answer (a `choice`: the best label that is not the catch-all,
+   see `--default`).
 3. **One request, up to 16 chunks, one question each**: `state.chunks[]` plus a
    Noul question per chunk, *"look only at chunk c3, does it match: …"*.
 4. **Threshold**: probabilities at or above `-t` are printed in file order.

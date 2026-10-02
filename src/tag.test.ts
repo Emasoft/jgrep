@@ -272,12 +272,12 @@ test("cli main: --tag with 1 category exits 2 with the usage error before any re
 
 // The cap was 60 lines while --help was a bare flag list; 0.7.0 groups the flags and adds
 // env vars, examples and use cases (the help is also embedded in the agent skill), so the
-// cap is 140: room for that, while still catching a help that balloons.
-test("USAGE documents --tag on one line and stays within the 140-line help cap", () => {
+// cap is 145 (140, then --default's two lines): room for that, while still catching a help that balloons.
+test("USAGE documents --tag on one line and stays within the 145-line help cap", () => {
   const line = USAGE.split("\n").find((l) => l.includes("--tag"));
   expect(line).toBeDefined();
   expect(line).toContain("[tag]");
-  expect(USAGE.split("\n").length).toBeLessThanOrEqual(140);
+  expect(USAGE.split("\n").length).toBeLessThanOrEqual(145);
 });
 
 // ---- CLI end-to-end over the fake gateway ------------------------------------------

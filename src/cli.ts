@@ -4,7 +4,7 @@ import fs from "node:fs";
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo; only createHash is used
 import { createHash } from "node:crypto";
 import { BudgetMeter, HARD_MAX_BYTES, cacheFilePath, chunkPaths, diffChunks, estimateLine, estimateTokens, gitDiff, jgrep, jgrepFuncs, loadCache, parseTagCategories, saveCache, type Estimate, type Hit, type Kind } from "./jgrep";
-import { readRows, loadQuestions, scoreRows, flattenAnswers, toCsv } from "./rows";
+import { readRows, loadQuestions, scoreRows, flattenAnswers, toCsv, choiceLabels } from "./rows";
 import { loadTests, selectTests } from "./tests";
 import { errorsLogFile, resolveChain, resolvePricePerMtok, verifyApiKey, type Provider, type ProviderChain } from "./providers";
 import { JevProviderError } from "./errors";
@@ -79,6 +79,8 @@ modes
       --verify          re-ask every hit strictly; it stands at p >= 0.6 x threshold
       --envelopes       append each chunk's numbers to its text (steadier counting)
       --tag <a,b,...>   classify each hit into one of 2+ categories, printed as [tag]
+      --default <label> catch-all category of --tag or a --questions choice (default:
+                        the last); a row judged in parts takes its best other label
       --tests [ref]     print the test files a diff plausibly affects (by name, by
                         import, then by Jev); pipe the list into your test runner
       --rows <file>     judge the rows of a CSV / JSONL file instead of code
@@ -184,7 +186,7 @@ export function parse(argv: string[]) {
     // the dry-run SINK (an Estimate object); a same-named boolean typed the merged field
     // `boolean | Estimate`, one omitted key away from `true.requests++` (audit, NaN silently).
     estimateOnly: false, sarif: false, envelopes: false, funcs: false, budget: null as number | null, followSymlinks: false, maxBytes: null as number | null,
-    diff: null as string[] | null, rows: "", questions: "", out: "", tests: false, tag: "",
+    diff: null as string[] | null, rows: "", questions: "", out: "", tests: false, tag: "", defaultLabel: undefined as string | undefined,
     provider: "", model: "", timeout: 15, requestTimeout: 30, retries: 4, rate: 0, failFast: false,
   };
   const rest: string[] = [];
@@ -202,6 +204,7 @@ export function parse(argv: string[]) {
     else if (a === "--envelopes") o.envelopes = true;
     else if (a === "--funcs") o.funcs = true;
     else if (a === "--tag") o.tag = argv[++i] ?? ""; // comma-separated categories; validated below
+    else if (a === "--default") o.defaultLabel = argv[++i] ?? ""; // checked against the categories in main()/rowsMain(), exit 1
     else if (a === "--estimate") o.estimateOnly = true;
     else if (a === "--json") o.json = true;
     else if (a === "--json-errors") { o.jsonErrors = true; o.json = true; } // implies --json
@@ -455,6 +458,9 @@ async function main() {
   if (process.argv[2] === "init") { const { init } = await import("./init"); return init(process.argv.slice(3)); }
   if (process.argv[2] === "status") return statusMain(process.argv.slice(3));
   const o = parse(process.argv.slice(2));
+  // --default names one of the categories (USER 2026-10-02, "Best real evidence wins"):
+  // outside --rows they come from --tag; --rows checks its choice questions in rowsMain().
+  if (o.defaultLabel !== undefined && !o.rows) checkDefault(o.defaultLabel, [["", parseTagCategories(o.tag)]]);
   // Provider resolution before anything else: a malformed providers.json, an unknown or
   // disabled --provider, or compatible without its endpoint throws JevProviderError straight
   // to the catch (exit 2). A missing key is reported at the first request, so --estimate and
@@ -623,12 +629,23 @@ async function testsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
   }
 }
 
+/** --default must be a label of every category list given ([question name, labels]; ""
+ *  for --tag); an unknown label, or no categories at all, exits 1 before anything is sent. */
+function checkDefault(label: string, lists: [string, string[]][]) {
+  const fail = (m: string) => { console.error(c("31", m)); process.exit(1); };
+  if (!lists.some(([, ls]) => ls.length)) fail(`--default "${label}" needs categories: --tag, or a choice question in --rows --questions`);
+  for (const [name, ls] of lists)
+    if (!ls.includes(label)) fail(`--default "${label}" is not one of the categories${name ? ` of question "${name}"` : ""}: ${ls.join(", ")}`);
+}
+
 async function rowsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
   if (!o.questions && !o.question) { console.error(USAGE); process.exit(2); }
   const t0 = Date.now();
   const { columns, rows } = readRows(o.rows);
   if (!rows.length) { console.error("no rows"); process.exit(1); }
   const questions = loadQuestions(o.questions || o.question);
+  if (o.defaultLabel !== undefined)
+    checkDefault(o.defaultLabel, Object.entries(questions).filter(([, q]) => q.type === "choice").map(([n, q]) => [n, choiceLabels(q)]));
   const cache = o.cache ? loadCache() : {};
   try {
     const r = await scoreRows(rows, questions, {

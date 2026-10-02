@@ -105,6 +105,7 @@ export interface RowsOptions {
   meter?: BudgetMeter;         // a caller-owned meter (the CLI reads its under-pricing check); else built from budget
   budget?: number;             // --budget: hard cap via reservation, same as jgrep(); undefined = no cap
   pricePerMtok?: number;       // $/Mtok for the budget reservation and token-priced spend (default DEFAULT_PRICE_PER_MTOK)
+  defaultLabel?: string;       // --default: the catch-all choice label (else each choice question's last criterion)
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
 
@@ -146,24 +147,40 @@ const topLabel = (a: Answer): [string, number] | undefined => {
   return top;
 };
 
+/** A choice question's labels: the keys of its `criteria` record (an array's items). */
+export const choiceLabels = (spec: Questions[string] | undefined): string[] => {
+  const c = spec?.criteria;
+  return Array.isArray(c) ? c.map(String) : c && typeof c === "object" ? Object.keys(c) : [];
+};
+
 /** USER 2026-10-02: a per-ROW verdict judged in parts takes the best part: noul -> the
- *  highest probability, score -> the highest score. Choice (coordinator correction
- *  2026-10-02, from Quicksilver's live tests: "the most confident part" lets a confident
- *  filler part win with the wrong label): for each label take its highest probability over
- *  the parts; the label with the highest such maximum wins, reported with the part that
- *  holds it. Missing answers lose to any real one. */
-export function combineParts(parts: Record<string, Answer>[]): Record<string, Answer> {
+ *  highest probability, score -> the highest score. Choice — USER 2026-10-02, "Best real
+ *  evidence wins" (replacing the per-label maximum, which let many confident filler parts
+ *  outvote the one part that held the evidence): the default/catch-all label is the LAST
+ *  criterion unless `defaultLabel` (--default) names another. A part votes only if its top
+ *  label is NOT the default; among voting parts the highest top probability wins and that
+ *  part is reported. If no part votes, the row gets the default label at its best score.
+ *  Missing answers lose to any real one. A single part is returned unchanged. */
+export function combineParts(parts: Record<string, Answer>[], questions: Questions = {}, defaultLabel?: string): Record<string, Answer> {
   if (parts.length === 1) return parts[0];
   const strength = (a: Answer): number =>
     a.type === "noul" ? (a.noul ?? -Infinity)
       : a.type === "score" ? (a.score ?? -Infinity)
-      : a.type === "choice" ? (topLabel(a)?.[1] ?? -Infinity)
       : -Infinity; // "missing"
+  const max = (as: Answer[], f: (a: Answer) => number) => as.reduce((b, a) => (f(a) > f(b) ? a : b));
   const out: Record<string, Answer> = {};
   for (const name of Object.keys(parts[0])) {
-    const best = parts.map((p) => p[name]).reduce((b, a) => (strength(a) > strength(b) ? a : b));
-    const top = topLabel(best);
-    out[name] = top ? { ...best, choice: top[0] } : best;
+    const as = parts.map((p) => p[name]);
+    if (!as.some((a) => topLabel(a))) { out[name] = max(as, strength); continue; }
+    const dflt = defaultLabel ?? choiceLabels(questions[name]).at(-1);
+    const votes = as.filter((a) => { const t = topLabel(a); return t !== undefined && t[0] !== dflt; });
+    if (votes.length) {
+      const best = max(votes, (a) => topLabel(a)![1]);
+      out[name] = { ...best, choice: topLabel(best)![0] };
+    } else {
+      const p = (a: Answer) => (a.type === "choice" ? (a.probabilities?.[dflt ?? ""] ?? -Infinity) : -Infinity);
+      out[name] = { ...max(as, p), choice: dflt };
+    }
   }
   return out;
 }
@@ -173,7 +190,9 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
   const chain = chainFor(o);
   const model = chain.model();
   const models = chain.models(); // a cached row from any model of the chain is served, the head's first
-  const qJson = JSON.stringify(questions);
+  // --default changes a split row's choice verdict (combineParts), so it is part of the cache
+  // key — only when given, so caches written without it stay valid.
+  const qJson = JSON.stringify(questions) + (o.defaultLabel !== undefined ? `\0default=${o.defaultLabel}` : "");
   const cache = o.cache ?? {};
   const f = o.fetchImpl ?? fetch;
   const answers: (Record<string, Answer> | null)[] = new Array(rows.length).fill(null); // errored rows stay null — dense, never holes
@@ -254,7 +273,7 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
   }
   for (const [row, parts] of got) {
     if (parts.length !== partsOf.get(row)) continue; // a part errored: the row is reported below, never half-judged
-    const a = combineParts(parts.map((p) => p.answers));
+    const a = combineParts(parts.map((p) => p.answers), questions, o.defaultLabel);
     answers[row] = a;
     // Cached under the model that answered (a fallback provider's, possibly). ponytail: a row
     // judged in parts by two different providers is not cached at all; it is re-judged next run.

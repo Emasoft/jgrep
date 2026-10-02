@@ -42,6 +42,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chunk, never trips the breaker).
 - `--budget` warns when the provider bills more per token than
   `JEV_PRICE_PER_MTOK` (the reservation price).
+- **`--default <label>`**: names the catch-all category of `--tag` or of a
+  `--rows --questions` choice (default: the last category; an unknown label, or no
+  categories at all, exits 1). A choice judged in parts follows the USER's rule
+  "Best real evidence wins": a part votes only when its top label is not the
+  catch-all; the voting part with the highest probability decides the label and is
+  reported; with no vote the row gets the catch-all at its best probability. This
+  replaces the per-label maximum, under which many confident catch-all parts
+  outvoted the one part that held the evidence. A single part is unchanged; noul
+  and score keep the max over the parts. `--default` is part of the rows cache key.
 
 ### Changed
 
@@ -64,8 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a byte budget, `--funcs` keeps every signature (no 200-signature / 8000-char
   cut), `--tests` sends the whole diff and whole signatures in parts, and an
   over-context `--rows` row is judged in parts. Per-file verdicts take the best
-  part (noul/score: highest; choice: the label whose highest probability over the
-  parts is the highest, never "the most confident part").
+  part (noul/score: highest; choice: "Best real evidence wins", see `--default`).
 - `--estimate --funcs` prices pass 1 exactly and pass 2 as an upper bound (text
   and `--json` `upper_bound`) instead of the plain search.
 - Run cost totals settle every request like the budget meter (reported cost, else

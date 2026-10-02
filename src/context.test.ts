@@ -110,7 +110,7 @@ test("--rows: a pack whose rows exceed the budget is split into smaller packs; e
   expect(r.errors).toEqual([]);
 });
 
-test("--rows: ONE row over the context is judged in parts; noul = best part, choice = the label with the highest probability in any part", async () => {
+test("--rows: ONE row over the context is judged in parts; noul = best part, choice = the best non-default label", async () => {
   const bio = Array.from({ length: 3000 }, (_, i) => `post ${i}: travel diary entry`).join("\n") + "\nfinal post: BEAUTY tutorial";
   const rows = [{ name: "big", bio }];
   const bodies: string[] = [];
@@ -133,17 +133,38 @@ test("--rows: ONE row over the context is judged in parts; noul = best part, cho
   const sent = bodies.map((b) => JSON.parse(b).state.rows.map((x: { bio: string }) => x.bio).join("\n")).join("\n");
   for (const l of bio.split("\n")) expect(sent.includes(l)).toBe(true); // nothing truncated
   expect(r.answers[0]!.match.noul).toBe(0.95);   // best part, not the first and not an average
-  expect(r.answers[0]!.topic.choice).toBe("beauty"); // beauty's best part 0.9 beats travel's best 0.6
+  expect(r.answers[0]!.topic.choice).toBe("beauty"); // travel is the default (last criterion): the beauty part is the only vote
 });
 
-test("combineParts choice: each label's highest probability over the parts decides; a part's own choice and confidence do not", async () => {
+test("combineParts choice (USER: \"Best real evidence wins\"): one relevant part beats many confident default parts", async () => {
   const { combineParts } = await import("./rows");
+  const qs = { q: { type: "choice" as const, instructions: "kind", criteria: { bug: "a real bug", filler: "nothing relevant" } } }; // default = last = filler
+  const filler = { q: { type: "choice", choice: "filler", probabilities: { bug: 0.01, filler: 0.99 }, confidence: 0.99 } };
+  const parts = [filler, filler, { q: { type: "choice", choice: "bug", probabilities: { bug: 0.6, filler: 0.4 } } }, filler];
+  expect(combineParts(parts, qs).q).toEqual({ type: "choice", choice: "bug", probabilities: { bug: 0.6, filler: 0.4 } });
+  // among voting parts the highest top label wins, reported with its part
+  const votes = [{ q: { type: "choice", choice: "bug", probabilities: { bug: 0.7, style: 0.2, filler: 0.1 } } }, { q: { type: "choice", choice: "style", probabilities: { bug: 0.1, style: 0.8, filler: 0.1 } } }];
+  const q3 = { q: { type: "choice" as const, instructions: "kind", criteria: { bug: "b", style: "s", filler: "f" } } };
+  expect(combineParts(votes, q3).q.choice).toBe("style");
+});
+
+test("combineParts choice: when no part votes, the row gets the default label at its best score", async () => {
+  const { combineParts } = await import("./rows");
+  const qs = { q: { type: "choice" as const, instructions: "kind", criteria: { bug: "b", filler: "f" } } };
   const parts = [
-    { q: { type: "choice", choice: "filler", probabilities: { filler: 0.55, bug: 0.45 }, confidence: 0.99 } },
-    { q: { type: "choice", choice: "filler", probabilities: { filler: 0.2, bug: 0.8 }, confidence: 0.1 } }, // its own choice disagrees with its probabilities
+    { q: { type: "choice", choice: "filler", probabilities: { bug: 0.3, filler: 0.7 } } },
+    { q: { type: "choice", choice: "filler", probabilities: { bug: 0.1, filler: 0.9 } } },
   ];
-  expect(combineParts(parts).q).toEqual({ type: "choice", choice: "bug", probabilities: { filler: 0.2, bug: 0.8 }, confidence: 0.1 });
-  // noul and score stay the max over the parts
+  expect(combineParts(parts, qs).q).toEqual({ type: "choice", choice: "filler", probabilities: { bug: 0.1, filler: 0.9 } });
+  // --default names another catch-all: now "bug" parts are the non-voting ones
+  const flipped = [
+    { q: { type: "choice", choice: "bug", probabilities: { bug: 0.95, filler: 0.05 } } },
+    { q: { type: "choice", choice: "filler", probabilities: { bug: 0.45, filler: 0.55 } } },
+  ];
+  expect(combineParts(flipped, qs, "bug").q.choice).toBe("filler");
+  expect(combineParts(flipped, qs).q.choice).toBe("bug");
+  // single part unchanged; noul and score stay the max over the parts
+  expect(combineParts([flipped[1]], qs, "filler")).toBe(flipped[1]);
   expect(combineParts([{ a: { type: "noul", noul: 0.2 } }, { a: { type: "noul", noul: 0.7 } }]).a.noul).toBe(0.7);
   expect(combineParts([{ s: { type: "score", score: 0.9 } }, { s: { type: "score", score: 0.4 } }]).s.score).toBe(0.9);
 });

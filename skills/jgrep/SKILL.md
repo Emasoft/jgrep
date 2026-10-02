@@ -125,6 +125,8 @@ modes
       --verify          re-ask every hit strictly; it stands at p >= 0.6 x threshold
       --envelopes       append each chunk's numbers to its text (steadier counting)
       --tag <a,b,...>   classify each hit into one of 2+ categories, printed as [tag]
+      --default <label> catch-all category of --tag or a --questions choice (default:
+                        the last); a row judged in parts takes its best other label
       --tests [ref]     print the test files a diff plausibly affects (by name, by
                         import, then by Jev); pipe the list into your test runner
       --rows <file>     judge the rows of a CSV / JSONL file instead of code
@@ -261,7 +263,9 @@ matching rows. With `--questions q.json` (a JSON object of Jev questions:
 `{name: {type: noul|choice|score, instructions, criteria?}}`, a `choice`
 question's `criteria` keyed by label) it writes the table back with one answer
 column per question (`--out scored.csv`, or `--json` for the flattened answer
-array). Use it to label, triage or filter records instead of reading them one by one.
+array). A row too big for one request is judged in parts; a choice then takes the
+best label any part gives that is not the catch-all (the last criterion, or
+`--default <label>`), else the catch-all at its best probability. Use it to label, triage or filter records instead of reading them one by one.
 
 ## Cache and cost
 
