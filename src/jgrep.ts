@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { BACKENDS, DEFAULT_PRICE_PER_MTOK, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
+import { chainFor, DEFAULT_PRICE_PER_MTOK, jgrepHome, RateLimiter, type Backend, type Fetch, type PostOpts, type ProviderChain } from "./providers";
 import { runPool, type PoolResult } from "./pool";
 import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
 import { detectLanguage, signatureChunks } from "./funcs";
@@ -463,13 +463,11 @@ export function numberEnvelope(text: string): string {
 
 // ---- cache ------------------------------------------------------------------
 // One JSON file for now; move to sqlite if it grows past a few MB.
-/** `$XDG_CACHE_HOME/jgrep/cache.json`, else `~/.cache/jgrep/cache.json`. Per the XDG base-dir
- *  spec a relative XDG_CACHE_HOME is invalid and ignored. */
+/** `$JGREP_HOME/cache.json`, else `~/.jgrep/cache.json`: jgrep's single home (user decision
+ *  "one file per tool", TRDD-3KBUODCE) next to providers.json and errors.log. */
 export function cacheFilePath(env: Record<string, string | undefined> = process.env, home: string = os.homedir()): string {
-  const xdg = env.XDG_CACHE_HOME?.trim();
-  return path.join(xdg && path.isAbsolute(xdg) ? xdg : path.join(home, ".cache"), "jgrep", "cache.json");
+  return path.join(jgrepHome(env, home), "cache.json");
 }
-const CACHE_FILE = cacheFilePath();
 /** Persistent answers: a chunk key -> p (number), a rows key -> its answer record. Values come
  *  from a JSON file a user can edit, so every read checks the shape (unknown, not any). */
 export type Cache = Record<string, unknown>;
@@ -510,7 +508,9 @@ export function normalizeForCache(text: string): string {
  *  envelope) loads unchanged and is re-persisted in the envelope on the next save —
  *  entries kept, order taken as Object.keys. No migration code: entries keyed on the
  *  pre-normalization raw chunk text simply miss once and re-bill (README cache note). */
-export function loadCache(file: string = CACHE_FILE): Cache {
+// The path is resolved per call, never at import: a bad JGREP_HOME must reach the CLI's
+// error handler (exit 2, one line), not crash the module load with a stack trace.
+export function loadCache(file: string = cacheFilePath()): Cache {
   try {
     const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
@@ -527,11 +527,11 @@ export function loadCache(file: string = CACHE_FILE): Cache {
  *  A failure skips the save with ONE stderr warning (audit: a silent EACCES/ENOSPC
  *  made every later run re-bill every chunk with no clue why) and removes the tmp
  *  file best-effort; the run itself still succeeds. The `file` parameter is a test seam; production callers rely on the
- *  default CACHE_FILE. */
-export function saveCache(c: Cache, file: string = CACHE_FILE) {
+ *  default, cacheFilePath(). */
+export function saveCache(c: Cache, file: string = cacheFilePath()) {
   const tmp = `${file}.tmp-${process.pid}`;
   try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 }); // jgrep's home also holds providers.json (keys)
     evict(c);
     fs.writeFileSync(tmp, JSON.stringify({ v: 1, entries: c, order: Object.keys(c) }));
     fs.renameSync(tmp, file);
@@ -712,6 +712,7 @@ export class BudgetMeter {
 export interface Options {
   threshold: number; batch: number; concurrency: number; apiKey?: string; kind?: Kind;
   backend?: Backend; model?: string;
+  chain?: ProviderChain;       // the CLI's providers.json chain (TRDD-3KBUODCE); wins over backend/model/apiKey
   timeoutSec?: number;         // per-batch deadline, retries included
   requestTimeoutSec?: number;  // per attempt
   maxRetries?: number;         // failed attempts tolerated before the final error
@@ -765,14 +766,16 @@ export async function jgrep(question: string, input: Chunk[], o: Options): Promi
   // Context fit (USER: never truncate, split): every over-budget chunk is split here, the
   // one place every search path (code, --diff, --funcs passes, --estimate) goes through.
   const chunks = input.flatMap((c) => fitChunk(c, kind));
-  const backend = o.backend ?? BACKENDS.typesafe; // the core never picks a provider from env — cli.ts resolves in Step 7
-  const model = o.model ?? backend.model;
+  // The core never picks a provider from env: cli.ts resolves the providers.json chain; a
+  // library call gets a chain of its one backend with a lazily resolved key (chainFor).
+  const chain = chainFor(o);
+  // Requests are built with the first live provider's model. An answer is cached under the
+  // model that gave it (res.via.model), and a lookup accepts any model of the chain, the
+  // head's first (chain.models()): every provider in the chain is one the user accepts.
+  const model = chain.model();
+  const models = chain.models();
   const cache = o.cache ?? {};
   const f = o.fetchImpl ?? fetch;
-  // Lazy key resolution: explicit apiKey wins; otherwise resolved once at the first
-  // request, so a fully-cached run (or a test passing apiKey) never touches the filesystem.
-  let apiKey = o.apiKey;
-  const apiKeyOf = (): string => { apiKey ??= resolveApiKey(backend); return apiKey; };
   const all: (Hit | undefined)[] = new Array(chunks.length); // errored chunks stay unset
   // Signature clustering (WI-3): chunks sharing a normalized (indent-aware) signature are
   // near-identical boilerplate — the FIRST cache-missing chunk of a signature (the head)
@@ -789,24 +792,25 @@ export async function jgrep(question: string, input: Chunk[], o: Options): Promi
   // answers. votes=1 keeps the byte-exact legacy single-question request and plain keys.
   const votes = Math.max(1, Math.min(5, Math.floor(o.votes ?? 1)));
   const envelopes = o.envelopes ?? false; // --envelopes (WI-9): judged text gains "[numbers: …]"
-  const keyOf = (ci: number): string => key(model, kind, question, chunks[ci]);
   const qid = (j: number, v: number): string => (votes > 1 ? `c${j}#v${v}` : `c${j}`);
   chunks.forEach((c, i) => {
-    const k = keyOf(i);
-    if (votes > 1) {
-      const ps: number[] = [];
-      let complete = true;
-      for (let v = 0; v < votes; v++) {
-        const p = cache[`${k}#v${v}`];
-        if (typeof p === "number" && Number.isFinite(p)) ps.push(p);
-        else { complete = false; break; }
+    for (const m of models) {
+      const k = key(m, kind, question, c);
+      if (votes > 1) {
+        const ps: number[] = [];
+        let complete = true;
+        for (let v = 0; v < votes; v++) {
+          const p = cache[`${k}#v${v}`];
+          if (typeof p === "number" && Number.isFinite(p)) ps.push(p);
+          else { complete = false; break; }
+        }
+        if (complete) { all[i] = { ...c, p: median(ps) }; cached++; return; }
+      } else {
+        // Same finite-number rule as the votes path: a hand-edited or corrupt cache value
+        // (null, a string) would otherwise become `p` and crash `p.toFixed` in the CLI.
+        const hit = cache[k];
+        if (typeof hit === "number" && Number.isFinite(hit)) { all[i] = { ...c, p: hit }; cached++; return; }
       }
-      if (complete) { all[i] = { ...c, p: median(ps) }; cached++; return; }
-    } else {
-      // Same finite-number rule as the votes path: a hand-edited or corrupt cache value
-      // (null, a string) would otherwise become `p` and crash `p.toFixed` in the CLI.
-      const hit = cache[k];
-      if (typeof hit === "number" && Number.isFinite(hit)) { all[i] = { ...c, p: hit }; cached++; return; }
     }
     const sk = sigKey(kind, question, c);
     if (heads.has(sk)) siblingsOf.get(sk)!.push(i);
@@ -833,24 +837,28 @@ export async function jgrep(question: string, input: Chunk[], o: Options): Promi
   const price = o.pricePerMtok ?? DEFAULT_PRICE_PER_MTOK;
   // --budget (B1): one meter for the main, verify and tag passes; none without a budget.
   const meter = o.meter ?? (o.budget !== undefined ? new BudgetMeter(o.budget, price) : undefined);
-  /** Every provider request of this run goes through here: per-batch deadline (retries
-   *  included, §1.6.1), lazy key, and the budget reservation when a budget is set. */
-  const send = (req: unknown) => {
-    const go = () => postSystemOne(req as Parameters<typeof postSystemOne>[0], backend, apiKeyOf(), { ...post, deadlineMs: Date.now() + timeoutMs });
-    return meter ? meter.run(req, backend.name, go) : go();
+  /** Every provider request of this run goes through here: the provider chain (per-batch
+   *  deadline per provider, retries included, §1.6.1; fallback; lazy key), and ONE budget
+   *  reservation for the request whichever provider answers it. */
+  const send = (req: { model: string; state: unknown; questions: Record<string, unknown> }) => {
+    const go = () => chain.post(req, post, timeoutMs);
+    return meter ? meter.run(req, chain.name(), go) : go();
   };
+  /** The model that answered each chunk judged this run: its siblings' cache entries use it. */
+  const answeredBy = new Map<number, string>();
   // Run-level success flag (plan §1.5): drives the invalid_api_key expired-vs-wrong-key
   // hint. Tracked HERE (not PoolResult) because failFast throws the pool result away.
   let hadSuccess = false;
   const worker = async (b: number[], index: number): Promise<BatchOutcome> => {
     const req = buildRequest(question, b.map((i) => chunks[i]), kind, model, votes, envelopes);
-    // --estimate: count before apiKeyOf() so a dry run needs no key.
+    // --estimate: count before any provider is asked, so a dry run needs no key.
     if (o.estimate) {
       o.estimate.requests++; o.estimate.chars += JSON.stringify(req).length;
       if (o.estimate.files) for (const i of b) o.estimate.files[chunks[i].file] = (o.estimate.files[chunks[i].file] ?? 0) + 1;
       return { index, entries: [], malformed: [] };
     }
     const res = await send(req); // --budget: reserves first; throws budget_exhausted unsent
+    const keyAs = (ci: number): string => key(res.via.model, kind, question, chunks[ci]);
     tokens += res.usage?.input_tokens ?? 0;
     cost = (cost ?? 0) + settledCost(res, price);
     // Finite p-values go straight into the in-memory cache object: cli.ts persists it in a
@@ -868,12 +876,13 @@ export async function jgrep(question: string, input: Chunk[], o: Options): Promi
         const p = res.answers[qid(j, v)]?.noul;
         if (typeof p === "number" && Number.isFinite(p)) {
           ps.push(p);
-          if (votes > 1) cache[`${keyOf(ci)}#v${v}`] = p;
+          if (votes > 1) cache[`${keyAs(ci)}#v${v}`] = p;
         } else complete = false;
       }
       if (!complete) { malformed.push(ci); return; }
       const p = votes > 1 ? median(ps) : ps[0];
-      if (votes === 1) cache[keyOf(ci)] = p;
+      if (votes === 1) cache[keyAs(ci)] = p;
+      answeredBy.set(ci, res.via.model);
       entries.push({ chunkIndex: ci, p });
     });
     hadSuccess = true; // this batch's request succeeded — set before returning (plan §1.5)
@@ -947,7 +956,7 @@ export async function jgrep(question: string, input: Chunk[], o: Options): Promi
     const verdict = all[headIdx];
     if (verdict !== undefined) {
       for (const si of sibs) {
-        cache[key(model, kind, question, chunks[si])] = verdict.p;
+        cache[key(answeredBy.get(headIdx) ?? model, kind, question, chunks[si])] = verdict.p; // the head's answering model
         all[si] = { ...chunks[si], p: verdict.p };
       }
     } else {
@@ -969,12 +978,11 @@ export async function jgrep(question: string, input: Chunk[], o: Options): Promi
   if (o.verify && hits.length > 0) {
     const gate = o.threshold * VERIFY_GATE;
     const verdictOf = new Map<Hit, number>(); // hit -> pass-2 p; an ABSENT verdict failed -> fail open
-    const pending: { hit: Hit; cacheKey: string }[] = [];
+    const pending: { hit: Hit }[] = [];
     for (const h of hits) {
-      const ck = `${key(model, kind, question, h)}#verify`;
-      const v = cache[ck];
+      const v = models.map((m) => cache[`${key(m, kind, question, h)}#verify`]).find((x) => typeof x === "number" && Number.isFinite(x));
       if (typeof v === "number" && Number.isFinite(v)) verdictOf.set(h, v);
-      else pending.push({ hit: h, cacheKey: ck });
+      else pending.push({ hit: h });
     }
     if (pending.length > 0) {
       // Same byte-aware packing as the main pass (the verify request carries the hit's text).
@@ -988,9 +996,10 @@ export async function jgrep(question: string, input: Chunk[], o: Options): Promi
         cost = (cost ?? 0) + settledCost(res, price);
         const got: { hit: Hit; p: number }[] = [];
         const missing: Hit[] = [];
-        bp.forEach(({ hit, cacheKey }, j) => {
+        bp.forEach(({ hit }, j) => {
           const p = res.answers[`c${j}`]?.noul;
-          if (typeof p === "number" && Number.isFinite(p)) { cache[cacheKey] = p; got.push({ hit, p }); }
+          // cached under the model that answered (a fallback provider's, possibly)
+          if (typeof p === "number" && Number.isFinite(p)) { cache[`${key(res.via.model, kind, question, hit)}#verify`] = p; got.push({ hit, p }); }
           else missing.push(hit);
         });
         return { index, got, missing };
@@ -1156,7 +1165,7 @@ export async function jgrepFuncs(question: string, paths: string[], o: Options):
 }
 
 // ---- config -----------------------------------------------------------------
-// Key resolution/verification/storage moved to providers.ts (WI-1): resolveApiKey,
-// verifyApiKey and the legacy ~/.config/jgrep/env writer live there now.
+// Providers, keys and their verification live in providers.ts (~/.jgrep/providers.json,
+// TRDD-3KBUODCE); `jgrep init` writes that file.
 // Agent-skill installation moved to init.ts: the vercel `skills` universal installer
 // (`installToAgentsDir` there is the fallback) replaced the old per-harness copy.

@@ -3,7 +3,7 @@
 // rows per request. Output is the table with one answer column per question.
 import fs from "node:fs";
 import { createHash } from "node:crypto";
-import { BACKENDS, DEFAULT_PRICE_PER_MTOK, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type JevAnswer, type PostOpts } from "./providers";
+import { chainFor, DEFAULT_PRICE_PER_MTOK, RateLimiter, type Backend, type Fetch, type JevAnswer, type PostOpts, type ProviderChain } from "./providers";
 import { runPool, type PoolResult } from "./pool";
 import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
 import {
@@ -95,6 +95,7 @@ const key = (model: string, qJson: string, r: Row) =>
 export interface RowsOptions {
   batch: number; concurrency: number; apiKey?: string;
   backend?: Backend; model?: string;
+  chain?: ProviderChain;       // the CLI's providers.json chain (TRDD-3KBUODCE); wins over backend/model/apiKey
   timeoutSec?: number;         // per-batch deadline, retries included (defaults shared with jgrep)
   requestTimeoutSec?: number;  // per attempt
   maxRetries?: number;         // failed attempts tolerated before the final error
@@ -114,7 +115,7 @@ export interface RowsResult { answers: (Record<string, Answer> | null)[]; tokens
 
 /** One request-pack's outcome; runPool results are completion-ordered, so the pack
  *  index rides along and `answers` is re-associated after the pool settles. */
-interface PackOutcome { index: number; unitResults: { unit: number; answers: Record<string, Answer> }[] }
+interface PackOutcome { index: number; unitResults: { unit: number; answers: Record<string, Answer>; model: string }[] }
 
 /** A row's JSON over this many bytes is judged in parts (half a request: room for the
  *  questions and the other rows of a pack). */
@@ -152,19 +153,17 @@ export function combineParts(parts: Record<string, Answer>[]): Record<string, An
 }
 
 export async function scoreRows(rows: Row[], questions: Questions, o: RowsOptions): Promise<RowsResult> {
-  const backend = o.backend ?? BACKENDS.typesafe;
-  const model = o.model ?? backend.model;
+  // Same chain rule as jgrep(): the CLI's providers.json chain, else one backend with a lazy key.
+  const chain = chainFor(o);
+  const model = chain.model();
+  const models = chain.models(); // a cached row from any model of the chain is served, the head's first
   const qJson = JSON.stringify(questions);
   const cache = o.cache ?? {};
   const f = o.fetchImpl ?? fetch;
-  // Lazy key resolution, same rule as jgrep(): explicit apiKey wins, else resolved
-  // once at the first request so fully-cached runs and tests never touch the filesystem.
-  let apiKey = o.apiKey;
-  const apiKeyOf = (): string => { apiKey ??= resolveApiKey(backend); return apiKey; };
   const answers: (Record<string, Answer> | null)[] = new Array(rows.length).fill(null); // errored rows stay null — dense, never holes
   const todo: number[] = [];
   rows.forEach((r, i) => {
-    const hit = cache[key(model, qJson, r)];
+    const hit = models.map((m) => cache[key(m, qJson, r)]).find((x) => x !== null && typeof x === "object");
     if (hit !== null && typeof hit === "object") answers[i] = hit as Record<string, Answer>; else todo.push(i);
   });
   // Defensive normalization (same rule as jgrep()): a 0/fractional batch would spin
@@ -199,19 +198,17 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
   const meter = o.meter ?? (o.budget !== undefined ? new BudgetMeter(o.budget, price) : undefined);
   const worker = async (b: number[], index: number): Promise<PackOutcome> => {
     const req = buildRowsRequest(b.map((ui) => units[ui].data), questions, model);
-    // --estimate: count before apiKeyOf() so a dry run needs no key.
+    // --estimate: count before any provider is asked, so a dry run needs no key.
     if (o.estimate) { o.estimate.requests++; o.estimate.chars += JSON.stringify(req).length; return { index, unitResults: [] }; }
-    const go = () => postSystemOne(req, backend, apiKeyOf(), {
-      ...post,
-      deadlineMs: Date.now() + timeoutMs, // per-batch deadline, retries included (§1.6.1)
-    });
-    const res = await (meter ? meter.run(req, backend.name, go) : go()); // throws budget_exhausted unsent
+    // per-batch deadline per provider, retries included (§1.6.1); one budget reservation per request
+    const go = () => chain.post(req, post, timeoutMs);
+    const res = await (meter ? meter.run(req, chain.name(), go) : go()); // throws budget_exhausted unsent
     tokens += res.usage?.input_tokens ?? 0;
     cost = (cost ?? 0) + settledCost(res, price);
     const unitResults = b.map((ui, j) => {
       const a: Record<string, Answer> = {};
       for (const name of Object.keys(questions)) a[name] = res.answers[`r${j}.${name}`] ?? { type: "missing" };
-      return { unit: ui, answers: a };
+      return { unit: ui, answers: a, model: res.via.model };
     });
     hadSuccess = true; // this pack's request succeeded — set before returning (plan §1.5)
     return { index, unitResults };
@@ -234,16 +231,19 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
   // A row's verdict needs ALL its parts answered; then the best part wins (combineParts).
   // Same caching rule as before: a row with any missing answer is not cached; complete
   // rows go into the in-memory cache object — cli.ts persists it in a finally (Step 7).
-  const got = new Map<number, Record<string, Answer>[]>();
+  const got = new Map<number, { answers: Record<string, Answer>; model: string }[]>();
   for (const r of pool.results) for (const ur of r.unitResults) {
     const row = units[ur.unit].row;
-    got.set(row, [...(got.get(row) ?? []), ur.answers]);
+    got.set(row, [...(got.get(row) ?? []), ur]);
   }
   for (const [row, parts] of got) {
     if (parts.length !== partsOf.get(row)) continue; // a part errored: the row is reported below, never half-judged
-    const a = combineParts(parts);
+    const a = combineParts(parts.map((p) => p.answers));
     answers[row] = a;
-    if (Object.values(a).every((x) => x.type !== "missing")) cache[key(model, qJson, rows[row])] = a;
+    // Cached under the model that answered (a fallback provider's, possibly). ponytail: a row
+    // judged in parts by two different providers is not cached at all; it is re-judged next run.
+    const models = new Set(parts.map((p) => p.model));
+    if (models.size === 1 && Object.values(a).every((x) => x.type !== "missing")) cache[key([...models][0], qJson, rows[row])] = a;
   }
   // Not failFast: recorded 401/403s get the same expired-vs-wrong-key distinction. One
   // clean place — mutate the JevProviderError's hint in pool.errors BEFORE mapping onto

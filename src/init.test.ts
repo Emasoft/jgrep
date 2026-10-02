@@ -1,6 +1,6 @@
-// Step 8 tests: init() itself is interactive (@clack), so the wizard's branch logic
-// is extracted into exported pure helpers in init.ts and covered here — plus the
-// storage wiring (writeKeyFile -> keyFilePath -> resolveApiKey) end to end.
+// `jgrep init` (TRDD-3KBUODCE): init() itself is interactive (@clack), so the wizard's branch
+// logic is extracted into exported pure helpers in init.ts and covered here — plus the save
+// path (withEntry -> saveProviders -> loadProviders) end to end, in temp homes only.
 // @ts-expect-error — no bun-types in this zero-dep repo; Bun provides bun:test at runtime
 import { test, expect } from "bun:test";
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo
@@ -11,11 +11,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 declare const process: { env: Record<string, string | undefined>; platform: string };
 
-import { BACKENDS, keyFilePath, readKeyFile, resolveApiKey, writeKeyFile } from "./providers";
+import { BACKENDS, builtinDoc, loadProviders } from "./providers";
 import {
-  PROVIDER_CHOICES, agentsSkillDir, existingKeyMessage, gatewayBackend, installToAgentsDir,
-  keyPromptMessage, legacySkillCopies, mergeLegacyEnv, outroLine, rejectionHint,
-  skillsInstallCommand, storageLine, storageOptions, verifyHost,
+  PROVIDER_CHOICES, agentsSkillDir, compatibleEndpoint, currentDoc, existingKeyMessage, installToAgentsDir,
+  keyPromptMessage, legacySkillCopies, outroLine, rejectionHint, saveProviders, skillsInstallCommand, verifyHost, withEntry,
 } from "./init";
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-i-"));
@@ -24,110 +23,86 @@ const errOf = (fn: () => unknown): Error => {
   throw new Error("expected fn to throw");
 };
 
-test("gatewayBackend: accepts an http(s) URL and returns a BACKENDS.gateway copy with url set", () => {
-  const b = gatewayBackend("https://x/v1/systemone");
-  expect(b).toEqual({ ...BACKENDS.gateway, url: "https://x/v1/systemone" });
-  expect(b.name).toBe("gateway");
-  expect(b.model).toBe("jev-latest");
-  expect(b.keyEnv).toBe("JEV_GATEWAY_API_KEY");
-  expect(BACKENDS.gateway.url).toBe(""); // registry never mutated
-  expect(gatewayBackend("  https://gw.example.com/v1/systemone  ").url).toBe("https://gw.example.com/v1/systemone"); // trimmed
-});
-
-test("gatewayBackend: rejects ftp://, remote http://, garbage and empty with a plain, clear Error", () => {
-  const e = errOf(() => gatewayBackend("ftp://x/v1/systemone"));
-  expect(e.constructor).toBe(Error); // plain Error — the wizard re-prompts on message, not on JevProviderError
+test("compatibleEndpoint: the full System One URL becomes base_url + path; bad URLs get a plain, clear Error", () => {
+  expect(compatibleEndpoint("  https://gw.example.com/v1/systemone  ")).toEqual({ base_url: "https://gw.example.com", path: "/v1/systemone" });
+  expect(compatibleEndpoint("http://localhost:11434/v1/systemone")).toEqual({ base_url: "http://localhost:11434", path: "/v1/systemone" });
+  const e = errOf(() => compatibleEndpoint("ftp://x/v1/systemone"));
+  expect(e.constructor).toBe(Error); // plain Error — the wizard re-prompts on message
   expect(e.message).toContain("must be https://");
-  expect(e.message).toContain("ftp:");
-  // cleartext to a remote host would carry the key in the clear (upstream #19 rule); loopback is a local server
-  expect(errOf(() => gatewayBackend("http://gw.example.com/v1/systemone")).message).toContain("must be https://");
-  expect(gatewayBackend("http://localhost:11434/v1/systemone").url).toBe("http://localhost:11434/v1/systemone");
-  expect(errOf(() => gatewayBackend("not a url")).message).toContain("not a valid URL");
-  expect(errOf(() => gatewayBackend("")).message).toContain("not a valid URL");
-  expect(errOf(() => gatewayBackend("   ")).message).toContain("not a valid URL");
+  // cleartext to a remote host would carry the key in the clear (upstream #19 rule)
+  expect(errOf(() => compatibleEndpoint("http://gw.example.com/v1/systemone")).message).toContain("must be https://");
+  expect(errOf(() => compatibleEndpoint("https://gw.example.com/v1/systemone?token=x")).message).toContain("query");
+  for (const bad of ["not a url", "", "   "]) expect(errOf(() => compatibleEndpoint(bad)).message).toContain("not a valid URL");
 });
 
-test("PROVIDER_CHOICES: the three backends in registry order, labels name host/protocol", () => {
-  expect(PROVIDER_CHOICES.map((o) => o.value)).toEqual(["typesafe", "openrouter", "gateway"]);
-  expect(PROVIDER_CHOICES[0].label).toContain("api.typesafe.ai");
-  expect(PROVIDER_CHOICES[1].label).toContain("openrouter.ai/api/v1/systemone");
-  expect(PROVIDER_CHOICES[2].label).toContain("gateway");
+test("PROVIDER_CHOICES: every built-in, in built-in chain order (openrouter first)", () => {
+  expect(PROVIDER_CHOICES.map((o) => o.value)).toEqual(["openrouter", "typesafe", "compatible", "cloudflare", "vercel"]);
+  expect(PROVIDER_CHOICES[0].label).toContain("openrouter.ai/api/v1/systemone");
+  expect(PROVIDER_CHOICES[1].label).toContain("api.typesafe.ai");
 });
 
 test("keyPromptMessage: provider-specific paste text with the right console/keys URL", () => {
-  expect(keyPromptMessage(BACKENDS.typesafe)).toContain("TypeSafe API key");
-  expect(keyPromptMessage(BACKENDS.typesafe)).toContain("https://console.typesafe.ai");
-  expect(keyPromptMessage(BACKENDS.openrouter)).toContain("OpenRouter API key");
-  expect(keyPromptMessage(BACKENDS.openrouter)).toContain("https://openrouter.ai/keys");
-  expect(keyPromptMessage(gatewayBackend("https://gw.example.com/v1/systemone"))).toContain("Authorization: Bearer");
+  expect(keyPromptMessage("typesafe")).toContain("https://console.typesafe.ai");
+  expect(keyPromptMessage("openrouter")).toContain("https://openrouter.ai/settings/keys");
+  expect(keyPromptMessage("cloudflare")).toContain("Workers AI");
+  expect(keyPromptMessage("compatible")).toContain("Authorization: Bearer");
 });
 
-test("verifyHost: names the actual backend host, never a hardcoded one", () => {
+test("verifyHost: names the host actually checked (the free check, else the endpoint)", () => {
   expect(verifyHost(BACKENDS.typesafe)).toBe("Checking the key against api.typesafe.ai");
   expect(verifyHost(BACKENDS.openrouter)).toBe("Checking the key against openrouter.ai");
-  expect(verifyHost(gatewayBackend("https://gw.example.com/v1/systemone"))).toBe("Checking the key against gw.example.com");
+  expect(verifyHost({ ...BACKENDS.compatible, url: "https://gw.example.com/v1/systemone" })).toBe("Checking the key against gw.example.com");
 });
 
 test("rejectionHint: only 404 gets the pin-version hint", () => {
   expect(rejectionHint(404)).toBe("the provider may need an explicit --model version");
   expect(rejectionHint(401)).toBeUndefined();
-  expect(rejectionHint(403)).toBeUndefined();
   expect(rejectionHint(0)).toBeUndefined(); // transport failure, not a rejection status
 });
 
-test("storageOptions: four choices, key file first (default), none's hint names the key env", () => {
-  const opts = storageOptions(BACKENDS.openrouter);
-  expect(opts.map((o) => o.value)).toEqual(["keyfile", "legacy", "project", "none"]);
-  expect(opts[0].label).toContain("openrouter.key");
-  expect(opts[1].label).toContain(path.join(".config", "jgrep", "env"));
-  expect(opts[2].hint).toContain(".gitignore");
-  expect(opts[3].hint).toContain("OPENROUTER_API_KEY");
-});
-
-test("storageLine: one human summary per branch, key env interpolated", () => {
-  const b = BACKENDS.openrouter, home = tmp();
-  expect(storageLine(b, "keyfile", home)).toBe(`Saved to ${keyFilePath("openrouter", home)} (mode 600)`);
-  expect(storageLine(b, "legacy", home)).toContain(path.join(home, ".config", "jgrep", "env"));
-  expect(storageLine(b, "legacy", home)).toContain("OPENROUTER_API_KEY");
-  expect(storageLine(b, "project", home)).toBe("Appended OPENROUTER_API_KEY to ./.env");
-  expect(storageLine(b, "none", home)).toContain("export OPENROUTER_API_KEY");
-  expect(storageLine(b, "mystery", home)).toBe(storageLine(b, "none", home)); // unknown falls back to "not saved"
-});
-
-test("existingKeyMessage: names the provider and masks the key to its last 4 chars", () => {
-  const m = existingKeyMessage(BACKENDS.typesafe, "sk-1234567890");
+test("existingKeyMessage: names the provider and where the key comes from, masks it to its last 4 chars", () => {
+  const m = existingKeyMessage("typesafe", "sk-1234567890", "$TYPESAFE_API_KEY");
   expect(m).toContain("typesafe");
   expect(m).toContain("…7890");
+  expect(m).toContain("$TYPESAFE_API_KEY");
   expect(m).not.toContain("sk-1234");
-});
-
-test("mergeLegacyEnv: appends KEYENV=<key>, drops a stale line for the same key, keeps the rest", () => {
-  expect(mergeLegacyEnv(null, "OPENROUTER_API_KEY", "k1")).toBe("OPENROUTER_API_KEY=k1\n");
-  expect(mergeLegacyEnv("", "OPENROUTER_API_KEY", "k1")).toBe("OPENROUTER_API_KEY=k1\n");
-  expect(mergeLegacyEnv("TYPESAFE_API_KEY=t\n", "OPENROUTER_API_KEY", "k1"))
-    .toBe("TYPESAFE_API_KEY=t\nOPENROUTER_API_KEY=k1\n"); // other providers' entries survive
-  expect(mergeLegacyEnv("OPENROUTER_API_KEY=old\nTYPESAFE_API_KEY=t\n", "OPENROUTER_API_KEY", "new"))
-    .toBe("TYPESAFE_API_KEY=t\nOPENROUTER_API_KEY=new\n"); // stale same-key line removed (first-match-wins parsing)
-  expect(mergeLegacyEnv("export OPENROUTER_API_KEY='old'\n", "OPENROUTER_API_KEY", "new"))
-    .toBe("OPENROUTER_API_KEY=new\n"); // export/quote variants are recognized as the same key
-  expect(mergeLegacyEnv("OTHER_A=1\n\n", "OPENROUTER_API_KEY", "k")).toBe("OTHER_A=1\nOPENROUTER_API_KEY=k\n"); // no blank pile-up
-  expect(mergeLegacyEnv("OTHER_A=1", "OPENROUTER_API_KEY", "k")).toBe("OTHER_A=1\nOPENROUTER_API_KEY=k\n"); // no trailing newline
-});
-
-test("init storage wiring: writeKeyFile(keyFilePath(...)) roundtrips and resolveApiKey finds the key", () => {
-  const home = tmp(), cwd = tmp();
-  writeKeyFile(keyFilePath("openrouter", home), "k"); // the keyfile branch's exact call
-  expect(readKeyFile(keyFilePath("openrouter", home))).toBe("k");
-  expect(resolveApiKey(BACKENDS.openrouter, {}, home, cwd)).toBe("k"); // §1.4 chain resolves it
-  if (process.platform !== "win32") {
-    expect(fs.statSync(keyFilePath("openrouter", home)).mode & 0o777).toBe(0o600);
-  }
 });
 
 test("outroLine: mentions the model in play via the chosen provider", () => {
   expect(outroLine(BACKENDS.typesafe)).toBe("Ready (jev-latest via typesafe).");
   expect(outroLine(BACKENDS.openrouter, "typesafe/jev-1.13")).toBe("Ready (typesafe/jev-1.13 via openrouter).");
-  expect(outroLine(gatewayBackend("https://gw.example.com/v1"), "jev-latest")).toBe("Ready (jev-latest via gateway).");
+});
+
+test("withEntry: merges fields into one entry (appended when missing), optionally moves it first, keeps the rest as written", () => {
+  const doc = { version: 1 as const, providers: [{ name: "openrouter" }, { name: "typesafe", enabled: "off" }] };
+  expect(withEntry(doc, "typesafe", { api_key: "k" }).providers).toEqual([{ name: "openrouter" }, { name: "typesafe", enabled: "off", api_key: "k" }]);
+  expect(withEntry(doc, "typesafe", {}, true).providers.map((e) => e.name)).toEqual(["typesafe", "openrouter"]);
+  expect(withEntry(doc, "vercel", { api_key: "$AI_GATEWAY_API_KEY" }).providers.map((e) => e.name)).toEqual(["openrouter", "typesafe", "vercel"]);
+  expect(doc.providers).toEqual([{ name: "openrouter" }, { name: "typesafe", enabled: "off" }]); // the input is never mutated
+});
+
+test("saveProviders: validated, 0600 in a 0700 home, atomic; the next run reads the saved literal key", () => {
+  const home = tmp();
+  const env = { JGREP_HOME: path.join(home, ".jgrep") };
+  const file = saveProviders(withEntry(builtinDoc(), "openrouter", { api_key: "sk-or-saved-key" }), env);
+  expect(file).toBe(path.join(home, ".jgrep", "providers.json"));
+  if (process.platform !== "win32") {
+    expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+    expect(fs.statSync(path.dirname(file)).mode & 0o777).toBe(0o700);
+  }
+  expect(fs.readdirSync(path.dirname(file))).toEqual(["providers.json"]); // no temp file left behind
+  const p = loadProviders(env, tmp(), tmp()).providers[0];
+  expect([p.name, p.key, p.keySource]).toEqual(["openrouter", "sk-or-saved-key", "literal in providers.json"]);
+  // an invalid document is never written: the next run must accept the file
+  expect(() => saveProviders({ version: 1, providers: [{ name: "typesafe", colour: "red" } as never] }, env)).toThrow(/unknown field/);
+  expect(JSON.parse(fs.readFileSync(file, "utf8")).providers[0].api_key).toBe("sk-or-saved-key");
+});
+
+test("currentDoc: every built-in by name when there is no file; a broken file stops init before any prompt", () => {
+  const env = { JGREP_HOME: tmp() };
+  expect(currentDoc(env)).toEqual({ doc: builtinDoc(), exists: false });
+  fs.writeFileSync(path.join(env.JGREP_HOME, "providers.json"), "{oops", { mode: 0o600 });
+  expect(() => currentDoc(env)).toThrow(/not valid JSON/);
 });
 
 // ---- universal skills installer (vercel-labs/skills) --------------------------
@@ -213,66 +188,6 @@ test("legacySkillCopies: lists pre-0.4 claude/codex copies that exist, ignores t
   ]);
   fs.mkdirSync(path.join(home, ".cursor"), { recursive: true }); // unknown agent home: not legacy
   expect(legacySkillCopies(home)).not.toContain(path.join(home, ".cursor", "skills", "jgrep", "SKILL.md"));
-});
-
-// ---- key storage hygiene (audit MINOR / review n6) ---------------------------------
-
-test("saveProjectEnvKey: appends on its own line (no glue onto a last line without newline) and chmods 0600", async () => {
-  const { saveProjectEnvKey } = await import("./init");
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-init-env-"));
-  fs.writeFileSync(path.join(cwd, ".env"), "FOO=1", { mode: 0o644 }); // no trailing newline
-  saveProjectEnvKey(cwd, "OPENROUTER_API_KEY", "sk-or-test");
-  expect(fs.readFileSync(path.join(cwd, ".env"), "utf8")).toBe("FOO=1\nOPENROUTER_API_KEY=sk-or-test\n");
-  if (process.platform !== "win32") expect(fs.statSync(path.join(cwd, ".env")).mode & 0o777).toBe(0o600);
-  const fresh = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-init-env-"));
-  saveProjectEnvKey(fresh, "TYPESAFE_API_KEY", "k");
-  expect(fs.readFileSync(path.join(fresh, ".env"), "utf8")).toBe("TYPESAFE_API_KEY=k\n");
-});
-
-test("saveLegacyEnvKey: tightens a pre-existing 0644 ~/.config/jgrep/env to 0600", async () => {
-  if (process.platform === "win32") return;
-  const { saveLegacyEnvKey } = await import("./init");
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-init-home-"));
-  const file = path.join(home, ".config", "jgrep", "env");
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, "OTHER=1\n", { mode: 0o644 });
-  fs.chmodSync(file, 0o644);
-  saveLegacyEnvKey("TYPESAFE_API_KEY", "k", home);
-  expect(fs.statSync(file).mode & 0o777).toBe(0o600);
-  expect(fs.readFileSync(file, "utf8")).toBe("OTHER=1\nTYPESAFE_API_KEY=k\n");
-});
-
-// ---- review m1: init saves the chosen provider (and gateway URL) for the next run ----
-
-test("saveProviderChoice: JEV_API (+ JEV_GATEWAY_URL for gateway) land in ~/.config/jgrep/env, other lines kept", async () => {
-  const { saveProviderChoice } = await import("./init");
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-init-prov-"));
-  const file = path.join(home, ".config", "jgrep", "env");
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, "TYPESAFE_API_KEY=ts\nJEV_API=typesafe\n");
-  saveProviderChoice({ ...BACKENDS.gateway, url: "https://gw.example.com/v1/systemone" }, home);
-  expect(fs.readFileSync(file, "utf8")).toBe("TYPESAFE_API_KEY=ts\nJEV_API=gateway\nJEV_GATEWAY_URL=https://gw.example.com/v1/systemone\n");
-  saveProviderChoice(BACKENDS.openrouter, home);
-  expect(fs.readFileSync(file, "utf8")).toBe("TYPESAFE_API_KEY=ts\nJEV_GATEWAY_URL=https://gw.example.com/v1/systemone\nJEV_API=openrouter\n");
-  if (process.platform !== "win32") expect(fs.statSync(file).mode & 0o777).toBe(0o600);
-});
-
-test("resolveProvider: the provider saved by init beats auto-detection; $JEV_API and --api still win", async () => {
-  const { resolveProvider } = await import("./providers");
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-init-prov-"));
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-init-cwd-"));
-  const file = path.join(home, ".config", "jgrep", "env");
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const env = { TYPESAFE_API_KEY: "ts", OPENROUTER_API_KEY: "or" }; // auto-detection alone picks typesafe
-  fs.writeFileSync(file, "JEV_API=openrouter\n");
-  expect(resolveProvider(undefined, env, home, cwd).name).toBe("openrouter"); // before: typesafe
-  expect(resolveProvider(undefined, { ...env, JEV_API: "typesafe" }, home, cwd).name).toBe("typesafe");
-  expect(resolveProvider("typesafe", env, home, cwd).name).toBe("typesafe");
-  fs.writeFileSync(file, "JEV_API=gateway\nJEV_GATEWAY_URL=https://gw.example.com/v1/systemone\nJEV_GATEWAY_API_KEY=gw\n");
-  const gw = resolveProvider(undefined, {}, home, cwd);
-  expect(gw.name).toBe("gateway");
-  expect(gw.url).toBe("https://gw.example.com/v1/systemone"); // before: "gateway needs JEV_GATEWAY_URL"
-  expect(resolveProvider(undefined, { JEV_GATEWAY_URL: "https://env.example.com/v1/systemone" }, home, cwd).url).toBe("https://env.example.com/v1/systemone");
 });
 
 test("parseInitArgs (review n4): --request-timeout <s> sets the key-check timeout; junk is rejected", async () => {

@@ -1,5 +1,5 @@
 // Step 7 CLI-surface tests: parse() flag types/defaults/numeric validation, the
-// --api choice enumeration (validated in main() via resolveProvider), and hermetic
+// --provider choice enumeration (validated in main() via resolveChain), and hermetic
 // end-to-end error rendering through the real entrypoint. The subprocess scenarios
 // all fail during argument/provider resolution — before any cache IO or network
 // call — so only stderr/exit-code are observed.
@@ -27,34 +27,34 @@ declare const Bun: {
 
 process.env.JGREP_NO_MAIN = "1";
 const { parse } = await import("./cli");
-const { resolveProvider } = await import("./providers");
+const { resolveChain } = await import("./providers");
 
 // ---- parse(): new flags --------------------------------------------------------
 
 test("cli parse: new flags parse with correct types and defaults", () => {
   const o = parse(["q"]);
-  expect(o).toMatchObject({ api: "", model: "", timeout: 15, requestTimeout: 30, retries: 4, rate: 0, failFast: false, estimateOnly: false });
+  expect(o).toMatchObject({ provider: "", model: "", timeout: 15, requestTimeout: 30, retries: 4, rate: 0, failFast: false, estimateOnly: false });
   expect(typeof o.timeout).toBe("number");
   expect(typeof o.retries).toBe("number");
   expect(typeof o.failFast).toBe("boolean");
   expect(typeof o.estimateOnly).toBe("boolean");
 
-  const o2 = parse(["--api", "openrouter", "--model", "typesafe/jev-1.13", "--timeout", "30", "--request-timeout", "60", "--retries", "2", "--rate", "5", "--fail-fast", "--estimate", "q", "src/"]);
+  const o2 = parse(["--provider", "openrouter", "--model", "typesafe/jev-1.13", "--timeout", "30", "--request-timeout", "60", "--retries", "2", "--rate", "5", "--fail-fast", "--estimate", "q", "src/"]);
   expect(o2).toMatchObject({
-    api: "openrouter", model: "typesafe/jev-1.13", timeout: 30, requestTimeout: 60,
+    provider: "openrouter", model: "typesafe/jev-1.13", timeout: 30, requestTimeout: 60,
     retries: 2, rate: 5, failFast: true, estimateOnly: true, question: "q", paths: ["src/"],
   });
 });
 
-test("cli parse: --api accepts any string; main()'s resolveProvider rejects unknown with all three choices", () => {
-  const o = parse(["--api", "unknown", "q"]);
-  expect(o.api).toBe("unknown"); // parse itself does not validate — main() does, for the typed error
+test("cli parse: --provider accepts any string; main()'s resolveChain rejects unknown, listing the configured providers", () => {
+  const o = parse(["--provider", "unknown", "q"]);
+  expect(o.provider).toBe("unknown"); // parse itself does not validate — main() does, for the typed error
   let caught: unknown;
-  try { resolveProvider(o.api); } catch (e) { caught = e; }
+  try { resolveChain({ pin: o.provider, version: "t" }); } catch (e) { caught = e; }
   expect(caught).toBeInstanceOf(JevProviderError);
   const err = caught as JevProviderError;
   expect(err.kind).toBe("bad_request");
-  for (const choice of ["typesafe", "openrouter", "gateway"]) expect(err.message).toContain(choice);
+  for (const choice of ["openrouter", "typesafe", "compatible", "cloudflare", "vercel"]) expect(err.message).toContain(choice);
 });
 
 test("cli parse: per-option numeric ranges (deadline > 0; counts are whole)", () => {
@@ -93,8 +93,8 @@ test("cli parse: --batch must be a positive integer — 0 would spin the batchin
 });
 
 test("cli parse: old and new flags coexist (--diff positional heuristic untouched)", () => {
-  const o = parse(["--diff", "--json", "--fail-fast", "--api", "openrouter", "--staged", "q"]);
-  expect(o).toMatchObject({ json: true, failFast: true, api: "openrouter", diff: ["--staged"], question: "q" });
+  const o = parse(["--diff", "--json", "--fail-fast", "--provider", "openrouter", "--staged", "q"]);
+  expect(o).toMatchObject({ json: true, failFast: true, provider: "openrouter", diff: ["--staged"], question: "q" });
   const o2 = parse(["--diff", "origin/main", "--estimate", "--rate", "10", "q", "src/"]);
   expect(o2).toMatchObject({ diff: ["origin/main"], estimateOnly: true, rate: 10, question: "q", paths: ["src/"] });
 });
@@ -120,21 +120,21 @@ const run = (args: string[]) =>
     env: { ...process.env, JGREP_NO_MAIN: "", JEV_GATEWAY_URL: "", JGREP_ENDPOINT: "" },
   });
 
-test("cli main: --api unknown exits 2 with the typed error and the three choices", () => {
-  const p = run(["--api", "unknown", "q"]);
+test("cli main: --provider unknown exits 2 with the typed error and every configured provider", () => {
+  const p = run(["--provider", "unknown", "q"]);
   expect(p.exitCode).toBe(2);
   const err = p.stderr.toString();
   expect(err).toContain("bad_request: unknown provider");
-  for (const choice of ["typesafe", "openrouter", "gateway"]) expect(err).toContain(choice);
+  for (const choice of ["openrouter", "typesafe", "compatible", "cloudflare", "vercel"]) expect(err).toContain(choice);
   expect(err).toContain("use one of:"); // the grey hint line under the error
 });
 
-test("cli main: gateway without JEV_GATEWAY_URL exits 2 with its hint", () => {
-  const p = run(["--api", "gateway", "q"]);
+test("cli main: compatible without its endpoint exits 2 naming base_url and JEV_GATEWAY_URL", () => {
+  const p = run(["--provider", "compatible", "q"]);
   expect(p.exitCode).toBe(2);
   const err = p.stderr.toString();
-  expect(err).toContain("bad_request: gateway provider needs JEV_GATEWAY_URL");
-  expect(err).toContain("--api typesafe");
+  expect(err).toContain("bad_request: compatible needs its endpoint");
+  expect(err).toContain("JEV_GATEWAY_URL");
 });
 
 test("cli main: a non-numeric numeric flag exits 2 with the plain untyped rendering", () => {
@@ -150,7 +150,7 @@ test("cli main: a non-numeric numeric flag exits 2 with the plain untyped render
 // --json-errors opts into the object. The shapes are proven through the REAL
 // entrypoint: a localhost-only Bun.serve fake speaks the Jev System One protocol
 // for chunks and rows, so no network and no key files are touched; --no-cache
-// keeps ~/.cache/jgrep out of it.
+// keeps ~/.jgrep/cache.json out of it.
 
 const HIT_KEYS = ["end", "file", "p", "start", "text"]; // the exact v0.3.0 hit-object keys
 
@@ -185,7 +185,7 @@ test("cli main code: --json emits the bare v0.3.0 hit array ({file,start,end,p,t
   const server = startFakeGateway();
   try {
     const p = await spawn(
-      ["bun", "src/cli.ts", "--json", "--no-cache", "--api", "gateway", "swallows errors", "src/cli.ts"],
+      ["bun", "src/cli.ts", "--json", "--no-cache", "--provider", "compatible", "swallows errors", "src/cli.ts"],
       gatewayEnv(server.port),
     );
     expect(p.exitCode).toBe(0);
@@ -195,7 +195,7 @@ test("cli main code: --json emits the bare v0.3.0 hit array ({file,start,end,p,t
     for (const h of parsed) expect(Object.keys(h).sort()).toEqual(HIT_KEYS);
 
     const p2 = await spawn(
-      ["bun", "src/cli.ts", "--json-errors", "--no-cache", "--api", "gateway", "swallows errors", "src/cli.ts"],
+      ["bun", "src/cli.ts", "--json-errors", "--no-cache", "--provider", "compatible", "swallows errors", "src/cli.ts"],
       gatewayEnv(server.port),
     );
     expect(p2.exitCode).toBe(0);
@@ -219,7 +219,7 @@ test("cli main rows: --json emits the position-aligned flattened array; --json-e
     const csv = path.join(dir, "rows.csv");
     fs.writeFileSync(csv, "handle\n@a\n@b\n");
     const run = (extra: string[]) =>
-      spawn(["bun", "src/cli.ts", "--rows", csv, "beauty?", "--api", "gateway", "--no-cache", ...extra], gatewayEnv(server.port));
+      spawn(["bun", "src/cli.ts", "--rows", csv, "beauty?", "--provider", "compatible", "--no-cache", ...extra], gatewayEnv(server.port));
 
     const bare = await run(["--json"]);
     expect(bare.exitCode).toBe(0);
@@ -248,14 +248,14 @@ test("cli main: errored chunks/rows never enter the --json array (empty array / 
     const csv = path.join(dir, "rows.csv");
     fs.writeFileSync(csv, "handle\n@a\n@b\n");
     const p = await spawn(
-      ["bun", "src/cli.ts", "--json", "--no-cache", "--api", "gateway", "--retries", "0", "--timeout", "1", "swallows errors", "src/cli.ts"],
+      ["bun", "src/cli.ts", "--json", "--no-cache", "--provider", "compatible", "--retries", "0", "--timeout", "1", "swallows errors", "src/cli.ts"],
       dead,
     );
     expect(p.exitCode).toBe(2); // partial failure surfaced via the exit code, not the payload
     expect(JSON.parse(p.stdout)).toEqual([]); // no hits: the bare array is just empty
 
     const p2 = await spawn(
-      ["bun", "src/cli.ts", "--rows", csv, "beauty?", "--api", "gateway", "--retries", "0", "--timeout", "1", "--no-cache", "--json"],
+      ["bun", "src/cli.ts", "--rows", csv, "beauty?", "--provider", "compatible", "--retries", "0", "--timeout", "1", "--no-cache", "--json"],
       dead,
     );
     expect(p2.exitCode).toBe(2);
@@ -278,7 +278,7 @@ test("cli main rows single description: --out writes a CSV of the shown hits (no
     // --all so `shown` covers every scored row (threshold-only would still be a CSV);
     // no --json: this is the branch that used to ignore --out entirely.
     const p = await spawn(
-      ["bun", "src/cli.ts", "--rows", csv, "beauty?", "--api", "gateway", "--no-cache", "--all", "--out", out],
+      ["bun", "src/cli.ts", "--rows", csv, "beauty?", "--provider", "compatible", "--no-cache", "--all", "--out", out],
       gatewayEnv(server.port),
     );
     expect(p.exitCode).toBe(0);
@@ -318,7 +318,7 @@ test("cli main: an invalid JEV_PRICE_PER_MTOK is fatal before any request is mad
     const csv = path.join(dir, "rows.csv");
     fs.writeFileSync(csv, "handle\n@a\n@b\n");
     const p = await spawn(
-      ["bun", "src/cli.ts", "--rows", csv, "beauty?", "--api", "gateway", "--no-cache"],
+      ["bun", "src/cli.ts", "--rows", csv, "beauty?", "--provider", "compatible", "--no-cache"],
       { ...gatewayEnv(server.port), JEV_PRICE_PER_MTOK: "abc" },
     );
     expect(p.exitCode).toBe(2);
@@ -330,18 +330,78 @@ test("cli main: an invalid JEV_PRICE_PER_MTOK is fatal before any request is mad
   }
 }, 20_000);
 
-// ---- review n1: $JEV_MODEL / $JGREP_MODEL only when the id fits the provider ----------
 
-test("n1 modelFor: an env model id applies only when it fits the provider; --model always applies", async () => {
-  const { modelFor } = await import("./cli");
-  const { BACKENDS } = await import("./providers");
-  // OpenRouter ids are vendor/model; TypeSafe ids have no slash; a gateway takes anything
-  expect(modelFor(BACKENDS.openrouter, "", { JEV_MODEL: "typesafe/jev-1.13" })).toEqual({ model: "typesafe/jev-1.13" });
-  const ts = modelFor(BACKENDS.typesafe, "", { JEV_MODEL: "typesafe/jev-1.13" });
-  expect(ts.model).toBeUndefined(); // the provider default, not an id TypeSafe would reject
-  expect(ts.warning).toContain("JEV_MODEL");
-  expect(modelFor(BACKENDS.openrouter, "", { JGREP_MODEL: "jev-latest" }).warning).toContain("JGREP_MODEL");
-  expect(modelFor({ ...BACKENDS.gateway, url: "http://localhost/x" }, "", { JEV_MODEL: "llama3" })).toEqual({ model: "llama3" });
-  expect(modelFor(BACKENDS.typesafe, "anything/at-all", { JEV_MODEL: "x/y" })).toEqual({ model: "anything/at-all" }); // the flag is explicit
-  expect(modelFor(BACKENDS.typesafe, "", {})).toEqual({});
-});
+// ---- providers.json through the real entrypoint (TRDD-3KBUODCE) ----------------------------
+
+/** A temp jgrep home holding `providers` as providers.json (0600), and a clean env: no inherited key. */
+const homeEnv = async (providers: unknown[]) => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-cli-home-"));
+  fs.writeFileSync(path.join(home, "providers.json"), JSON.stringify({ version: 1, providers }), { mode: 0o600 });
+  return { home, env: { PATH: process.env.PATH ?? "", HOME: home, JGREP_HOME: home } as Record<string, string> };
+};
+
+test("cli status: the chain in file order with each entry's state, never a key; exit 0 only when one is usable", async () => {
+  const { env } = await homeEnv([
+    { name: "first", base_url: "https://jev.example.com", path: "/v1/systemone", adapter: "system-one", api_key: "first-literal-key-123", model: "m1" },
+    { name: "typesafe", enabled: "off" },
+    { name: "openrouter" },
+  ]);
+  const p = await spawn(["bun", "src/cli.ts", "status"], env);
+  expect(p.exitCode).toBe(0);
+  expect(p.stdout).toMatch(/^1\. first +key present \(not verified\) · key literal in providers\.json$/m); // no free check: never "ready"
+  expect(p.stdout).toMatch(/^2\. typesafe +disabled$/m);
+  expect(p.stdout).toMatch(/^3\. openrouter +key missing \(\$OPENROUTER_API_KEY\)$/m);
+  expect(p.stdout).not.toMatch(/^4\./m); // exactly the file's entries: no built-in appended
+  expect(p.stdout + p.stderr).not.toContain("first-literal-key-123");
+  const none = await spawn(["bun", "src/cli.ts", "status"], (await homeEnv([{ name: "openrouter" }])).env);
+  expect(none.exitCode).toBe(2);
+}, 20_000);
+
+test("cli fallback: a rejected first provider costs ONE request, the second answers, the summary says so, errors.log masks the key", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  let firstHits = 0;
+  const bad = Bun.serve({ port: 0, fetch: () => { firstHits++; return new Response(JSON.stringify({ error: { message: "invalid key first-literal-key-123" } }), { status: 401 }); } });
+  const good = startFakeGateway();
+  const { home, env } = await homeEnv([
+    { name: "first", base_url: `http://127.0.0.1:${bad.port}`, path: "/v1/systemone", adapter: "system-one", api_key: "first-literal-key-123", model: "m1" },
+    { name: "second", base_url: `http://127.0.0.1:${good.port}`, path: "/v1/systemone", adapter: "system-one", api_key: "$SECOND_KEY", model: "m2" },
+  ]);
+  try {
+    const p = await spawn(["bun", "src/cli.ts", "--no-cache", "-b", "1", "swallows errors", "src/errors.ts"], { ...env, SECOND_KEY: "second-key-456" });
+    expect(p.exitCode).toBe(0);
+    expect(firstHits).toBe(1); // the circuit breaker held the parallel requests behind the first
+    expect(p.stderr).toContain("fallback: first → second (invalid_api_key, HTTP 401) ×");
+    expect(p.stderr).toContain("answered by second (m2)");
+    const log = fs.readFileSync(path.join(home, "errors.log"), "utf8");
+    expect(log).toContain("provider=first model=m1 kind=invalid_api_key status=401 fallback=second");
+    for (const k of ["first-literal-key-123", "second-key-456"]) {
+      expect(log).not.toContain(k);
+      expect(p.stdout + p.stderr).not.toContain(k);
+    }
+  } finally {
+    bad.stop(true);
+    good.stop(true);
+  }
+}, 20_000);
+
+test("cli: the cache lives in ~/.jgrep; an old ~/.cache/jgrep/cache.json is named once as deletable and never touched", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-cli-cache-"));
+  const old = path.join(home, ".cache", "jgrep", "cache.json");
+  fs.mkdirSync(path.dirname(old), { recursive: true });
+  fs.writeFileSync(old, "{}");
+  const env = { PATH: process.env.PATH ?? "", HOME: home };
+  const first = await spawn(["bun", "src/cli.ts", "--estimate", "retries", "src/pool.ts"], env);
+  expect(first.exitCode).toBe(0);
+  expect(first.stderr).toContain(`the old ${old} is no longer used and can be deleted`);
+  expect(fs.existsSync(path.join(home, ".jgrep", "cache.json"))).toBe(true);
+  expect(fs.readFileSync(old, "utf8")).toBe("{}"); // never migrated, never deleted
+  const second = await spawn(["bun", "src/cli.ts", "--estimate", "retries", "src/pool.ts"], env);
+  expect(second.stderr).not.toContain("can be deleted"); // said once
+}, 20_000);

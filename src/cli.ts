@@ -3,10 +3,10 @@
 import fs from "node:fs";
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo; only createHash is used
 import { createHash } from "node:crypto";
-import { BudgetMeter, HARD_MAX_BYTES, chunkPaths, diffChunks, estimateLine, estimateTokens, gitDiff, jgrep, jgrepFuncs, loadCache, parseTagCategories, saveCache, type Estimate, type Hit, type Kind } from "./jgrep";
+import { BudgetMeter, HARD_MAX_BYTES, cacheFilePath, chunkPaths, diffChunks, estimateLine, estimateTokens, gitDiff, jgrep, jgrepFuncs, loadCache, parseTagCategories, saveCache, type Estimate, type Hit, type Kind } from "./jgrep";
 import { readRows, loadQuestions, scoreRows, flattenAnswers, toCsv } from "./rows";
 import { loadTests, selectTests } from "./tests";
-import { resolvePricePerMtok, resolveProvider, type Backend } from "./providers";
+import { errorsLogFile, resolveChain, resolvePricePerMtok, verifyApiKey, type Provider, type ProviderChain } from "./providers";
 import { JevProviderError } from "./errors";
 
 // Ambient so the file typechecks without node types (same pattern as providers.ts);
@@ -30,6 +30,7 @@ const VERSION = "0.7.0";
 export const USAGE = `jgrep ${VERSION} — semantic grep powered by Jev
 
 usage: jgrep init [--request-timeout <s>]   setup: provider, key (checked), agent skills
+       jgrep status [--provider <name>]     the provider chain and each one's state
        jgrep [options] "<description>" [path ...]
        jgrep [options] --diff [ref] "<description>"
        jgrep [options] --tests [ref] [--staged] [path ...]
@@ -38,8 +39,7 @@ usage: jgrep init [--request-timeout <s>]   setup: provider, key (checked), agen
 
 Describe the code in English; jgrep asks Jev one yes/no question per chunk and
 prints the chunks that match as file:line ranges with a probability p.
-Key: export OPENROUTER_API_KEY or TYPESAFE_API_KEY (or JEV_GATEWAY_API_KEY) in your
-shell profile; jgrep detects it. No env var? \`jgrep init\` stores a key file instead.
+Keys: export OPENROUTER_API_KEY (or another provider's key, below) or run \`jgrep init\`.
 
 search
   -t, --threshold <p>   print chunks with p >= this (default 0.7; 0.5 with --tests)
@@ -58,8 +58,7 @@ input and chunking
                         hard ceiling always skipped; a larger n exits 1)
       --follow-symlinks follow symlinks found while listing (default: skip and
                         report them); secret-looking names/targets stay refused
-      --no-cache        ignore and do not write the cache ($XDG_CACHE_HOME/jgrep
-                        or ~/.cache/jgrep)
+      --no-cache        ignore and do not write the cache (~/.jgrep/cache.json)
 
 output
       --json            hits as a JSON array [{file,start,end,p,text}] (v0.3.0 shape);
@@ -87,24 +86,25 @@ modes
                         of every row; prints the table with one column per question
   --group, --votes, --verify, --envelopes and --tag apply to code and --diff search
 
-provider and keys
-      --api <name>      typesafe | openrouter | gateway; precedence: --api > $JEV_API >
-                        the one \`jgrep init\` saved > the first with a key (typesafe,
-                        openrouter, gateway): an OpenRouter key alone selects OpenRouter
-      --model <id>      model id (default: the provider's; env JEV_MODEL, JGREP_MODEL)
-  key lookup per provider: env var > ~/.config/jgrep/<provider>.key (jgrep init)
-  > ~/.config/jgrep/env > ./.env of the project
+provider and keys (~/.jgrep/providers.json; \`jgrep status\` shows the chain)
+      --provider <name> only this provider, no fallback (env JEV_API)
+      --model <id>      model id, used where it fits a provider's ids (env JEV_MODEL,
+                        then JGREP_MODEL); other providers keep their own
+  providers.json: {"version":1,"providers":[{"name":"openrouter","api_key":
+  "$OPENROUTER_API_KEY"},{"name":"typesafe"}]}: array order = fallback order (no file:
+  openrouter, typesafe, compatible, cloudflare, vercel); a key, credit, model or
+  429/5xx failure moves the request on, logged to ~/.jgrep/errors.log (72 h); api_key
+  "$VAR" or a literal (chmod 600); "enabled": false skips one; every field: see
+  providers.example.json; key fallbacks: ~/.config/jgrep/{<name>.key,env}, ./.env
 
 environment
-  TYPESAFE_API_KEY      TypeSafe key
-  OPENROUTER_API_KEY    OpenRouter key
-  JEV_GATEWAY_URL       gateway: full System One endpoint, https:// or a loopback
-                        http:// server that needs no key (alias JGREP_ENDPOINT; process
-                        env only: under bun, a value bun loaded from ./.env is refused)
-  JEV_GATEWAY_API_KEY   gateway key
-  JEV_API               default provider (--api wins)
-  JEV_MODEL             default model id (alias JGREP_MODEL; --model wins; ignored
-                        with a warning when it does not fit the provider)
+  OPENROUTER_API_KEY    openrouter key; JEV_API_KEY or TYPESAFE_API_KEY: typesafe key
+  JEV_GATEWAY_URL       compatible: full System One endpoint when providers.json gives
+                        no base_url; https:// or a loopback http:// server that needs no
+                        key (alias JGREP_ENDPOINT; process env only, never ./.env)
+  JEV_GATEWAY_API_KEY   compatible key; AI_GATEWAY_API_KEY: vercel key
+  CLOUDFLARE_API_TOKEN  + CLOUDFLARE_ACCOUNT_ID: cloudflare (alias JEV_CLOUDFLARE_API_TOKEN)
+  JGREP_HOME            jgrep's home instead of ~/.jgrep (absolute path)
   JEV_BUDGET            default --budget in dollars (the flag wins)
   JEV_PRICE_PER_MTOK    dollars per million input tokens for --estimate, --budget and
                         the cost line when the provider reports none (default 0.042;
@@ -166,7 +166,7 @@ use cases:
       jgrep --diff origin/main --sarif "<rule>" > jgrep.sarif
   a local or Ollama System One server, no key, no code leaves the machine
       JEV_GATEWAY_URL=http://localhost:11434/v1/systemone \\
-        jgrep --api gateway --model <name> "<rule>" src/`;
+        jgrep --provider compatible --model <name> "<rule>" src/`;
 
 const tty = process.stdout.isTTY && !process.env.NO_COLOR;
 const c = (code: string, s: string) => (tty ? `\x1b[${code}m${s}\x1b[0m` : s);
@@ -185,7 +185,7 @@ export function parse(argv: string[]) {
     // `boolean | Estimate`, one omitted key away from `true.requests++` (audit, NaN silently).
     estimateOnly: false, sarif: false, envelopes: false, funcs: false, budget: null as number | null, followSymlinks: false, maxBytes: null as number | null,
     diff: null as string[] | null, rows: "", questions: "", out: "", tests: false, tag: "",
-    api: "", model: "", timeout: 15, requestTimeout: 30, retries: 4, rate: 0, failFast: false,
+    provider: "", model: "", timeout: 15, requestTimeout: 30, retries: 4, rate: 0, failFast: false,
   };
   const rest: string[] = [];
   const positionalsAfter = (i: number) => argv.slice(i + 1).filter((x) => !x.startsWith("-")).length;
@@ -210,7 +210,7 @@ export function parse(argv: string[]) {
     else if (a === "--no-cache") o.cache = false;
     else if (a === "--follow-symlinks") o.followSymlinks = true;
     else if (a === "--max-bytes") o.maxBytes = Number(argv[++i]);
-    else if (a === "--api") o.api = argv[++i] ?? "";
+    else if (a === "--provider") o.provider = argv[++i] ?? "";
     else if (a === "--model") o.model = argv[++i] ?? "";
     else if (a === "--timeout") o.timeout = Number(argv[++i]);
     else if (a === "--request-timeout") o.requestTimeout = Number(argv[++i]);
@@ -270,8 +270,7 @@ export function parse(argv: string[]) {
 
 /** Resolved provider + reliability options handed to BOTH jgrep() and scoreRows(). */
 interface Wiring {
-  backend: Backend;
-  model?: string;   // --model > $JEV_MODEL > $JGREP_MODEL > the backend's default (applied in jgrep/scoreRows)
+  chain: ProviderChain; // providers.json in fallback order (or the pinned one); models picked per provider
   timeoutSec: number;
   requestTimeoutSec: number;
   maxRetries: number;
@@ -380,19 +379,61 @@ export function toSarif(question: string, hits: Hit[]) {
   };
 }
 
-// ---- model selection (review n1) ---------------------------------------------------
-/** --model > $JEV_MODEL > $JGREP_MODEL > the backend default. The env vars are global
- *  (shell profile) while the provider can change per run, so an env id is applied only
- *  when it FITS the provider: OpenRouter ids are vendor/model, TypeSafe ids have no
- *  slash, a gateway takes anything. A misfit is ignored with a warning instead of being
- *  sent to a provider that rejects it. An explicit --model is always applied. */
-export function modelFor(backend: Backend, flag: string, env: Record<string, string | undefined>): { model?: string; warning?: string } {
-  if (flag) return { model: flag };
-  const name = env.JEV_MODEL ? "JEV_MODEL" : env.JGREP_MODEL ? "JGREP_MODEL" : undefined;
-  if (!name) return {};
-  const id = env[name]!;
-  const fits = backend.name === "gateway" || (backend.name === "openrouter") === id.includes("/");
-  return fits ? { model: id } : { warning: `warning: ignoring ${name}=${id} — not a ${backend.name} model id; using ${backend.model} (pass --model to force it)` };
+// ---- providers: the fallback note and `jgrep status` (TRDD-3KBUODCE) -----------------
+/** After the summary, when the chain moved: which providers and models answered, and every
+ *  fallback with its reason (user decision: the run reports fallbacks). Silent otherwise. */
+function chainNote(chain: ProviderChain) {
+  if (!chain.fallbacks.size) return;
+  const list = (m: Map<string, number>) => [...m].map(([k, n]) => `${k} ×${n}`).join(", ");
+  console.error(c("33", `fallback: ${list(chain.fallbacks)} · answered by ${list(chain.used) || "none"} · details in ${errorsLogFile()}`));
+}
+
+/** One status line: what a provider's key check says, never the key. A provider without a
+ *  free check is never called "ready": its key is only known to be set. */
+async function statusText(p: Provider, timeoutMs: number): Promise<{ ok: boolean; text: string }> {
+  if (p.state === "disabled") return { ok: false, text: "disabled" };
+  if (p.state === "no-url") return { ok: false, text: "not configured (no base_url)" };
+  if (p.state === "no-account") return { ok: false, text: `account id missing (${(p.acctTried ?? []).join(", ")})` };
+  if (p.state === "no-key") return { ok: false, text: `key missing (${p.tried.join(", ") || "no api_key"})` };
+  if (!p.key) return { ok: true, text: `no key needed (local server, not checked) · model ${p.model}` };
+  if (!p.verify) return { ok: true, text: `key present (not verified) · key ${p.keySource}` };
+  const r = await verifyApiKey(p, p.key, { timeoutMs });
+  const st = r.status === "ok" ? "ready" : r.status === "no_credits" ? `no credits (HTTP ${r.http})`
+    : r.http === 401 || r.http === 403 ? `rejected (HTTP ${r.http})` : r.http === 0 ? "unreachable" : `check failed (HTTP ${r.http})`;
+  // unreachable still counts: the key is there, and a new key would not fix the network
+  return { ok: st === "ready" || st === "unreachable", text: `${st} · key ${p.keySource}${st === "ready" ? ` · model ${p.model}` : ""}` };
+}
+
+/** `jgrep status [--provider <name>] [--request-timeout <s>]`: the chain in order, each entry's
+ *  state (free GET key checks only, never a billed ping). Exit 0 when a provider is usable. */
+async function statusMain(argv: string[]) {
+  const o = { provider: "", requestTimeoutSec: 15 };
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--provider") o.provider = argv[++i] ?? "";
+    else if (argv[i] === "--request-timeout") o.requestTimeoutSec = Number(argv[++i]);
+    else throw new Error(`unknown option ${argv[i]} for jgrep status (it takes --provider <name> and --request-timeout <s>)`);
+  }
+  if (!Number.isFinite(o.requestTimeoutSec) || o.requestTimeoutSec <= 0) throw new Error("request-timeout must be a positive number");
+  // resolveChain validates the file and the pin (unknown or disabled: exit 2), like a search.
+  const { providers, file, exists } = resolveChain({ pin: o.provider, version: VERSION });
+  const pinned = o.provider.trim() || process.env.JEV_API?.trim();
+  const shown = pinned ? providers.filter((p) => p.name === pinned) : providers;
+  const rows = await Promise.all(shown.map(async (p) => ({ p, ...(await statusText(p, o.requestTimeoutSec * 1000)) })));
+  const w = Math.max(...rows.map((r) => r.p.name.length));
+  console.log(`providers, in fallback order (${exists ? file : "built-in: no providers.json yet"}):`);
+  for (const [i, r] of rows.entries()) console.log(`${i + 1}. ${r.p.name.padEnd(w)}  ${r.text}`);
+  process.exitCode = rows.some((r) => r.ok) ? 0 : 2;
+}
+
+/** The cache moved to ~/.jgrep (user decision: one home). Nothing is migrated or deleted:
+ *  while the new cache does not exist yet, say once that the old file can be deleted. */
+function noteOldCache() {
+  if (fs.existsSync(cacheFilePath())) return;
+  const xdg = process.env.XDG_CACHE_HOME?.trim();
+  const home = process.env.HOME ?? "";
+  for (const old of [xdg?.startsWith("/") ? `${xdg}/jgrep/cache.json` : "", home ? `${home}/.cache/jgrep/cache.json` : ""]) {
+    if (old && fs.existsSync(old)) { console.error(c("90", `note: jgrep's cache is now ${cacheFilePath()}; the old ${old} is no longer used and can be deleted`)); return; }
+  }
 }
 
 // ---- --budget (WI-7) ---------------------------------------------------------------
@@ -412,10 +453,13 @@ export function resolveBudgetEnv(env: Record<string, string | undefined>): numbe
 
 async function main() {
   if (process.argv[2] === "init") { const { init } = await import("./init"); return init(process.argv.slice(3)); }
+  if (process.argv[2] === "status") return statusMain(process.argv.slice(3));
   const o = parse(process.argv.slice(2));
-  // Provider resolution before anything else: unknown --api, or gateway without
-  // JEV_GATEWAY_URL, throws JevProviderError straight to the catch (exit 2).
-  const backend = resolveProvider(o.api || undefined);
+  // Provider resolution before anything else: a malformed providers.json, an unknown or
+  // disabled --provider, or compatible without its endpoint throws JevProviderError straight
+  // to the catch (exit 2). A missing key is reported at the first request, so --estimate and
+  // fully cached runs need none.
+  const { chain } = resolveChain({ pin: o.provider, model: o.model || undefined, version: VERSION, warn: (m) => console.error(c("33", m)) });
   // Resolve (and validate) the price up front, BOTH modes: an invalid
   // JEV_PRICE_PER_MTOK must be fatal before the run can bill anything, not at
   // summary time when the tokens have already been spent.
@@ -423,12 +467,10 @@ async function main() {
   // No startup probe (upstream design): OpenRouter is on its stable /api/v1/systemone path,
   // and the first batch's error goes through the typed classifier (401 invalid key, 402
   // credits, retries for transients) — a separate billed ping only misreported those.
-  // JGREP_MODEL is upstream's name for the same override (#19); JEV_MODEL wins when both are set.
-  const picked = modelFor(backend, o.model, process.env);
-  if (picked.warning) console.error(c("33", picked.warning));
+  // The model per provider (--model > JEV_MODEL > JGREP_MODEL, where it fits) is picked in
+  // resolveChain; a misfit is warned about when that provider is first used.
   const wiring: Wiring = {
-    backend,
-    model: picked.model,
+    chain,
     timeoutSec: o.timeout, requestTimeoutSec: o.requestTimeout, maxRetries: o.retries,
     ratePerSec: o.rate || undefined, failFast: o.failFast, pricePerMtok,
     estimate: o.estimateOnly ? { requests: 0, chars: 0, files: {} } : undefined,
@@ -436,6 +478,7 @@ async function main() {
     budget: o.budget ?? resolveBudgetEnv(process.env), // --budget (WI-7): flag > $JEV_BUDGET > unlimited
   };
   if (wiring.budget !== undefined) wiring.meter = new BudgetMeter(wiring.budget, pricePerMtok);
+  if (o.cache) noteOldCache();
   // Symlinks found while listing are skipped unless asked (USER: "an option to follow
   // symlinks or not"); the flag or JGREP_FOLLOW_SYMLINKS=1 turns following on.
   o.followSymlinks ||= process.env.JGREP_FOLLOW_SYMLINKS === "1";
@@ -530,6 +573,7 @@ async function main() {
     console.error(c("90", r.errors.length ? summary + erroredSuffix(r.errors) : summary));
     printExamples(r.errors.map((e) => ({ line: `  ${e.kind}: ${e.file}:${e.start}-${e.end} ${e.message.slice(0, 120)}`, hint: e.hint })));
     warnUnderpriced(wiring);
+    chainNote(wiring.chain);
     // grep semantics when clean; 2 when any chunk errored (partial failure).
     process.exitCode = r.errors.length > 0 ? 2 : (r.hits.length > 0 ? 0 : 1);
   } finally {
@@ -539,9 +583,9 @@ async function main() {
   }
 }
 
-/** Upstream's --tests mode, wired through the fork's provider plumbing: backend,
- *  model, timeouts, pacing and the price come from the shared Wiring (resolved in
- *  main()), the API key stays lazy inside selectTests (scoreRows pattern). Errors are
+/** Upstream's --tests mode, wired through the fork's provider plumbing: the provider
+ *  chain, timeouts, pacing and the price come from the shared Wiring (resolved in
+ *  main()); keys are only demanded at the first request (scoreRows pattern). Errors are
  *  isolated per batch like the other modes (upstream's pool-based selectTests). */
 async function testsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
   const t0 = Date.now();
@@ -570,6 +614,7 @@ async function testsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
     console.error(c("90", r.errors.length ? summary + erroredSuffix(r.errors) : summary));
     printExamples(r.errors.map((e) => ({ line: `  ${e.kind}: ${e.file} ${e.message.slice(0, 120)}`, hint: e.hint })));
     warnUnderpriced(wiring);
+    chainNote(wiring.chain);
     // grep semantics when clean; 2 when any batch errored (partial failure) — same rule as code mode.
     process.exitCode = r.errors.length > 0 ? 2 : (r.selected.length ? 0 : 1);
   } finally {
@@ -641,6 +686,7 @@ async function rowsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
     console.error(c("90", r.errors.length ? summary + erroredSuffix(r.errors) : summary));
     printExamples(r.errors.map((e) => ({ line: `  ${e.kind}: row ${e.row} ${e.message.slice(0, 120)}`, hint: e.hint })));
     warnUnderpriced(wiring);
+    chainNote(wiring.chain);
     if (wrote) console.error(c("90", `wrote ${o.out}`));
     // grep semantics when clean; 2 when any row errored (partial failure) — same rule as code mode.
     process.exitCode = r.errors.length > 0 ? 2 : (o.questions || hits ? 0 : 1);

@@ -145,9 +145,9 @@ jobs:
           # $ARGS is deliberately unquoted: it is "" or "--limit N", and the word
           # split is what turns it into two argv entries for the bench scripts.
           # shellcheck disable=SC2086
-          bun bench/accuracy.ts --fixture all --api typesafe $ARGS 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || status=1
+          bun bench/accuracy.ts --fixture all --provider typesafe $ARGS 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || status=1
           # shellcheck disable=SC2086
-          bun bench/code_selection.ts --api typesafe $ARGS 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || status=1
+          bun bench/code_selection.ts --provider typesafe $ARGS 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || status=1
           exit $status
 
       # ---- openrouter ----------------------------------------------------------
@@ -190,9 +190,9 @@ jobs:
           # $ARGS is deliberately unquoted: it is "" or "--limit N", and the word
           # split is what turns it into two argv entries for the bench scripts.
           # shellcheck disable=SC2086
-          bun bench/accuracy.ts --fixture all --api openrouter $ARGS 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || status=1
+          bun bench/accuracy.ts --fixture all --provider openrouter $ARGS 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || status=1
           # shellcheck disable=SC2086
-          bun bench/code_selection.ts --api openrouter $ARGS 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || status=1
+          bun bench/code_selection.ts --provider openrouter $ARGS 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || status=1
           exit $status
 
       # ---- artifacts -----------------------------------------------------------

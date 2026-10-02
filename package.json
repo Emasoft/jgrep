@@ -11,7 +11,7 @@
   "bin": {
     "jgrep": "dist/jgrep.js"
   },
-  "files": ["dist", "skills", "README.md", "LICENSE", "CHANGELOG.md"],
+  "files": ["dist", "skills", "providers.example.json", "README.md", "LICENSE", "CHANGELOG.md"],
   "engines": {
     "node": ">=18"
   },

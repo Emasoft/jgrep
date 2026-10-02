@@ -5,7 +5,7 @@
 // everywhere, so the lazy key resolver never touches the filesystem); the CLI surface
 // (parse flags, the estimate table, the budget stop summary, SARIF end-to-end) runs the
 // real entrypoint against a localhost-only fake gateway — no network, no key files,
-// --no-cache so ~/.cache/jgrep stays out of it.
+// --no-cache so ~/.jgrep/cache.json stays out of it.
 // @ts-expect-error — no bun-types in this zero-dep repo; Bun provides bun:test at runtime
 import { test, expect } from "bun:test";
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo; the surface used is trivial
@@ -236,7 +236,7 @@ test("cli e2e: --sarif emits a valid SARIF 2.1.0 object whose results are the hi
   const server = startBigUsageGateway();
   try {
     const p = await spawn(
-      ["bun", "src/cli.ts", "--sarif", "--no-cache", "--api", "gateway", "swallows errors", "src/cli.ts"],
+      ["bun", "src/cli.ts", "--sarif", "--no-cache", "--provider", "compatible", "swallows errors", "src/cli.ts"],
       gatewayEnv(server.port),
     );
     expect(p.exitCode).toBe(0);
@@ -260,7 +260,7 @@ test("cli e2e: --budget stops the run — summary names the stop, un-run chunks 
   const server = startBigUsageGateway();
   try {
     const p = await spawn(
-      ["bun", "src/cli.ts", "--json", "--no-cache", "-c", "1", "--api", "gateway", "--budget", "0.001", "swallows errors", "src/cli.ts"],
+      ["bun", "src/cli.ts", "--json", "--no-cache", "-c", "1", "--provider", "compatible", "--budget", "0.001", "swallows errors", "src/cli.ts"],
       gatewayEnv(server.port),
     );
     expect(p.exitCode).toBe(2); // un-run chunks errored: partial-failure semantics
@@ -293,7 +293,7 @@ test("cli e2e: --envelopes reaches the request body ([numbers: …] in the judge
   try {
     fs.writeFileSync(path.join(dir, "n.ts"), "export const retries = 42;\nexport const delay = 7;\nexport const more = 1;\nexport const x = 2;\nexport const y = 3;\n");
     const p = await spawn(
-      ["bun", "src/cli.ts", "--no-cache", "--envelopes", "--api", "gateway", "many retries", dir],
+      ["bun", "src/cli.ts", "--no-cache", "--envelopes", "--provider", "compatible", "many retries", dir],
       gatewayEnv(server.port),
     );
     expect(p.exitCode).toBe(0);
@@ -358,10 +358,10 @@ test("BudgetMeter: tracks the provider's observed $/Mtok and warns only when it 
 test("cli e2e: --budget with JEV_PRICE_PER_MTOK below the billed rate prints one under-pricing warning", async () => {
   const server = startPriceyGateway();
   try {
-    const p = await spawn(["bun", "src/cli.ts", "--no-cache", "--api", "gateway", "--budget", "100", "swallows errors", "src/errors.ts"], gatewayEnv(server.port));
+    const p = await spawn(["bun", "src/cli.ts", "--no-cache", "--provider", "compatible", "--budget", "100", "swallows errors", "src/errors.ts"], gatewayEnv(server.port));
     expect(p.stderr).toMatch(/warning: the provider billed ~\$0\.42\d*\/Mtok/);
     expect(p.stderr).toContain("JEV_PRICE_PER_MTOK");
-    const q = await spawn(["bun", "src/cli.ts", "--no-cache", "--api", "gateway", "swallows errors", "src/errors.ts"], gatewayEnv(server.port));
+    const q = await spawn(["bun", "src/cli.ts", "--no-cache", "--provider", "compatible", "swallows errors", "src/errors.ts"], gatewayEnv(server.port));
     expect(q.stderr).not.toContain("warning: the provider billed"); // no budget: nothing is reserved, nothing to warn about
   } finally {
     server.stop(true);
@@ -391,7 +391,7 @@ test("cli e2e: a hostile chunk's escape sequences never reach the terminal (prev
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-esc-"));
   try {
     fs.writeFileSync(path.join(dir, "evil.ts"), "const x = 1; // \x1b]0;pwned\x07 title hijack\nconst y = 2; // \x1b[2J clear screen\n");
-    const p = await spawn(["bun", "src/cli.ts", "--no-cache", "--api", "gateway", "-C", "anything", path.join(dir, "evil.ts")], gatewayEnv(server.port));
+    const p = await spawn(["bun", "src/cli.ts", "--no-cache", "--provider", "compatible", "-C", "anything", path.join(dir, "evil.ts")], gatewayEnv(server.port));
     expect(p.exitCode).toBe(0);
     expect(p.stdout).toContain("title hijack");
     expect(p.stdout).not.toContain("\x1b");

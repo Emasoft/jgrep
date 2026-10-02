@@ -1,7 +1,7 @@
 // WI-6 cache tests: whitespace-normalized keys, atomic tmp+rename writes, the
 // 10,000-entry oldest-first cap, and the legacy flat-cache migration. All disk
 // traffic goes through loadCache/saveCache's optional `file` test seam (temp
-// dirs) — the real ~/.cache/jgrep is never touched, and jgrep()/scoreRows()
+// dirs) — the real ~/.jgrep/cache.json is never touched, and jgrep()/scoreRows()
 // run with an explicit apiKey + fake fetch so no key resolution happens.
 import fs from "node:fs";
 import os from "node:os";
@@ -316,9 +316,9 @@ test("saveCache: a failed save warns once on stderr instead of failing silently"
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("cacheFilePath: honours an absolute XDG_CACHE_HOME, ignores a relative one", async () => {
+test("cacheFilePath: jgrep's home (TRDD-3KBUODCE): $JGREP_HOME/cache.json, else ~/.jgrep/cache.json; XDG_CACHE_HOME no longer counts", async () => {
   const { cacheFilePath } = await import("./jgrep");
-  expect(cacheFilePath({ XDG_CACHE_HOME: "/var/xdg" }, "/home/u")).toBe(path.join("/var/xdg", "jgrep", "cache.json"));
-  expect(cacheFilePath({ XDG_CACHE_HOME: "rel/dir" }, "/home/u")).toBe(path.join("/home/u", ".cache", "jgrep", "cache.json"));
-  expect(cacheFilePath({}, "/home/u")).toBe(path.join("/home/u", ".cache", "jgrep", "cache.json"));
+  expect(cacheFilePath({}, "/home/u")).toBe(path.join("/home/u", ".jgrep", "cache.json"));
+  expect(cacheFilePath({ JGREP_HOME: "/var/jh" }, "/home/u")).toBe(path.join("/var/jh", "cache.json"));
+  expect(cacheFilePath({ XDG_CACHE_HOME: "/var/xdg" }, "/home/u")).toBe(path.join("/home/u", ".jgrep", "cache.json"));
 });

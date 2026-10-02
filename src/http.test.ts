@@ -115,13 +115,13 @@ test("permanent 400 -> bad_request after exactly one call, zero sleeps", async (
   expect(sleeps.length).toBe(0);
 });
 
-test("402 -> insufficient_credits with billing URL and --api typesafe hint", async () => {
+test("402 -> insufficient_credits with billing URL and --provider typesafe hint", async () => {
   const { fetchImpl } = scriptedFetch(() => resp(402, "no credits"));
   const e = await errOf(postSystemOne({}, BACKENDS.openrouter, "k", { fetchImpl }));
   expect(e.kind).toBe("insufficient_credits");
   expect(e.retryable).toBe(false);
   expect(e.hint).toContain("https://openrouter.ai/credits");
-  expect(e.hint).toContain("--api typesafe");
+  expect(e.hint).toContain("--provider typesafe");
 });
 
 test("401 -> invalid_api_key naming the provider's key env and key file", async () => {
@@ -138,7 +138,7 @@ test("404 and model-not-found bodies -> model_unavailable without retries", asyn
   const e1 = await errOf(postSystemOne({}, BACKENDS.typesafe, "k", { fetchImpl: missing.fetchImpl }));
   expect(e1.kind).toBe("model_unavailable");
   expect(e1.hint).toContain("--model");
-  expect(e1.hint).toContain("--api typesafe");
+  expect(e1.hint).toContain("--provider typesafe");
   expect(missing.calls.length).toBe(1);
 
   const bodyHit = scriptedFetch(() => resp(502, "Error: no endpoints found for this model"));
@@ -456,14 +456,15 @@ test("postSystemOne + limiter: an expired batch deadline is thrown by the limite
 
 // ---- verifyApiKey ----
 
-test("verifyApiKey (typesafe/gateway): ok path parses the model and sends the ping payload", async () => {
+test("verifyApiKey (no free check: compatible): ok path parses the model and sends the ping payload", async () => {
+  const gw = { ...BACKENDS.compatible, url: "https://gw.example.com/v1/systemone" };
   const { calls, fetchImpl } = scriptedFetch(() => resp(200, { model: "jev-latest", answers: {} }));
-  const r = await verifyApiKey(BACKENDS.typesafe, "k", { fetchImpl });
+  const r = await verifyApiKey(gw, "k", { fetchImpl });
   expect(r.status).toBe("ok");
   expect(r.http).toBe(200);
   expect(r.model).toBe("jev-latest");
   expect(calls.length).toBe(1);
-  expect(calls[0].url).toBe(BACKENDS.typesafe.url);
+  expect(calls[0].url).toBe(gw.url);
   expect(calls[0].init.method).toBe("POST");
   expect(JSON.parse(calls[0].init.body!)).toEqual({
     model: "jev-latest",
@@ -471,6 +472,14 @@ test("verifyApiKey (typesafe/gateway): ok path parses the model and sends the pi
     questions: { ok: { type: "noul", instructions: "Is the state the word ping?" } },
   });
   expect(calls[0].init.headers).toMatchObject({ Authorization: "Bearer k", "Content-Type": "application/json" });
+});
+
+test("verifyApiKey: TypeSafe and Cloudflare keys are checked with their FREE GET route, never a billed ping", async () => {
+  for (const [b, url] of [[BACKENDS.typesafe, "https://api.typesafe.ai/v1/models"], [BACKENDS.cloudflare, "https://api.cloudflare.com/client/v4/user/tokens/verify"]] as const) {
+    const { calls, fetchImpl } = scriptedFetch(() => resp(200, { success: true }));
+    expect((await verifyApiKey(b, "k", { fetchImpl })).status).toBe("ok");
+    expect(calls.map((c) => [c.url, c.init.method, c.init.body])).toEqual([[url, "GET", undefined]]);
+  }
 });
 
 test("verifyApiKey (review m2): OpenRouter is checked with the FREE GET /api/v1/key, never a billed ping", async () => {
@@ -556,10 +565,10 @@ test("m6: a Retry-After longer than the batch deadline reports rate_limited with
 test("n3: the insufficient_credits hint never suggests the backend already in use", async () => {
   const { fetchImpl } = scriptedFetch(() => resp(402, "no credits"));
   const ts = await errOf(postSystemOne({}, BACKENDS.typesafe, "k", { fetchImpl }));
-  expect(ts.hint).not.toContain("--api typesafe");
-  expect(ts.hint).toContain("--api openrouter");
+  expect(ts.hint).not.toContain("--provider typesafe");
+  expect(ts.hint).toContain("--provider openrouter");
   const or = await errOf(postSystemOne({}, BACKENDS.openrouter, "k", { fetchImpl }));
-  expect(or.hint).toContain("--api typesafe");
+  expect(or.hint).toContain("--provider typesafe");
 });
 
 declare const Bun: { serve(o: { port: number; fetch(r: Request): Response | Promise<Response> }): { port: number; stop(force?: boolean): void } };
@@ -568,7 +577,7 @@ test("redirects are never followed: a 3xx endpoint fails fast (fatal, no retries
   let hits = 0;
   const server = Bun.serve({ port: 0, fetch: () => { hits++; return new Response("", { status: 302, headers: { location: "https://example.com/steal" } }); } });
   try {
-    const gw = { ...BACKENDS.gateway, url: `http://127.0.0.1:${server.port}/v1/systemone` };
+    const gw = { ...BACKENDS.compatible, url: `http://127.0.0.1:${server.port}/v1/systemone` };
     const e = await errOf(postSystemOne({}, gw, "k", { maxRetries: 3, sleep: async () => {} }));
     expect(e.retryable).toBe(false);
     expect(e.kind).toBe("server_unreachable");

@@ -19,7 +19,7 @@ import fs from "node:fs";
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo
 import path from "node:path";
 import { scoreRows, type Answer, type Questions, type Row } from "../src/rows";
-import { resolveApiKey, resolvePricePerMtok, resolveProvider, type Backend, type Fetch } from "../src/providers";
+import { resolveChain, resolvePricePerMtok, type Backend, type Fetch } from "../src/providers";
 import { JevProviderError } from "../src/errors";
 
 // Ambient so the file typechecks without node types (same pattern as cli.ts);
@@ -54,8 +54,8 @@ usage: bun bench/code_selection.ts [options]
 
   --limit <n>       first n cases — smoke mode, costs pennies (0 = all 20)
   --cases <n>       alias for --limit
-  --api <name>      provider: typesafe | openrouter | gateway
-                    precedence: --api > $JEV_API > first key found (typesafe first)
+  --provider <name> the provider to measure (default: the first ready one of
+                    ~/.jgrep/providers.json, or of the built-in chain; env JEV_API)
   --model <id>      model id override (default: the provider's default)
   --out <dir>       results directory (default bench/results, next to this script)
   --rate <req/s>    request pacing (token bucket); cases run sequentially, one
@@ -77,10 +77,10 @@ exit status: 0 clean, 2 on error or when any case errored.
 examples:
   bun bench/code_selection.ts --limit 2              # smoke: 2 cases, < $0.01
   bun bench/code_selection.ts --rate 5
-  OPENROUTER_API_KEY=sk-or-... bun bench/code_selection.ts --api openrouter`;
+  OPENROUTER_API_KEY=sk-or-... bun bench/code_selection.ts --provider openrouter`;
 
 export interface BenchArgs {
-  limit: number; api: string; model: string; out: string;
+  limit: number; provider: string; model: string; out: string;
   rate: number; retries: number; timeout: number; failFast: boolean;
 }
 
@@ -88,12 +88,12 @@ export interface BenchArgs {
  *  here; --limit is the accuracy.ts name and --cases is the code_selection alias
  *  (last occurrence wins). */
 export function parse(argv: string[]): BenchArgs {
-  const o: BenchArgs = { limit: 0, api: "", model: "", out: "", rate: 0, retries: 4, timeout: 15, failFast: false };
+  const o: BenchArgs = { limit: 0, provider: "", model: "", out: "", rate: 0, retries: 4, timeout: 15, failFast: false };
   const rest: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--limit" || a === "--cases") o.limit = Number(argv[++i]);
-    else if (a === "--api") o.api = argv[++i] ?? "";
+    else if (a === "--provider") o.provider = argv[++i] ?? "";
     else if (a === "--model") o.model = argv[++i] ?? "";
     else if (a === "--out") o.out = argv[++i] ?? "";
     else if (a === "--rate") o.rate = Number(argv[++i]);
@@ -340,12 +340,13 @@ export function writeResult(outDir: string, base: string, r: SelectionResult): s
 
 async function main() {
   const o = parse(process.argv.slice(2));
-  // Provider resolution before anything else (§1.4 precedence): unknown --api, a
-  // gateway without JEV_GATEWAY_URL, or a missing key throws the typed
-  // JevProviderError straight to the catch (exit 2, hint under the message).
-  const backend = resolveProvider(o.api || undefined);
-  const apiKey = resolveApiKey(backend);
-  const model = o.model || backend.model;
+  // Provider resolution before anything else: a benchmark measures ONE provider, the head
+  // of the providers.json chain (or the pinned one). A malformed file, an unknown provider
+  // or a missing key throws the typed JevProviderError straight to the catch (exit 2).
+  const head = resolveChain({ pin: o.provider || undefined, model: o.model || undefined, version: "bench" }).chain.head();
+  const backend = head.backend;
+  const apiKey = head.key();
+  const model = head.model;
   const pricePerMtok = resolvePricePerMtok();
   const allCases = await loadCases(CASES_FILE);
   const cases = o.limit > 0 ? allCases.slice(0, o.limit) : allCases;

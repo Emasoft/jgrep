@@ -1,10 +1,10 @@
 // bench/accuracy.ts — WI-8 accuracy harness: SMS spam-vs-ham + AG News 4-way
 // precision/recall, ported from the sibling tool's accuracy.py idea on top of the
-// existing rows machinery (scoreRows) and the WI-1 provider layer
-// (resolveProvider/resolveApiKey). Zero new deps, Bun-only: `bun bench/accuracy.ts`.
+// existing rows machinery (scoreRows) and the provider layer (resolveChain: the head
+// of ~/.jgrep/providers.json). Zero new deps, Bun-only: `bun bench/accuracy.ts`.
 //
-// Hermetic behavior: with no key anywhere, resolveApiKey throws the standard
-// missing-key enumeration error (exit 2) — no fake fallback provider. `--limit N`
+// Hermetic behavior: with no key anywhere, the chain throws the standard missing-key
+// error (exit 2) — no fake fallback provider, and no fallback during a measurement. `--limit N`
 // caps the rows per class so a smoke run costs pennies. Answers go into a
 // THROWAWAY cache object that is never persisted: repeated runs always measure
 // true accuracy, and nothing is ever written outside --out (default bench/results —
@@ -14,7 +14,7 @@ import fs from "node:fs";
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo
 import path from "node:path";
 import { readRows, scoreRows, type Answer, type Questions, type Row, type RowError } from "../src/rows";
-import { resolveApiKey, resolvePricePerMtok, resolveProvider, type Backend, type Fetch } from "../src/providers";
+import { resolveChain, resolvePricePerMtok, type Backend, type Fetch } from "../src/providers";
 import { JevProviderError } from "../src/errors";
 
 // Ambient so the file typechecks without node types (same pattern as cli.ts);
@@ -45,8 +45,8 @@ const USAGE = `jgrep bench/accuracy.ts v${VERSION} — SMS + AG News precision/r
 usage: bun bench/accuracy.ts [options]
 
   --fixture <name>  sms | agnews | all (default all)
-  --api <name>      provider: typesafe | openrouter | gateway
-                    precedence: --api > $JEV_API > first key found (typesafe first)
+  --provider <name> the provider to measure (default: the first ready one of
+                    ~/.jgrep/providers.json, or of the built-in chain; env JEV_API)
   --model <id>      model id override (default: the provider's default)
   --limit <n>       first n rows per class — smoke mode, costs pennies (0 = all)
   --out <dir>       results directory (default bench/results, next to this script)
@@ -67,22 +67,22 @@ exit status: 0 clean, 2 on error or when any row errored.
 examples:
   bun bench/accuracy.ts --fixture sms --limit 2          # smoke: 4 rows, < $0.01
   bun bench/accuracy.ts --fixture all --rate 5
-  OPENROUTER_API_KEY=sk-or-... bun bench/accuracy.ts --api openrouter`;
+  OPENROUTER_API_KEY=sk-or-... bun bench/accuracy.ts --provider openrouter`;
 
 export interface BenchArgs {
-  fixture: string; api: string; model: string; limit: number; out: string;
+  fixture: string; provider: string; model: string; limit: number; out: string;
   rate: number; retries: number; timeout: number; failFast: boolean;
 }
 
 /** Same flag-parsing style as src/cli.ts: numerics validated here, the fixture enum
  *  too (a bench-local closed set — no typed provider error to defer to main). */
 export function parse(argv: string[]): BenchArgs {
-  const o: BenchArgs = { fixture: "all", api: "", model: "", limit: 0, out: "", rate: 0, retries: 4, timeout: 15, failFast: false };
+  const o: BenchArgs = { fixture: "all", provider: "", model: "", limit: 0, out: "", rate: 0, retries: 4, timeout: 15, failFast: false };
   const rest: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--fixture") o.fixture = argv[++i] ?? "";
-    else if (a === "--api") o.api = argv[++i] ?? "";
+    else if (a === "--provider") o.provider = argv[++i] ?? "";
     else if (a === "--model") o.model = argv[++i] ?? "";
     else if (a === "--limit") o.limit = Number(argv[++i]);
     else if (a === "--out") o.out = argv[++i] ?? "";
@@ -352,12 +352,13 @@ export function writeResult(outDir: string, base: string, r: FixtureResult): str
 
 async function main() {
   const o = parse(process.argv.slice(2));
-  // Provider resolution before anything else (§1.4 precedence): unknown --api, a
-  // gateway without JEV_GATEWAY_URL, or a missing key throws the typed
-  // JevProviderError straight to the catch (exit 2, hint under the message).
-  const backend = resolveProvider(o.api || undefined);
-  const apiKey = resolveApiKey(backend);
-  const model = o.model || backend.model;
+  // Provider resolution before anything else: a benchmark measures ONE provider, the head
+  // of the providers.json chain (or the pinned one). A malformed file, an unknown provider
+  // or a missing key throws the typed JevProviderError straight to the catch (exit 2).
+  const head = resolveChain({ pin: o.provider || undefined, model: o.model || undefined, version: "bench" }).chain.head();
+  const backend = head.backend;
+  const apiKey = head.key();
+  const model = head.model;
   const pricePerMtok = resolvePricePerMtok();
   const specs = o.fixture === "all" ? [FIXTURES.sms, FIXTURES.agnews] : [FIXTURES[o.fixture as "sms" | "agnews"]];
   const outDir = o.out || DEFAULT_OUT;

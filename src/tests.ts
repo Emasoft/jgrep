@@ -3,10 +3,9 @@
 // tests worth running first. Tests that map to a changed file by name are
 // selected in code without asking.
 //
-// Fork adaptation: requests go through providers.ts' multi-backend
-// postSystemOne(body, backend, apiKey, opts). Backend/model resolution, the lazy
-// API-key lookup and the PostOpts wiring follow scoreRows() in rows.ts; the cache
-// key is scoped by the RESOLVED model id, the same rule every other mode uses.
+// Fork adaptation: requests go through the providers.ts chain (providers.json, with
+// fallback). The chain, the lazy API-key lookup and the PostOpts wiring follow scoreRows()
+// in rows.ts; the cache key is scoped by the model that answered, the rule every mode uses.
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -15,7 +14,7 @@ import {
   DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, KEY_WORKED_EARLIER_HINT,
   BudgetMeter, MAX_REQUEST_BYTES, byteLen, diffHeaderPath, fitChunk, lineWindows, listFiles, packBatches, settledCost, splitLongLine, withinSize, type Cache, type Estimate, type ListOptions,
 } from "./jgrep";
-import { BACKENDS, DEFAULT_PRICE_PER_MTOK, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
+import { chainFor, DEFAULT_PRICE_PER_MTOK, RateLimiter, type Backend, type Fetch, type PostOpts, type ProviderChain } from "./providers";
 import { runPool, type PoolResult } from "./pool";
 import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
 
@@ -195,6 +194,7 @@ export interface SelectOptions {
   threshold: number; batch: number; concurrency: number;
   apiKey?: string;             // explicit key wins; else resolved lazily at the first request (scoreRows pattern)
   backend?: Backend; model?: string;
+  chain?: ProviderChain;       // the CLI's providers.json chain (TRDD-3KBUODCE); wins over backend/model/apiKey
   timeoutSec?: number;         // per-batch deadline, retries included (defaults shared with jgrep)
   requestTimeoutSec?: number;  // per attempt
   maxRetries?: number;         // failed attempts tolerated before the final error
@@ -219,11 +219,10 @@ interface BatchOutcome { index: number; entries: { unit: number; p: number }[]; 
 export const SIG_PART_BYTES = 8_000;
 
 export async function selectTests(diff: string, tests: TestFile[], o: SelectOptions): Promise<SelectResult> {
-  // Same resolution as scoreRows(): explicit backend wins, else typesafe; --model > $JEV_MODEL > the backend's default.
-  const backend = o.backend ?? BACKENDS.typesafe;
-  const model = o.model ?? backend.model;
-  let apiKey = o.apiKey;
-  const apiKeyOf = (): string => { apiKey ??= resolveApiKey(backend); return apiKey; };
+  // Same chain rule as jgrep()/scoreRows(): the CLI's providers.json chain, else one backend with a lazy key.
+  const chain = chainFor(o);
+  const model = chain.model();
+  const models = chain.models(); // a cached verdict from any model of the chain is served, the head's first
   const f = o.fetchImpl ?? fetch;
   const cache = o.cache ?? {};
   const changed = changedFilesOf(diff);
@@ -238,11 +237,12 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
   const parts = compactDiffParts(diff);
   const partHash = parts.map((d) => createHash("sha1").update(d).digest("hex"));
   const sigParts = (t: TestFile) => (t.signature ? fitChunk({ file: t.file, start: 1, end: 1, text: t.signature }, "code", SIG_PART_BYTES).map((c) => c.text) : [""]);
-  // Model-scoped keys (same rule as jgrep()/rows): a different model re-judges.
-  const key = (file: string, part: number, sig: string) => createHash("sha1").update(`${model}\0tests\0${partHash[part]}\0${file}\0${sig}`).digest("hex");
+  // Model-scoped keys (same rule as jgrep()/rows): a different model re-judges. Lookups use
+  // the first live provider's model; an answer is stored under the model that gave it.
+  const key = (file: string, part: number, sig: string, m: string = model) => createHash("sha1").update(`${m}\0tests\0${partHash[part]}\0${file}\0${sig}`).digest("hex");
 
   const all: (Selected | undefined)[] = new Array(tests.length); // errored tests stay unset
-  const units: { test: number; part: number; sig: string; key: string }[] = [];
+  const units: { test: number; part: number; sig: string }[] = [];
   const best = new Map<number, number>();      // test -> best p so far (cached + answered units)
   const pending = new Map<number, number>();   // test -> units still to be judged
   let fromCache = 0;
@@ -252,10 +252,9 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
     if (viaPackage.has(t.file)) { all[i] = { file: t.file, p: 1, reason: "package" }; return; }
     let open = 0;
     for (let k = 0; k < parts.length; k++) for (const sig of sigParts(t)) {
-      const ck = key(t.file, k, sig);
-      const p = cache[ck];
+      const p = models.map((m) => cache[key(t.file, k, sig, m)]).find((x) => typeof x === "number" && Number.isFinite(x));
       if (typeof p === "number" && Number.isFinite(p)) best.set(i, Math.max(best.get(i) ?? -Infinity, p));
-      else { units.push({ test: i, part: k, sig, key: ck }); open++; }
+      else { units.push({ test: i, part: k, sig }); open++; }
     }
     if (open === 0) { all[i] = { file: t.file, p: best.get(i)!, reason: "cached" }; fromCache++; }
     else pending.set(i, open);
@@ -298,13 +297,11 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
       questions[`t${j}`] = { type: "noul", instructions: `Look only at the test file with id "t${j}". Given the diff, is this test plausibly affected by the change: it imports or exercises a changed module or function, or asserts behaviour the diff alters? Unrelated tests should be no.` };
     });
     const req = { model, state, questions };
-    // --estimate: count before apiKeyOf() so a dry run needs no key.
+    // --estimate: count before any provider is asked, so a dry run needs no key.
     if (o.estimate) { o.estimate.requests++; o.estimate.chars += JSON.stringify(req).length; return { index, entries: [], malformed: [] }; }
-    const go = () => postSystemOne(req, backend, apiKeyOf(), {
-      ...post,
-      deadlineMs: Date.now() + timeoutMs, // per-batch deadline, retries included
-    });
-    const res = await (meter ? meter.run(req, backend.name, go) : go()); // throws budget_exhausted unsent
+    // per-batch deadline per provider, retries included; one budget reservation per request
+    const go = () => chain.post(req, post, timeoutMs);
+    const res = await (meter ? meter.run(req, chain.name(), go) : go()); // throws budget_exhausted unsent
     tokens += res.usage?.input_tokens ?? 0;
     cost = (cost ?? 0) + settledCost(res, price);
     // Finite p-values go straight into the in-memory cache object: cli.ts persists it in
@@ -314,7 +311,8 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
     b.forEach((ui, j) => {
       const p = res.answers[`t${j}`]?.noul;
       if (typeof p === "number" && Number.isFinite(p)) {
-        cache[units[ui].key] = p;
+        const u = units[ui];
+        cache[key(tests[u.test].file, u.part, u.sig, res.via.model)] = p; // the model that answered
         entries.push({ unit: ui, p });
       } else malformed.push(ui);
     });

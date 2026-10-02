@@ -15,9 +15,10 @@ description: >-
 # jgrep
 
 `jgrep "<description in English>" [paths]` asks a fast decision model (Jev, via
-TypeSafe, OpenRouter or a self-hosted gateway) one yes/no question per 5-60 line
-chunk and prints the chunks that match. It never reads files into your context:
-you get a short list, then you Read only the ranges you need.
+OpenRouter, TypeSafe, a compatible endpoint, Cloudflare or Vercel) one yes/no
+question per 5-60 line chunk and prints the chunks that match. It never reads
+files into your context: you get a short list, then you Read only the ranges you
+need.
 
 ## Setup
 
@@ -28,13 +29,15 @@ and stop; do not install it yourself. The user's install command:
 curl -fsSL https://raw.githubusercontent.com/Emasoft/jgrep/main/install-dev.sh | bash -s -- --choice 8
 ```
 
-The API key comes from the environment: the user exports `OPENROUTER_API_KEY`
-or `TYPESAFE_API_KEY` (or `JEV_GATEWAY_API_KEY` with `JEV_GATEWAY_URL`) in their
-shell profile and jgrep detects it; an OpenRouter key alone selects OpenRouter.
-Never put a key on the command line. Only a user without such an env var needs
-`jgrep init` (it stores `~/.config/jgrep/<provider>.key`). If jgrep reports
-"No <provider> API key found. Looked in: …", tell the user rather than working
-around it.
+Providers are listed in `~/.jgrep/providers.json`, in fallback order (no file:
+openrouter, typesafe, compatible, cloudflare, vercel). Each entry's key is an env
+var (`"api_key": "$OPENROUTER_API_KEY"`) or a literal key; a provider whose key is
+unset is skipped, and a request that fails on a rejected key, no credits, a missing
+model or a 429/5xx moves to the next provider. `jgrep status` lists the chain and
+each provider's state. Never put a key on the command line and never edit the
+user's providers.json yourself: if jgrep reports "no provider is ready" or "No
+<provider> API key found", tell the user (they export a key or run `jgrep init`)
+rather than working around it. Errors are logged to `~/.jgrep/errors.log` (72 h).
 
 ## When to use it instead of grep or reading files
 
@@ -73,6 +76,7 @@ status, examples and use cases:
 jgrep 0.7.0 — semantic grep powered by Jev
 
 usage: jgrep init [--request-timeout <s>]   setup: provider, key (checked), agent skills
+       jgrep status [--provider <name>]     the provider chain and each one's state
        jgrep [options] "<description>" [path ...]
        jgrep [options] --diff [ref] "<description>"
        jgrep [options] --tests [ref] [--staged] [path ...]
@@ -81,8 +85,7 @@ usage: jgrep init [--request-timeout <s>]   setup: provider, key (checked), agen
 
 Describe the code in English; jgrep asks Jev one yes/no question per chunk and
 prints the chunks that match as file:line ranges with a probability p.
-Key: export OPENROUTER_API_KEY or TYPESAFE_API_KEY (or JEV_GATEWAY_API_KEY) in your
-shell profile; jgrep detects it. No env var? `jgrep init` stores a key file instead.
+Keys: export OPENROUTER_API_KEY (or another provider's key, below) or run `jgrep init`.
 
 search
   -t, --threshold <p>   print chunks with p >= this (default 0.7; 0.5 with --tests)
@@ -101,8 +104,7 @@ input and chunking
                         hard ceiling always skipped; a larger n exits 1)
       --follow-symlinks follow symlinks found while listing (default: skip and
                         report them); secret-looking names/targets stay refused
-      --no-cache        ignore and do not write the cache ($XDG_CACHE_HOME/jgrep
-                        or ~/.cache/jgrep)
+      --no-cache        ignore and do not write the cache (~/.jgrep/cache.json)
 
 output
       --json            hits as a JSON array [{file,start,end,p,text}] (v0.3.0 shape);
@@ -130,24 +132,25 @@ modes
                         of every row; prints the table with one column per question
   --group, --votes, --verify, --envelopes and --tag apply to code and --diff search
 
-provider and keys
-      --api <name>      typesafe | openrouter | gateway; precedence: --api > $JEV_API >
-                        the one `jgrep init` saved > the first with a key (typesafe,
-                        openrouter, gateway): an OpenRouter key alone selects OpenRouter
-      --model <id>      model id (default: the provider's; env JEV_MODEL, JGREP_MODEL)
-  key lookup per provider: env var > ~/.config/jgrep/<provider>.key (jgrep init)
-  > ~/.config/jgrep/env > ./.env of the project
+provider and keys (~/.jgrep/providers.json; `jgrep status` shows the chain)
+      --provider <name> only this provider, no fallback (env JEV_API)
+      --model <id>      model id, used where it fits a provider's ids (env JEV_MODEL,
+                        then JGREP_MODEL); other providers keep their own
+  providers.json: {"version":1,"providers":[{"name":"openrouter","api_key":
+  "$OPENROUTER_API_KEY"},{"name":"typesafe"}]}: array order = fallback order (no file:
+  openrouter, typesafe, compatible, cloudflare, vercel); a key, credit, model or
+  429/5xx failure moves the request on, logged to ~/.jgrep/errors.log (72 h); api_key
+  "$VAR" or a literal (chmod 600); "enabled": false skips one; every field: see
+  providers.example.json; key fallbacks: ~/.config/jgrep/{<name>.key,env}, ./.env
 
 environment
-  TYPESAFE_API_KEY      TypeSafe key
-  OPENROUTER_API_KEY    OpenRouter key
-  JEV_GATEWAY_URL       gateway: full System One endpoint, https:// or a loopback
-                        http:// server that needs no key (alias JGREP_ENDPOINT; process
-                        env only: under bun, a value bun loaded from ./.env is refused)
-  JEV_GATEWAY_API_KEY   gateway key
-  JEV_API               default provider (--api wins)
-  JEV_MODEL             default model id (alias JGREP_MODEL; --model wins; ignored
-                        with a warning when it does not fit the provider)
+  OPENROUTER_API_KEY    openrouter key; JEV_API_KEY or TYPESAFE_API_KEY: typesafe key
+  JEV_GATEWAY_URL       compatible: full System One endpoint when providers.json gives
+                        no base_url; https:// or a loopback http:// server that needs no
+                        key (alias JGREP_ENDPOINT; process env only, never ./.env)
+  JEV_GATEWAY_API_KEY   compatible key; AI_GATEWAY_API_KEY: vercel key
+  CLOUDFLARE_API_TOKEN  + CLOUDFLARE_ACCOUNT_ID: cloudflare (alias JEV_CLOUDFLARE_API_TOKEN)
+  JGREP_HOME            jgrep's home instead of ~/.jgrep (absolute path)
   JEV_BUDGET            default --budget in dollars (the flag wins)
   JEV_PRICE_PER_MTOK    dollars per million input tokens for --estimate, --budget and
                         the cost line when the provider reports none (default 0.042;
@@ -209,7 +212,7 @@ use cases:
       jgrep --diff origin/main --sarif "<rule>" > jgrep.sarif
   a local or Ollama System One server, no key, no code leaves the machine
       JEV_GATEWAY_URL=http://localhost:11434/v1/systemone \
-        jgrep --api gateway --model <name> "<rule>" src/
+        jgrep --provider compatible --model <name> "<rule>" src/
 ```
 
 ## Reading results
@@ -262,11 +265,12 @@ array). Use it to label, triage or filter records instead of reading them one by
 
 ## Cache and cost
 
-Answers are cached by (model, question, chunk) in `~/.cache/jgrep/` (or
-`$XDG_CACHE_HOME/jgrep/`), so a re-run is free. Trailing whitespace, blank lines
-and line endings do not re-bill; any change in content or leading indentation
-does. Cost is settled per request: the provider's reported number, else input
-tokens × `$JEV_PRICE_PER_MTOK` (default $0.042 per million, output free).
+Answers are cached by (model, question, chunk) in `~/.jgrep/cache.json`, so a
+re-run is free; an answer a fallback provider gave is cached under its own model.
+Trailing whitespace, blank lines and line endings do not re-bill; any change in
+content or leading indentation does. Cost is settled per request: the provider's
+reported number, else input tokens × the entry's `usd_per_mtok` or
+`$JEV_PRICE_PER_MTOK` (default $0.042 per million, output free).
 `--budget` covers every mode and is as exact as the estimate (about 15%); with
 `--funcs`, `--estimate` prints pass 1 and an upper bound for pass 2.
 
@@ -277,5 +281,5 @@ binaries are skipped. Symlinks found while listing are skipped and reported;
 pass `--follow-symlinks` only when the user wants them (secret-looking links stay
 refused). Nothing is truncated to fit Jev's context: big chunks are split and a
 per-file verdict takes the best part. Run the installed `jgrep` (node), not
-`bun src/cli.ts`, in an untrusted repo: under bun a gateway URL that came from
-the repo's `./.env` is refused.
+`bun src/cli.ts`, in an untrusted repo: under bun a compatible endpoint, a
+provider pin or a jgrep home that came from the repo's `./.env` is refused.

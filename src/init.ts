@@ -1,12 +1,13 @@
-// `jgrep init`: interactive setup. Provider -> gateway URL (gateway only) -> key
-// (keep-existing or paste+verify) -> where to store -> agent skills via the vercel
-// `skills` universal installer (opt-in) -> star prompt. Every step is skippable
-// with ctrl-c.
+// `jgrep init`: interactive setup. Provider -> its endpoint (compatible) or account id
+// (cloudflare) when needed -> key (keep-existing or paste+verify) -> save it in
+// ~/.jgrep/providers.json -> put the provider first in the fallback chain (optional) ->
+// agent skills via the vercel `skills` universal installer (opt-in) -> star prompt. Every
+// step is skippable with ctrl-c.
 //
-// Step 8: per-provider key setup. The wizard provisions any of the three backends
-// (typesafe / openrouter / gateway) instead of assuming TypeSafe. The interactive
-// steps stay in this file; the branch logic is extracted into exported pure
-// helpers (gatewayBackend, keyPromptMessage, storageLine, ...) so init.test.ts can
+// TRDD-3KBUODCE: init writes ~/.jgrep/providers.json (0600 in a 0700 home, atomic) and
+// nothing else. The old key stores (~/.config/jgrep/*.key, the legacy env file, ./.env) are
+// still READ as fallbacks (user decision) but never written. The interactive steps stay in
+// this file; the branch logic is extracted into exported pure helpers so init.test.ts can
 // cover every branch without mocking @clack.
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo; the surface used is trivial
 import fs from "node:fs";
@@ -20,57 +21,64 @@ import { fileURLToPath } from "node:url";
 import { execFile, spawnSync } from "node:child_process";
 import * as p from "@clack/prompts";
 import {
-  BACKENDS, PROVIDER_URLS, envIsGitignored, isLoopbackHttp, keyFilePath, legacyEnvFile, resolveApiKey, verifyApiKey,
-  writeKeyFile, type Backend,
+  BUILTINS, buildEntries, builtinDoc, isLoopbackHttp, loadProviders, providersFile, readProvidersDoc, verifyApiKey, writeFileAtomic,
+  type Backend, type ProviderEntry,
 } from "./providers";
 
 // Ambient so the file typechecks without node types (same pattern as providers.ts/cli.ts);
 // keep all process usage to this shape.
-declare const process: { platform: string; exit(code: number): never };
+declare const process: { platform: string; env: Record<string, string | undefined>; exit(code: number): never };
 
 export const REPO_URL = "https://github.com/Emasoft/jgrep";
 const SKILL_SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "skills", "jgrep", "SKILL.md");
 
 // ---- wizard data + pure helpers (tested in init.test.ts) ----------------------
 
-/** First wizard step: which System One-speaking provider to provision (default typesafe). */
-export const PROVIDER_CHOICES: { value: Backend["name"]; label: string }[] = [
+/** First wizard step: which built-in provider to set up. The order is the built-in chain
+ *  (openrouter first, as the user decided), so the default is the chain head. */
+export const PROVIDER_CHOICES: { value: string; label: string }[] = [
+  { value: "openrouter", label: "OpenRouter — Jev via openrouter.ai/api/v1/systemone" },
   { value: "typesafe", label: "TypeSafe — api.typesafe.ai, the original System One provider" },
-  { value: "openrouter", label: "OpenRouter — same Jev protocol via openrouter.ai/api/v1/systemone" },
-  { value: "gateway", label: "Self-hosted gateway — any System One endpoint (e.g. LiteLLM)" },
+  { value: "compatible", label: "Compatible — any System One endpoint (self-hosted gateway, e.g. LiteLLM)" },
+  { value: "cloudflare", label: "Cloudflare Workers AI — needs an API token and the account id" },
+  { value: "vercel", label: "Vercel AI Gateway — needs an AI Gateway key" },
 ];
 
-/** Validated gateway backend: a copy of BACKENDS.gateway with `url` set. Throws a plain
- *  Error with a clear message on a non-URL or non-http(s) value — the wizard re-prompts. */
-export function gatewayBackend(url: string): Backend {
+/** The compatible entry's endpoint from the full System One URL the user pastes: the origin
+ *  becomes base_url and the path becomes path. Throws a plain Error with a clear message on a
+ *  non-URL, a query/credential, or plain http to a remote host — the wizard re-prompts. */
+export function compatibleEndpoint(url: string): { base_url: string; path: string } {
   const trimmed = url.trim();
   let parsed: URL;
   try { parsed = new URL(trimmed); } catch {
     throw new Error(`not a valid URL: "${trimmed || "(empty)"}" — expected the full System One endpoint, e.g. https://gw.example.com/v1/systemone`);
   }
   if (parsed.protocol !== "https:" && !isLoopbackHttp(trimmed)) {
-    throw new Error(`the gateway URL must be https:// (or http:// on localhost), got "${trimmed}"`);
+    throw new Error(`the endpoint must be https:// (or http:// on localhost), got "${trimmed}"`);
   }
-  return { ...BACKENDS.gateway, url: trimmed };
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error("the endpoint must not hold a user name, password, query or fragment");
+  return { base_url: parsed.origin, path: parsed.pathname };
 }
 
 /** Paste-prompt text per provider (pure): names where to get the key. */
-export function keyPromptMessage(backend: Backend): string {
-  switch (backend.name) {
-    case "typesafe": return `Paste your TypeSafe API key (get one at ${PROVIDER_URLS.typesafe.console})`;
-    case "openrouter": return "Paste your OpenRouter API key (get one at https://openrouter.ai/keys)";
-    case "gateway": return "Paste your gateway API key (or the value your gateway expects in Authorization: Bearer)";
+export function keyPromptMessage(name: string): string {
+  switch (name) {
+    case "typesafe": return "Paste your TypeSafe API key (get one at https://console.typesafe.ai)";
+    case "openrouter": return "Paste your OpenRouter API key (get one at https://openrouter.ai/settings/keys)";
+    case "cloudflare": return "Paste your Cloudflare API token (Workers AI permission; https://dash.cloudflare.com/profile/api-tokens)";
+    case "vercel": return "Paste your Vercel AI Gateway API key";
+    default: return `Paste your ${name} API key (the value the endpoint expects in Authorization: Bearer)`;
   }
 }
 
 /** Confirm text when a key for the chosen provider is already resolvable. */
-export function existingKeyMessage(backend: Backend, key: string): string {
-  return `A ${backend.name} key is already configured (…${key.slice(-4)}). Keep it?`;
+export function existingKeyMessage(name: string, key: string, source: string): string {
+  return `A ${name} key is already configured (…${key.slice(-4)}, from ${source}). Keep it?`;
 }
 
-/** Spinner text for the verify step — names the actual backend host, never a hardcoded one. */
+/** Spinner text for the verify step — names the actual host checked, never a hardcoded one. */
 export function verifyHost(backend: Backend): string {
-  return `Checking the key against ${new URL(backend.url).host}`;
+  return `Checking the key against ${new URL(backend.verify ?? backend.url).host}`;
 }
 
 /** Extra hint after a rejected key: a 404 usually means the floating model id needs
@@ -79,46 +87,43 @@ export function rejectionHint(status: number): string | undefined {
   return status === 404 ? "the provider may need an explicit --model version" : undefined;
 }
 
-/** Storage choices for a NEW key; the first entry is the select's default. */
-export type StorageChoice = "keyfile" | "legacy" | "project" | "none";
-
-export function storageOptions(backend: Backend): { value: StorageChoice; label: string; hint?: string }[] {
-  return [
-    { value: "keyfile", label: keyFilePath(backend.name), hint: "recommended: per-provider file, mode 600" },
-    { value: "legacy", label: legacyEnvFile(), hint: "legacy global env file, works in every project" },
-    { value: "project", label: "./.env in this directory", hint: "add .env to .gitignore" },
-    { value: "none", label: "Don't save", hint: `I'll export ${backend.keyEnv} myself` },
-  ];
-}
-
-/** "Where the key went" human summary per storage choice (pure; init logs it after the IO). */
-export function storageLine(backend: Backend, choice: string, homeDir: string = os.homedir()): string {
-  switch (choice) {
-    case "keyfile": return `Saved to ${keyFilePath(backend.name, homeDir)} (mode 600)`;
-    case "legacy": return `Saved to ${legacyEnvFile(homeDir)} (${backend.keyEnv}, mode 600)`;
-    case "project": return `Appended ${backend.keyEnv} to ./.env`;
-    case "none":
-    default: return `Not saved. Use: export ${backend.keyEnv}=…`;
-  }
-}
-
 /** Outro: the model in play (the one the key just verified against when fresh, else
- *  the backend default) via the chosen provider. */
+ *  the provider default) via the chosen provider. */
 export function outroLine(backend: Backend, verifiedModel?: string): string {
   return `Ready (${verifiedModel ?? backend.model} via ${backend.name}).`;
 }
 
-/** Pure: next content of the legacy ~/.config/jgrep/env — drop any stale line for
- *  keyEnv (first-match-wins parsing would otherwise resurrect an old key on a
- *  re-run), keep every other line (other providers' entries survive), append
- *  `KEYENV=<key>`. Tolerates `export `/quotes like the parser in providers.ts. */
-export function mergeLegacyEnv(existing: string | null, keyEnv: string, key: string): string {
-  const kept = (existing ?? "").split(/\r?\n/).filter((l) => {
-    const m = /^\s*(?:export\s+)?([\w.]+)\s*=/.exec(l);
-    return m?.[1] !== keyEnv;
-  });
-  while (kept.length > 0 && kept[kept.length - 1].trim() === "") kept.pop(); // no blank-line pile-up
-  return [...kept, `${keyEnv}=${key}`].join("\n") + "\n";
+/** Pure: `doc` with `fields` merged into the entry named `name` (appended when missing) and,
+ *  with `first`, that entry moved to the front of the chain. Every other entry, and the order
+ *  of the rest, stays exactly as the user wrote it (the order is their fallback chain). */
+export function withEntry(doc: { version: 1; providers: ProviderEntry[] }, name: string, fields: Partial<ProviderEntry>, first = false): { version: 1; providers: ProviderEntry[] } {
+  const providers = doc.providers.map((e) => ({ ...e }));
+  let entry = providers.find((e) => e.name === name);
+  if (!entry) { entry = { name }; providers.push(entry); }
+  Object.assign(entry, fields);
+  if (first) { providers.splice(providers.indexOf(entry), 1); providers.unshift(entry); }
+  return { ...doc, providers };
+}
+
+/** Write providers.json (0600 in a 0700 home, temp file + rename) after validating it the way
+ *  every run will read it: a file init writes must never stop the next search. Returns the path. */
+export function saveProviders(doc: { version: 1; providers: ProviderEntry[] }, env: Record<string, string | undefined> = process.env, homeDir: string = os.homedir()): string {
+  const file = providersFile(env, homeDir);
+  buildEntries(doc, file);
+  writeFileAtomic(file, `${JSON.stringify(doc, null, 2)}\n`);
+  // Mode bits do not exist there: the key file is only as private as the user's profile folder.
+  if (process.platform === "win32") console.error(`warning: chmod 600 is a no-op on Windows — protect ${path.dirname(file)} manually`);
+  return file;
+}
+
+/** The current providers.json as a document init can edit, or every built-in by name when there
+ *  is none yet (so the whole chain is visible and editable). A broken file stops init here,
+ *  before any prompt: init never overwrites what it could not read. */
+export function currentDoc(env: Record<string, string | undefined> = process.env, homeDir: string = os.homedir()): { doc: { version: 1; providers: ProviderEntry[] }; exists: boolean } {
+  const doc = readProvidersDoc(env, homeDir);
+  if (doc === null) return { doc: builtinDoc(), exists: false };
+  buildEntries(doc, providersFile(env, homeDir));
+  return { doc: doc as { version: 1; providers: ProviderEntry[] }, exists: true };
 }
 
 /** The vercel `skills` installer, pinned (audit: `npx -y skills` ran whatever version npm
@@ -163,33 +168,6 @@ export function legacySkillCopies(home: string): string[] {
     .filter((f) => fs.existsSync(f));
 }
 
-// ---- wizard plumbing ----------------------------------------------------------
-
-// Legacy global storage (~/.config/jgrep/env, `KEYENV=<key>`): the file+format the
-// pre-0.4 wizard wrote, preserved so existing installs keep working. Step 8
-// generalizes it to any provider's keyEnv; mergeLegacyEnv does the content math.
-// chmod after the write: `mode` only applies when the file is created, so a pre-existing
-// 0644 env file stayed world-readable (audit).
-export function saveLegacyEnvKey(keyEnv: string, key: string, homeDir: string = os.homedir()): string {
-  const file = legacyEnvFile(homeDir);
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  fs.chmodSync(path.dirname(file), 0o700);
-  let existing: string | null = null;
-  try { existing = fs.readFileSync(file, "utf8"); } catch { /* new file */ }
-  fs.writeFileSync(file, mergeLegacyEnv(existing, keyEnv, key), { mode: 0o600 });
-  fs.chmodSync(file, 0o600);
-  return file;
-}
-
-/** Review m1: remember the provider picked in the wizard (and a gateway's URL) in
- *  ~/.config/jgrep/env, which resolveProvider reads after --api and $JEV_API — before,
- *  only the key was saved, so the next plain run auto-detected another provider (or, for
- *  a gateway, failed for lack of JEV_GATEWAY_URL) and the "Ready (... via X)" outro lied. */
-export function saveProviderChoice(backend: Backend, homeDir: string = os.homedir()): string {
-  const file = saveLegacyEnvKey("JEV_API", backend.name, homeDir);
-  if (backend.name === "gateway") saveLegacyEnvKey("JEV_GATEWAY_URL", backend.url, homeDir);
-  return file;
-}
 
 /** `jgrep init [--request-timeout <s>]` (review n4: the key check now honours the same
  *  per-attempt timeout flag as a search; default 15 s). */
@@ -202,18 +180,6 @@ export function parseInitArgs(argv: string[]): { requestTimeoutSec: number } {
     } else throw new Error(`unknown option ${argv[i]} for jgrep init (it takes only --request-timeout <s>)`);
   }
   return o;
-}
-
-/** "./.env in this directory" storage: append `KEYENV=<key>` on its OWN line (a file whose
- *  last line has no newline used to get the key glued onto it — review n6) and chmod 0600,
- *  since the file now holds a secret (audit). */
-export function saveProjectEnvKey(cwd: string, keyEnv: string, key: string): string {
-  const file = path.join(cwd, ".env");
-  let existing = "";
-  try { existing = fs.readFileSync(file, "utf8"); } catch { /* new file */ }
-  fs.appendFileSync(file, `${existing && !existing.endsWith("\n") ? "\n" : ""}${keyEnv}=${key}\n`, { mode: 0o600 });
-  fs.chmodSync(file, 0o600);
-  return file;
 }
 
 function bail(msg = "Setup cancelled."): never {
@@ -231,54 +197,65 @@ function openUrl(url: string) {
 export async function init(argv: string[] = []) {
   const { requestTimeoutSec } = parseInitArgs(argv);
   p.intro("jgrep init");
+  const current = currentDoc();
+  const exists = current.exists;
+  let doc = current.doc;
 
-  // 1. provider (new first step — any of the three backends can be provisioned)
-  const provider = guard<Backend["name"]>(await p.select({
+  // 1. provider (default: the head of the built-in chain)
+  const name = guard<string>(await p.select({
     message: "Which provider should jgrep use?",
-    initialValue: "typesafe",
+    initialValue: PROVIDER_CHOICES[0].value,
     options: PROVIDER_CHOICES,
   }));
-  let backend: Backend = { ...BACKENDS[provider] };
-  if (provider === "gateway") {
-    // gateway needs the full System One endpoint; clack re-prompts on a validate error
+  const builtin = BUILTINS.find((b) => b.name === name)!;
+  const entry = (): ProviderEntry => doc.providers.find((e) => e.name === name) ?? { name };
+
+  // 1b. what the provider needs besides a key: compatible its endpoint, cloudflare its account id
+  if (name === "compatible" && entry().base_url === undefined && !process.env.JEV_GATEWAY_URL?.trim() && !process.env.JGREP_ENDPOINT?.trim()) {
     const url = guard<string>(await p.text({
-      message: "Gateway URL (the full System One endpoint, e.g. https://gw.example.com/v1/systemone)",
+      message: "Endpoint (the full System One URL, e.g. https://gw.example.com/v1/systemone)",
       placeholder: "https://gw.example.com/v1/systemone",
       validate: (v) => {
-        try { gatewayBackend(v ?? ""); return undefined; }
+        try { compatibleEndpoint(v ?? ""); return undefined; }
         catch (e) { return (e as Error).message; }
       },
-    })).trim();
-    backend = gatewayBackend(url);
+    }));
+    doc = withEntry(doc, name, compatibleEndpoint(url));
   }
+  if (name === "cloudflare" && entry().account_id === undefined && !process.env.CLOUDFLARE_ACCOUNT_ID?.trim()) {
+    const id = guard<string>(await p.text({
+      message: "Cloudflare account id (dash.cloudflare.com, right sidebar of any zone)",
+      validate: (v) => (/^[A-Za-z0-9]{1,64}$/.test(v?.trim() ?? "") ? undefined : "1-64 letters or digits"),
+    })).trim();
+    doc = withEntry(doc, name, { account_id: id });
+  }
+  // The provider as the next run will see it, with this (unsaved) document.
+  const provider = () => loadProviders(process.env, os.homedir(), ".", withEntry(doc, name, {})).providers.find((x) => x.name === name)!;
 
   // 2. key: keep the existing one, or paste + verify (loop with a retry confirm)
-  let existing: string | undefined;
-  try { existing = resolveApiKey(backend); } catch { /* none — expected */ }
-  if (existing) {
-    const keep = guard<boolean>(await p.confirm({
-      message: existingKeyMessage(backend, existing),
-      initialValue: true,
-    }));
-    if (!keep) existing = undefined;
+  const now = provider();
+  // A local System One server (loopback http) needs no key: nothing to ask or store.
+  let apiKey: string | undefined = !now.key && isLoopbackHttp(now.url) ? "" : undefined;
+  if (apiKey === undefined && now.key) {
+    const keep = guard<boolean>(await p.confirm({ message: existingKeyMessage(name, now.key, now.keySource), initialValue: true }));
+    if (keep) apiKey = now.key;
   }
-
-  let apiKey = existing;
+  const fresh = apiKey === undefined;
   let model: string | undefined;
-  while (!apiKey) {
+  while (apiKey === undefined) {
     const typed = guard<string>(await p.password({
-      message: keyPromptMessage(backend),
+      message: keyPromptMessage(name),
       validate: (v) => (v?.trim() ? undefined : "The key is required: jgrep cannot run without it."),
     })).trim();
     const s = p.spinner();
-    s.start(verifyHost(backend));
-    // verifyApiKey never throws (review m2: the old catch here was dead code). Only
-    // "rejected" means a bad key; an empty account or an unreachable provider is not.
-    const r = await verifyApiKey(backend, typed, { timeoutMs: requestTimeoutSec * 1000 });
-    if (r.status === "ok") { s.stop(`Key accepted (${r.model ?? backend.name})`); apiKey = typed; model = r.model; }
+    s.start(verifyHost(now));
+    // verifyApiKey never throws (review m2). Only "rejected" means a bad key; an empty
+    // account or an unreachable provider is not.
+    const r = await verifyApiKey(now, typed, { timeoutMs: requestTimeoutSec * 1000 });
+    if (r.status === "ok") { s.stop(`Key accepted (${r.model ?? name})`); apiKey = typed; model = r.model; }
     else if (r.status === "no_credits") {
       s.stop("Key accepted — but the account has no credits (HTTP 402)");
-      p.log.warn(`top up at ${PROVIDER_URLS[backend.name].billing || "your gateway's billing"} before searching`);
+      p.log.warn(`top up ${name === "openrouter" ? "at https://openrouter.ai/credits " : ""}before searching`);
       apiKey = typed;
     } else if (r.status === "rejected") {
       s.error(`Rejected with HTTP ${r.http}${r.detail ? `: ${r.detail}` : ""}`);
@@ -289,34 +266,33 @@ export async function init(argv: string[] = []) {
       const keep = guard<boolean>(await p.confirm({ message: "Save it anyway, unverified?", initialValue: true }));
       if (keep) apiKey = typed;
     }
-    if (!apiKey) {
+    if (apiKey === undefined) {
       const again = guard<boolean>(await p.confirm({ message: "Try another key?", initialValue: true }));
       if (!again) bail("No working key; run `jgrep init` again later.");
     }
   }
 
-  // 3. where to store (only when the key is new)
-  if (!existing) {
-    const where = guard<StorageChoice>(await p.select({
-      message: "Where should the key live?",
-      initialValue: "keyfile",
-      options: storageOptions(backend),
+  // 3. a new key goes into providers.json as a literal api_key (0600), unless the user exports it
+  if (fresh) {
+    const vars = [entry().api_key ?? builtin.api_key ?? []].flat().filter((v) => v.startsWith("$"));
+    const store = vars.length === 0 || guard<boolean>(await p.confirm({
+      message: `Save the key in ${providersFile()} (file mode 600)? No: you export ${vars.join(" or ")} yourself`,
+      initialValue: true,
     }));
-    if (where === "keyfile") writeKeyFile(keyFilePath(backend.name), apiKey); // 0600; Windows chmod warning inside
-    else if (where === "legacy") saveLegacyEnvKey(backend.keyEnv, apiKey);
-    else if (where === "project") saveProjectEnvKey(".", backend.keyEnv, apiKey);
-    if (where === "none") p.log.info(storageLine(backend, where));
-    else p.log.success(storageLine(backend, where));
-    // Same check as the key-from-.env warning (git check-ignore, then ./.gitignore): anything
-    // short of "git ignores it" is a key that can be committed.
-    if (where === "project" && envIsGitignored(".") !== true) p.log.warn(".env is not gitignored — add it to .gitignore before you commit");
+    if (store) doc = withEntry(doc, name, { api_key: apiKey });
+    else p.log.info(`Not saved. Use: export ${vars[0].replace(/^\$\{?|\}$/g, "")}=…`);
   }
 
-  // 3b. the provider choice (and a gateway's URL) — not secret, saved whatever the key storage
-  const saved = saveProviderChoice(backend);
-  p.log.info(`Saved JEV_API=${backend.name}${backend.name === "gateway" ? " and JEV_GATEWAY_URL" : ""} to ${saved} (--api and $JEV_API override it)`);
+  // 4. the chain order: the array order is the fallback order (user decision)
+  if (doc.providers[0]?.name !== name) {
+    const first = guard<boolean>(await p.confirm({ message: `Put ${name} first in the fallback chain?`, initialValue: true }));
+    if (first) doc = withEntry(doc, name, {}, true);
+  }
+  const before = exists ? JSON.stringify(readProvidersDoc()) : "";
+  doc = withEntry(doc, name, {}); // the entry exists even when only its defaults are used
+  if (JSON.stringify(doc) !== before) p.log.success(`Saved ${saveProviders(doc)} (mode 600)`);
 
-  // 4. agent skills (opt-in): the vercel `skills` installer auto-detects every
+  // 5. agent skills (opt-in): the vercel `skills` installer auto-detects every
   // agent-skills harness (Claude Code, Codex, OpenCode, Cursor, +75 more) and has
   // its own interactive UI — spawn with stdio:"inherit", never a clack spinner.
   // If it can't run (npx missing, offline, non-zero exit), fall back to copying the
@@ -344,7 +320,7 @@ export async function init(argv: string[] = []) {
     }
   }
 
-  // 5. star
+  // 6. star
   const star = guard<boolean>(await p.confirm({ message: "Enjoying jgrep? Give it a star on GitHub", initialValue: true }));
   if (star) { openUrl(REPO_URL); p.log.info(REPO_URL); }
 
@@ -353,8 +329,9 @@ export async function init(argv: string[] = []) {
       `jgrep "catches an error and silently ignores it" src/`,
       `jgrep -C "validates the webhook signature" app/`,
       `jgrep --diff --staged "leaves debug output behind"`,
+      "jgrep status",
     ].join("\n"),
     "Try it",
   );
-  p.outro(outroLine(backend, model));
+  p.outro(outroLine(now, model));
 }

@@ -409,7 +409,7 @@ test("cli main rows: --json-errors --out writes the file and an errored run exit
     fs.writeFileSync(csv, "handle\n@a\n@b\n@c\n@d\n");
     const out = path.join(dir, "out.json");
     const p = Bun.spawnSync(
-      ["bun", "src/cli.ts", "--rows", csv, "beauty?", "--api", "gateway", "--retries", "0", "--timeout", "1", "--no-cache", "--json-errors", "--out", out],
+      ["bun", "src/cli.ts", "--rows", csv, "beauty?", "--provider", "compatible", "--retries", "0", "--timeout", "1", "--no-cache", "--json-errors", "--out", out],
       { env: { ...process.env, JGREP_NO_MAIN: "", JEV_GATEWAY_URL: "http://127.0.0.1:1/v1/systemone", JEV_GATEWAY_API_KEY: "test-key" } },
     );
     expect(p.exitCode).toBe(2); // any row errored -> 2 (used to fall through to 0)

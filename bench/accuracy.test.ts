@@ -114,10 +114,10 @@ test("sliceByClass takes the first N rows per class in fixture order", () => {
 });
 
 test("parse: defaults, flags, numeric validation, fixture enum, stray positionals", () => {
-  expect(parse([])).toMatchObject({ fixture: "all", api: "", model: "", limit: 0, out: "", rate: 0, retries: 4, timeout: 15, failFast: false });
-  expect(parse(["--fixture", "sms", "--limit", "2", "--api", "openrouter", "--model", "typesafe/jev-1.13",
+  expect(parse([])).toMatchObject({ fixture: "all", provider: "", model: "", limit: 0, out: "", rate: 0, retries: 4, timeout: 15, failFast: false });
+  expect(parse(["--fixture", "sms", "--limit", "2", "--provider", "openrouter", "--model", "typesafe/jev-1.13",
     "--rate", "5", "--retries", "1", "--timeout", "30", "--fail-fast", "--out", "/tmp/r"]))
-    .toMatchObject({ fixture: "sms", limit: 2, api: "openrouter", model: "typesafe/jev-1.13",
+    .toMatchObject({ fixture: "sms", limit: 2, provider: "openrouter", model: "typesafe/jev-1.13",
       rate: 5, retries: 1, timeout: 30, failFast: true, out: "/tmp/r" });
   for (const flag of ["--limit", "--rate", "--retries", "--timeout"]) {
     expect(() => parse([flag, "abc"])).toThrow(/numeric option expected/);

@@ -6,7 +6,7 @@
 // pattern as verify.test.ts / funcs.test.ts (explicit apiKey everywhere, so the lazy
 // key resolver never touches the filesystem); the CLI scenarios run the real
 // entrypoint against a localhost-only fake gateway — no network, no key files,
-// --no-cache so ~/.cache/jgrep stays out of it.
+// --no-cache so ~/.jgrep/cache.json stays out of it.
 // @ts-expect-error — no bun-types in this zero-dep repo; Bun provides bun:test at runtime
 import { test, expect } from "bun:test";
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo; the surface used is trivial
@@ -289,7 +289,7 @@ test("cli e2e: --tag text output shows [tag] after the p column; --json carries 
     fs.writeFileSync(path.join(dir, "a.ts"), "export function alpha() {\n  return 1;\n}\n");
     fs.writeFileSync(path.join(dir, "b.ts"), "export function beta() {\n  return 2;\n}\n");
     const text = await spawn(
-      ["bun", "src/cli.ts", "--tag", "real bug,idiomatic", "--no-cache", "--api", "gateway", "returns a number", dir],
+      ["bun", "src/cli.ts", "--tag", "real bug,idiomatic", "--no-cache", "--provider", "compatible", "returns a number", dir],
       gatewayEnv(server.port),
     );
     expect(text.exitCode).toBe(0);
@@ -299,7 +299,7 @@ test("cli e2e: --tag text output shows [tag] after the p column; --json carries 
     expect(text.stdout).toMatch(/p=0\.90 \[idiomatic\]/);
 
     const json = JSON.parse((await spawn(
-      ["bun", "src/cli.ts", "--json", "--tag", "real bug,idiomatic", "--no-cache", "--api", "gateway", "returns a number", dir],
+      ["bun", "src/cli.ts", "--json", "--tag", "real bug,idiomatic", "--no-cache", "--provider", "compatible", "returns a number", dir],
       gatewayEnv(server.port),
     )).stdout);
     expect(json).toHaveLength(2);
@@ -322,7 +322,7 @@ test("cli e2e: a failing tag endpoint leaves the hits clean — same output shap
     fs.writeFileSync(path.join(dir, "a.ts"), "export function alpha() {\n  return 1;\n}\n");
     const p = await spawn(
       ["bun", "src/cli.ts", "--json", "--tag", "real bug,idiomatic", "--no-cache", "--retries", "0", "--timeout", "2",
-       "--api", "gateway", "returns a number", dir],
+       "--provider", "compatible", "returns a number", dir],
       gatewayEnv(server.port),
     );
     expect(p.exitCode).toBe(0); // exit semantics unchanged: hits, no errors

@@ -6,7 +6,8 @@
 // spend. With the flag the suite issues 5 OpenRouter calls: one behavioral code
 // query, one rows classification, one key probe, one guaranteed-401 invalid-key
 // call (free) and one skill-extraction query over the bundled SKILL.md — well
-// under 10k input tokens in total, roughly $0.005 per full run.
+// under 10k input tokens in total, roughly $0.005 per full run — plus one Cloudflare
+// and one Vercel query, each only when that provider's credentials are exported.
 // The key comes from the ambient OPENROUTER_API_KEY (resolveApiKey's first lookup);
 // with the flag set but no key configured the suite skips with a one-line hint
 // instead of failing.
@@ -18,7 +19,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { JevProviderError } from "./errors";
 import { chunk, chunkPaths, jgrep } from "./jgrep";
-import { BACKENDS, resolveApiKey, verifyApiKey } from "./providers";
+import { BACKENDS, loadProviders, resolveApiKey, verifyApiKey } from "./providers";
 import { scoreRows, type Row } from "./rows";
 
 declare const process: { cwd(): string; env: Record<string, string | undefined> };
@@ -160,3 +161,27 @@ test.skipIf(skip)("live skill extraction: 'extract the help section from the ski
 
   console.log(`e2e: best ${best.file}:${best.start}-${best.end} p=${best.p.toFixed(2)} chunk lines=${best.end - best.start + 1} USAGE lines matched ${matched}/${usageLines.length} (chunks=${skillChunks.length} tokens=${r.tokens})`);
 }, 60_000);
+
+// ---- the two non-System-One adapters (TRDD-3KBUODCE): one live code query each, only
+// when the user exported that provider's credentials (same double gate, never in CI). ----
+
+const liveVia = async (name: "cloudflare" | "vercel") => {
+  // The built-in entry with the exported credentials (JGREP_HOME is the test run's own, empty home).
+  const p = loadProviders(process.env).providers.find((x) => x.name === name)!;
+  expect(p.state).toBe("ready");
+  console.log(`e2e: code mode via ${p.name} (${p.adapter}) model=${p.model}`);
+  const r = await jgrep("returns the sum of two numbers", chunks, { backend: p, apiKey: p.key, threshold: 0.5, timeoutSec: 60, batch: 4, concurrency: 1 });
+  expect(r.errors).toHaveLength(0);
+  expect(r.all.find((c) => c.text.includes("addNumbers"))!.p).toBeGreaterThanOrEqual(0.5);
+  console.log(`e2e: ${name} p=${r.all.map((h) => h.p.toFixed(2)).join(",")} tokens=${r.tokens}`);
+};
+
+test.skipIf(!RUN_LIVE || !process.env.CLOUDFLARE_API_TOKEN || !process.env.CLOUDFLARE_ACCOUNT_ID)(
+  "live cloudflare-ai-run: Workers AI answers a code query (needs CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID)",
+  () => liveVia("cloudflare"), 90_000,
+);
+
+test.skipIf(!RUN_LIVE || !process.env.AI_GATEWAY_API_KEY)(
+  "live vercel-evaluation: the AI Gateway answers a code query (needs AI_GATEWAY_API_KEY)",
+  () => liveVia("vercel"), 90_000,
+);
