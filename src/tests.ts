@@ -13,7 +13,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, KEY_WORKED_EARLIER_HINT,
-  BudgetMeter, diffHeaderPath, listFiles, settledCost, type Cache, type Estimate, type ListOptions,
+  BudgetMeter, diffHeaderPath, listFiles, settledCost, withinSize, type Cache, type Estimate, type ListOptions,
 } from "./jgrep";
 import { BACKENDS, DEFAULT_PRICE_PER_MTOK, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
 import { runPool, type PoolResult } from "./pool";
@@ -323,5 +323,6 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
 }
 
 export function loadTests(paths: string[] = ["."], opts: ListOptions = {}): TestFile[] {
-  return findTestFiles(listFiles(paths, opts)).map((file) => ({ file, signature: signature(file) }));
+  // Same size rule as the code search: the 100 MB ceiling, or the opt-in --max-bytes.
+  return withinSize(findTestFiles(listFiles(paths, opts)), opts.maxBytes).map((file) => ({ file, signature: signature(file) }));
 }

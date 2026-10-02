@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { BACKENDS, DEFAULT_PRICE_PER_MTOK, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
 import { runPool, type PoolResult } from "./pool";
 import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
-import { DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, KEY_WORKED_EARLIER_HINT, BudgetMeter, normalizeForCache, settledCost, type Cache, type Estimate } from "./jgrep";
+import { DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, HARD_MAX_BYTES, KEY_WORKED_EARLIER_HINT, BudgetMeter, normalizeForCache, settledCost, type Cache, type Estimate } from "./jgrep";
 
 export type Row = Record<string, string>;
 export type Questions = Record<string, { type: "noul" | "choice" | "score"; instructions: string; [k: string]: unknown }>;
@@ -35,6 +35,9 @@ export function parseCsv(text: string): { columns: string[]; rows: Row[] } {
 }
 
 export function readRows(file: string): { columns: string[]; rows: Row[] } {
+  // The same 100 MB hard ceiling as code search (USER: "just to prevent system hangs"): the
+  // whole file is parsed in memory, so a bigger one is refused instead of read.
+  if (fs.statSync(file).size > HARD_MAX_BYTES) throw new Error(`${file} is over the 100 MB hard ceiling — split it`);
   const text = fs.readFileSync(file, "utf8");
   if (/\.jsonl?$/i.test(file)) {
     const rows: Row[] = file.toLowerCase().endsWith(".json")

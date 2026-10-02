@@ -1,8 +1,8 @@
 // File listing safety (audit MINOR + USER "add an option to follow symlinks or not"):
 // symlinks are skipped by default and reported; --follow-symlinks (JGREP_FOLLOW_SYMLINKS=1)
 // follows them, deduped by realpath, loop-safe, and never through a link whose path OR
-// target looks like a secret; a total-size cap bounds what one run can send; a git
-// ls-files failure other than "not a git repository" is reported once.
+// target looks like a secret; a git ls-files failure other than "not a git repository"
+// is reported once. (File SIZE limits live in src/maxbytes.test.ts.)
 // @ts-expect-error — no bun-types in this zero-dep repo; Bun provides bun:test at runtime
 import { test, expect, spyOn } from "bun:test";
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo
@@ -84,15 +84,6 @@ test("--follow-symlinks: a directory loop terminates and duplicates are deduped 
     const files = rel(proj, listFiles([proj], { followSymlinks: true }));
     expect(files).toEqual(["real.ts", "sub/b.ts"].sort()); // each realpath once, no infinite walk
   } finally { err.mockRestore(); fs.rmSync(root, { recursive: true, force: true }); }
-});
-
-test("total-size cap: a listing past the cap refuses before anything is read or sent", () => {
-  const { root, proj } = fixture();
-  try {
-    fs.writeFileSync(path.join(proj, "big.ts"), "x".repeat(200));
-    expect(() => listFiles([proj], { maxTotalBytes: 100 })).toThrow(/total.*cap/);
-    expect(listFiles([proj], { maxTotalBytes: 10_000 })).toHaveLength(2);
-  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test("git ls-files failing for a reason other than 'not a git repository' is reported once", () => {

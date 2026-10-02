@@ -3,7 +3,7 @@
 import fs from "node:fs";
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo; only createHash is used
 import { createHash } from "node:crypto";
-import { BudgetMeter, chunkPaths, diffChunks, estimateLine, estimateTokens, gitDiff, jgrep, jgrepFuncs, loadCache, parseTagCategories, saveCache, type Estimate, type Hit, type Kind } from "./jgrep";
+import { BudgetMeter, HARD_MAX_BYTES, chunkPaths, diffChunks, estimateLine, estimateTokens, gitDiff, jgrep, jgrepFuncs, loadCache, parseTagCategories, saveCache, type Estimate, type Hit, type Kind } from "./jgrep";
 import { readRows, loadQuestions, scoreRows, flattenAnswers, toCsv } from "./rows";
 import { loadTests, selectTests } from "./tests";
 import { resolvePricePerMtok, resolveProvider, type Backend } from "./providers";
@@ -166,7 +166,7 @@ const c = (code: string, s: string) => (tty ? `\x1b[${code}m${s}\x1b[0m` : s);
 export function parse(argv: string[]) {
   const o = {
     threshold: 0.7, batch: 16, concurrency: 16, all: false, show: false, group: false, votes: 1, verify: false, json: false, jsonErrors: false, cache: true,
-    estimate: false, sarif: false, envelopes: false, funcs: false, budget: null as number | null, followSymlinks: false,
+    estimate: false, sarif: false, envelopes: false, funcs: false, budget: null as number | null, followSymlinks: false, maxBytes: null as number | null,
     diff: null as string[] | null, rows: "", questions: "", out: "", tests: false, tag: "",
     api: "", model: "", timeout: 15, requestTimeout: 30, retries: 4, rate: 0, failFast: false,
   };
@@ -192,6 +192,7 @@ export function parse(argv: string[]) {
     else if (a === "--budget") o.budget = Number(argv[++i]);
     else if (a === "--no-cache") o.cache = false;
     else if (a === "--follow-symlinks") o.followSymlinks = true;
+    else if (a === "--max-bytes") o.maxBytes = Number(argv[++i]);
     else if (a === "--api") o.api = argv[++i] ?? "";
     else if (a === "--model") o.model = argv[++i] ?? "";
     else if (a === "--timeout") o.timeout = Number(argv[++i]);
@@ -244,6 +245,9 @@ export function parse(argv: string[]) {
   // reservation exceeds it), negative/non-finite gets the generic numeric error.
   if (o.budget !== null && !(Number.isFinite(o.budget) && o.budget >= 0))
     throw new Error("numeric option expected");
+  // --max-bytes: a byte count (> 0). The 100 MB ceiling is checked in main(), with exit 1.
+  if (o.maxBytes !== null && !(Number.isInteger(o.maxBytes) && o.maxBytes > 0))
+    throw new Error("max-bytes must be a positive whole number of bytes");
   return { ...o, question: rest[0], paths: rest.slice(1) };
 }
 
@@ -398,6 +402,18 @@ async function main() {
   // Symlinks found while listing are skipped unless asked (USER: "an option to follow
   // symlinks or not"); the flag or JGREP_FOLLOW_SYMLINKS=1 turns following on.
   o.followSymlinks ||= process.env.JGREP_FOLLOW_SYMLINKS === "1";
+  // --max-bytes > $JGREP_MAX_BYTES > none (any size up to the hard ceiling). USER: the
+  // 100 MB ceiling "just to prevent system hangs" can be lowered, never raised: exit 1.
+  const envMax = process.env.JGREP_MAX_BYTES?.trim();
+  if (o.maxBytes === null && envMax) {
+    o.maxBytes = Number(envMax);
+    if (!(Number.isInteger(o.maxBytes) && o.maxBytes > 0)) throw new Error(`JGREP_MAX_BYTES must be a positive whole number of bytes (got "${envMax}")`);
+  }
+  if (o.maxBytes !== null && o.maxBytes > HARD_MAX_BYTES) {
+    console.error(`--max-bytes ${o.maxBytes} is above the 100 MB hard ceiling (${HARD_MAX_BYTES} bytes), which cannot be raised`);
+    process.exit(1);
+  }
+  const sizeOpts = { followSymlinks: o.followSymlinks, maxBytes: o.maxBytes ?? undefined };
   if (o.tests) return testsMain(o, wiring);
   if (o.rows) return rowsMain(o, wiring);
   if (!o.question) { console.error(USAGE); process.exit(2); }
@@ -409,14 +425,14 @@ async function main() {
   // Applies to code search only: --diff keeps judging hunks (funcs ignored there).
   // --estimate prices the plain search even with --funcs: pass 2 depends on pass-1
   // answers a dry run never gets (a known overestimate, listed in the CHANGELOG).
-  const chunks = o.funcs && !o.diff && !o.estimate ? null : (o.diff ? diffChunks(gitDiff(o.diff)) : chunkPaths(o.paths.length ? o.paths : ["."], { followSymlinks: o.followSymlinks }));
+  const chunks = o.funcs && !o.diff && !o.estimate ? null : (o.diff ? diffChunks(gitDiff(o.diff)) : chunkPaths(o.paths.length ? o.paths : ["."], sizeOpts));
   if (chunks !== null && !chunks.length) { console.error(o.diff ? "empty diff" : "no text files found"); process.exit(1); }
   const cache = o.cache ? loadCache() : {};
   try {
     const onProgress = (d: number, n: number) => { if (process.stderr.isTTY) process.stderr.write(`\r${d}/${n} requests`); };
     const r = chunks !== null
-      ? await jgrep(o.question, chunks, { ...o, kind, cache, ...wiring, onProgress })
-      : await jgrepFuncs(o.question, o.paths.length ? o.paths : ["."], { ...o, kind, cache, ...wiring, onProgress });
+      ? await jgrep(o.question, chunks, { ...o, ...sizeOpts, kind, cache, ...wiring, onProgress })
+      : await jgrepFuncs(o.question, o.paths.length ? o.paths : ["."], { ...o, ...sizeOpts, kind, cache, ...wiring, onProgress });
     if (process.stderr.isTTY) process.stderr.write("\r\x1b[K");
     if (reportEstimate(wiring, o.json)) return;
 
@@ -496,7 +512,7 @@ async function testsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
   const diff = gitDiff(o.diff ?? []);
   if (!diff.trim()) { console.error("empty diff"); process.exit(1); }
   const paths = [o.question, ...o.paths].filter((p): p is string => !!p);
-  const tests = loadTests(paths.length ? paths : ["."], { followSymlinks: o.followSymlinks });
+  const tests = loadTests(paths.length ? paths : ["."], { followSymlinks: o.followSymlinks, maxBytes: o.maxBytes ?? undefined });
   if (!tests.length) { console.error("no test files found"); process.exit(1); }
   const threshold = o.threshold === 0.7 ? 0.5 : o.threshold; // recall matters more here
   const cache = o.cache ? loadCache() : {};

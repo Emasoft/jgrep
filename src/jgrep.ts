@@ -184,19 +184,21 @@ const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", "ta
 const SECRET_NAME_RE = /^(\.env(\..*)?|.*\.(key|pem|p12|pfx|tfvars)|id_(rsa|dsa|ecdsa|ed25519)(\..*)?|credentials(\..*)?|\.git-credentials|\.netrc|\.npmrc|\.pypirc|kubeconfig)$/i;
 const looksSecret = (p: string): boolean => SECRET_NAME_RE.test(path.basename(p));
 
-/** Most text one run may read (sum of the sizes of the listed files that readText would
- *  read, i.e. those <= 1 MB). git-listed trees had no cap at all (the 5000-file cap
- *  only bounds the non-git walk), so `jgrep "..." .` in a huge monorepo could send
- *  hundreds of MB. ponytail: a fixed cap; make it a flag if real trees hit it. */
-export const MAX_TOTAL_BYTES = 50_000_000;
-const MAX_FILE_BYTES = 1_000_000;
+/** Per-file HARD ceiling: no flag raises it. USER 2026-10-02: "remove the input limit, make
+ *  it opt-in only if --max-bytes is used. otherwise both tools must read any file size. add
+ *  an hard limit of 100MB just to prevent system hungs." (This replaced the old silent 1 MB
+ *  per-file skip, and the total-size cap the audit asked for was dropped by the same
+ *  decision.) */
+export const HARD_MAX_BYTES = 104_857_600;
 
 export interface ListOptions {
   /** --follow-symlinks / JGREP_FOLLOW_SYMLINKS=1. Default false: listed symlinks are
    *  skipped and reported (paths given on the command line are always followed, like
    *  grep -r — naming one is the user's own choice). */
   followSymlinks?: boolean;
-  maxTotalBytes?: number; // test seam; default MAX_TOTAL_BYTES
+  /** --max-bytes / JGREP_MAX_BYTES: opt-in per-file limit below HARD_MAX_BYTES (the CLI
+   *  rejects larger values); files over it are skipped and reported. Default: the ceiling. */
+  maxBytes?: number;
 }
 
 let lsFilesWarned = false; // "report once" for a git ls-files failure other than not-a-repo
@@ -276,11 +278,6 @@ export function listFiles(paths: string[], opts: ListOptions = {}): string[] {
       ? `jgrep: skipped ${skipped.length} symlink(s) whose name or target looks like a secret, or that dangle: ${shown}`
       : `jgrep: skipped ${skipped.length} symlink(s) (not followed by default; --follow-symlinks follows them): ${shown}`);
   }
-  const cap = opts.maxTotalBytes ?? MAX_TOTAL_BYTES;
-  let total = 0;
-  for (const f of out) { const n = fs.statSync(f).size; if (n <= MAX_FILE_BYTES) total += n; }
-  if (total > cap)
-    throw new Error(`the selected files total ${(total / 1e6).toFixed(1)} MB of text, over the ${(cap / 1e6).toFixed(0)} MB per-run cap — pass a narrower path`);
   return out.sort();
 }
 
@@ -301,18 +298,33 @@ function walk(root: string, out: Set<string>, dir = root) {
   }
 }
 
-export function readText(file: string): string | null {
-  const st = fs.statSync(file);
-  if (st.size > MAX_FILE_BYTES) return null;
+/** A file's text, or null for a binary (NUL in the first 8000 bytes) or a file over
+ *  `maxBytes` (default HARD_MAX_BYTES). The size is checked BEFORE reading, so an
+ *  over-limit file is never loaded. */
+export function readText(file: string, maxBytes: number = HARD_MAX_BYTES): string | null {
+  if (fs.statSync(file).size > Math.min(maxBytes, HARD_MAX_BYTES)) return null;
   const buf = fs.readFileSync(file);
   if (buf.subarray(0, 8000).includes(0)) return null; // binary
   return buf.toString("utf8");
 }
 
+/** Files within the size limit (ListOptions.maxBytes, never above HARD_MAX_BYTES). The
+ *  over-limit ones are reported in ONE stderr line — a size skip is a user-visible choice
+ *  now, not the old silent 1 MB drop. */
+export function withinSize(files: string[], maxBytes: number = HARD_MAX_BYTES): string[] {
+  const limit = Math.min(maxBytes, HARD_MAX_BYTES);
+  const over = files.filter((f) => fs.statSync(f).size > limit);
+  if (over.length) {
+    const why = limit === HARD_MAX_BYTES ? "the 100 MB hard ceiling" : `--max-bytes ${limit} bytes`;
+    console.error(`jgrep: skipped ${over.length} file(s) over ${why}: ${over.slice(0, 3).join(", ")}${over.length > 3 ? `, … ${over.length - 3} more` : ""}`);
+  }
+  return files.filter((f) => !over.includes(f));
+}
+
 export function chunkPaths(paths: string[], opts: ListOptions = {}): Chunk[] {
   const chunks: Chunk[] = [];
-  for (const file of listFiles(paths, opts)) {
-    const text = readText(file);
+  for (const file of withinSize(listFiles(paths, opts), opts.maxBytes)) {
+    const text = readText(file, opts.maxBytes);
     if (text !== null) chunks.push(...(isMarkdownPath(file) ? chunkMarkdown(file, text) : chunk(file, text)));
   }
   return chunks;
@@ -622,6 +634,7 @@ export interface Options {
   funcs?: boolean;             // --funcs (WI-5): two-phase navigation — shortlist files by signature chunks, then search only those
   envelopes?: boolean;         // --envelopes (WI-9): append each chunk's numbers ("[numbers: 42, 7]") to the judged text
   followSymlinks?: boolean;    // --follow-symlinks: jgrepFuncs' own file listing follows symlinks (see ListOptions)
+  maxBytes?: number;           // --max-bytes: jgrepFuncs' per-file size limit (see ListOptions)
   budget?: number;             // --budget (WI-7): once metered cost exceeds this many dollars, un-run chunks error budget_exhausted
   pricePerMtok?: number;       // $/Mtok for the --budget meter when the provider reports no cost (default DEFAULT_PRICE_PER_MTOK)
   meter?: BudgetMeter;         // a meter shared across runs (jgrepFuncs' two passes, the CLI's under-pricing check); else built from budget
@@ -1010,11 +1023,11 @@ export async function jgrep(question: string, chunks: Chunk[], o: Options): Prom
  */
 export async function jgrepFuncs(question: string, paths: string[], o: Options): Promise<Result> {
   const sigChunks: Chunk[] = [];
-  for (const file of listFiles(paths, { followSymlinks: o.followSymlinks })) {
+  for (const file of withinSize(listFiles(paths, { followSymlinks: o.followSymlinks }), o.maxBytes)) {
     const lang = detectLanguage(file);
     if (!lang) continue; // unsupported language: excluded from --funcs search (documented)
-    const text = readText(file);
-    if (text === null) continue; // binary or >1MB: the same skip chunkPaths applies
+    const text = readText(file, o.maxBytes);
+    if (text === null) continue; // binary (size was filtered and reported above)
     const sc = signatureChunk(file, text, lang);
     if (sc) sigChunks.push(sc);
   }
@@ -1024,7 +1037,7 @@ export async function jgrepFuncs(question: string, paths: string[], o: Options):
   const pass1 = await jgrep(question, sigChunks, { ...o, tag: undefined, meter });
   const shortlist = [...new Set(pass1.hits.map((h) => h.file))];
   if (shortlist.length === 0) return pass1;
-  const pass2 = await jgrep(question, chunkPaths(shortlist, { followSymlinks: o.followSymlinks }), { ...o, meter });
+  const pass2 = await jgrep(question, chunkPaths(shortlist, { followSymlinks: o.followSymlinks, maxBytes: o.maxBytes }), { ...o, meter });
   const cost = pass1.cost === undefined && pass2.cost === undefined ? undefined : (pass1.cost ?? 0) + (pass2.cost ?? 0);
   return {
     ...pass2,
