@@ -501,3 +501,13 @@ test("M2: OpenRouter 400 'Model X does not exist' -> model_unavailable (fatal), 
   expect(calls.length).toBe(1);
 });
 
+test("m4: a JSON error body is reduced to error.message — the user_id never leaks into the message", async () => {
+  const { fetchImpl } = scriptedFetch(() => resp(400, { error: { message: "expected record, received array", code: 400 }, user_id: "user_REDACTED123" }));
+  const e = await errOf(postSystemOne({}, BACKENDS.openrouter, "k", { fetchImpl }));
+  expect(e.kind).toBe("bad_request");
+  expect(e.message).toContain("expected record, received array");
+  expect(e.message).not.toContain("user_");
+  const m = await errOf(postSystemOne({}, BACKENDS.openrouter, "k", { fetchImpl: scriptedFetch(() => resp(400, OR_MISSING_MODEL)).fetchImpl }));
+  expect(m.message).not.toContain("user_");
+});
+

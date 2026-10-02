@@ -451,6 +451,18 @@ function malformedResponseError(backend: Backend, snippet: string): JevProviderE
   );
 }
 
+/** The human part of an error body: OpenRouter-style `{"error":{"message":…}}` (or a top-level
+ *  `message`) is reduced to that message, so fields such as the account's `user_id` never
+ *  reach error output, logs or --json-errors (review m4). Non-JSON bodies pass through. */
+export function errorTextOf(body: string): string {
+  try {
+    const j = JSON.parse(body) as { error?: { message?: unknown } | string; message?: unknown };
+    const m = typeof j?.error === "object" ? j.error?.message : typeof j?.error === "string" ? j.error : j?.message;
+    if (typeof m === "string" && m) return m;
+  } catch { /* not JSON: the raw text is the message */ }
+  return body;
+}
+
 /** POST one System One request with per-attempt timeouts, a batch deadline that
  *  includes retries, Retry-After-aware backoff and typed errors (WI-11). The
  *  caller owns `body` (including `body.model`) — it is never mutated here. */
@@ -507,7 +519,7 @@ export async function postSystemOne(
       });
       if (!res.ok) {
         // Read the body BEFORE classifying so a retry never needs it a second time.
-        const snippet = (await res.text()).slice(0, SNIPPET_MAX);
+        const snippet = errorTextOf(await res.text()).slice(0, SNIPPET_MAX);
         const cls = classifyStatus(res.status, snippet);
         if (!cls.retryable) {
           throw new JevProviderError(cls.kind, statusMessage(cls.kind, backend, res.status, snippet), {
