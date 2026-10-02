@@ -154,22 +154,115 @@ export function gitDiff(args: string[], cwd = process.cwd()): string {
 // ---- files ------------------------------------------------------------------
 const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", "target", "vendor"]);
 
-export function listFiles(paths: string[]): string[] {
-  const files = new Set<string>();
+/** Names that hold credentials. With --follow-symlinks a link is refused when its own
+ *  name OR its target's name matches: a cloned repo must not be able to smuggle
+ *  ~/.aws/credentials or a deploy key into the request behind an innocent link name. */
+const SECRET_NAME_RE = /^(\.env(\..*)?|.*\.(key|pem|p12|pfx|tfvars)|id_(rsa|dsa|ecdsa|ed25519)(\..*)?|credentials(\..*)?|\.git-credentials|\.netrc|\.npmrc|\.pypirc|kubeconfig)$/i;
+const looksSecret = (p: string): boolean => SECRET_NAME_RE.test(path.basename(p));
+
+/** Most text one run may read (sum of the sizes of the listed files that readText would
+ *  read, i.e. those <= 1 MB). git-listed trees had no cap at all (the 5000-file cap
+ *  only bounds the non-git walk), so `jgrep "..." .` in a huge monorepo could send
+ *  hundreds of MB. ponytail: a fixed cap; make it a flag if real trees hit it. */
+export const MAX_TOTAL_BYTES = 50_000_000;
+const MAX_FILE_BYTES = 1_000_000;
+
+export interface ListOptions {
+  /** --follow-symlinks / JGREP_FOLLOW_SYMLINKS=1. Default false: listed symlinks are
+   *  skipped and reported (paths given on the command line are always followed, like
+   *  grep -r — naming one is the user's own choice). */
+  followSymlinks?: boolean;
+  maxTotalBytes?: number; // test seam; default MAX_TOTAL_BYTES
+}
+
+let lsFilesWarned = false; // "report once" for a git ls-files failure other than not-a-repo
+
+/** Files under `paths`: git ls-files (tracked + untracked, .gitignore honoured) per
+ *  directory, else a hidden-file-skipping walk. Symlinks found while listing are
+ *  skipped and reported on stderr unless opts.followSymlinks; when following, every
+ *  file is deduped by realpath, directory cycles are cut by a visited-realpath set,
+ *  and secret-looking links (name or target) are still refused. Throws when the
+ *  listing exceeds the total-size cap. */
+export function listFiles(paths: string[], opts: ListOptions = {}): string[] {
+  const follow = opts.followSymlinks ?? false;
+  const listed = new Set<string>();   // paths found while listing (subject to the symlink rule)
+  const explicit = new Set<string>(); // files named on the command line
   for (const p of paths) {
     if (!fs.existsSync(p)) throw new Error(`no such path: ${p}`);
-    if (fs.statSync(p).isFile()) { files.add(p); continue; }
+    if (fs.statSync(p).isFile()) { explicit.add(p); continue; }
     try {
-      execFileSync("git", ["ls-files", "-z", "-co", "--exclude-standard", "--", p], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
-        .split("\0").filter(Boolean).forEach((f) => files.add(f));
-    } catch {
-      walk(p, files);
+      // Run git INSIDE p (-C) and join its p-relative output back onto p: git run from the
+      // process cwd failed with "outside repository" for any directory in another repo
+      // than the cwd's, and the silent walk fallback hid that (.gitignore then ignored).
+      execFileSync("git", ["-C", p, "ls-files", "-z", "-co", "--exclude-standard"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
+        .split("\0").filter(Boolean).forEach((f) => listed.add(path.join(p, f)));
+    } catch (e) {
+      // "not a git repository" is the expected non-repo case: walk silently. Anything else
+      // (git missing, dubious ownership, a corrupt index) used to fall back silently too,
+      // turning a gitignore-aware listing into a gitignore-unaware one — say so, once.
+      const why = String((e as { stderr?: unknown }).stderr ?? "") || (e as Error).message;
+      if (!/not a git repository/i.test(why) && !lsFilesWarned) {
+        lsFilesWarned = true;
+        console.error(`warning: git ls-files failed (${why.trim().split("\n")[0]}) — falling back to a directory walk that ignores .gitignore`);
+      }
+      walk(p, listed);
     }
   }
-  return [...files].filter((f) => { try { return fs.statSync(f).isFile(); } catch { return false; } }).sort();
+  const out: string[] = [];
+  const seenReal = new Set<string>();
+  const seenPath = new Set<string>();
+  const skipped: string[] = [];
+  const keep = (f: string) => {
+    if (seenPath.has(f)) return; // a file named explicitly AND listed under a named directory
+    seenPath.add(f);
+    if (follow) {
+      const real = fs.realpathSync(f);
+      if (seenReal.has(real)) return; // the same file reached twice (a link and its target)
+      seenReal.add(real);
+    }
+    out.push(f);
+  };
+  for (const f of explicit) { try { if (fs.statSync(f).isFile()) keep(f); } catch { /* vanished */ } }
+  const visitedDirs = new Set<string>(paths.flatMap((p) => { try { return [fs.realpathSync(p)]; } catch { return []; } }));
+  const consider = (f: string): void => {
+    let st: ReturnType<typeof fs.lstatSync>;
+    try { st = fs.lstatSync(f); } catch { return; } // listed by git but deleted on disk
+    if (!st.isSymbolicLink()) { if (st.isFile()) keep(f); return; }
+    if (!follow) { skipped.push(f); return; }
+    let real: string;
+    try { real = fs.realpathSync(f); } catch { skipped.push(f); return; } // dangling link
+    if (looksSecret(f) || looksSecret(real)) { skipped.push(f); return; }
+    const target = fs.statSync(real);
+    if (target.isFile()) { keep(f); return; }
+    if (!target.isDirectory() || visitedDirs.has(real)) return; // a cycle (or a dir seen already) ends here
+    visitedDirs.add(real);
+    const inner = new Set<string>();
+    walk(f, inner);
+    for (const g of [...inner].sort()) consider(g);
+  };
+  // Regular files first, then links: when a link and its target are both listed, the
+  // dedupe keeps the real path, not the alias.
+  const isLink = (f: string) => { try { return fs.lstatSync(f).isSymbolicLink(); } catch { return false; } };
+  const sorted = [...listed].sort();
+  for (const f of sorted.filter((f) => !isLink(f))) consider(f);
+  for (const f of sorted.filter(isLink)) consider(f);
+  if (skipped.length) {
+    const shown = skipped.slice(0, 3).join(", ") + (skipped.length > 3 ? `, … ${skipped.length - 3} more` : "");
+    console.error(follow
+      ? `jgrep: skipped ${skipped.length} symlink(s) whose name or target looks like a secret, or that dangle: ${shown}`
+      : `jgrep: skipped ${skipped.length} symlink(s) (not followed by default; --follow-symlinks follows them): ${shown}`);
+  }
+  const cap = opts.maxTotalBytes ?? MAX_TOTAL_BYTES;
+  let total = 0;
+  for (const f of out) { const n = fs.statSync(f).size; if (n <= MAX_FILE_BYTES) total += n; }
+  if (total > cap)
+    throw new Error(`the selected files total ${(total / 1e6).toFixed(1)} MB of text, over the ${(cap / 1e6).toFixed(0)} MB per-run cap — pass a narrower path`);
+  return out.sort();
 }
 
 const MAX_WALK_FILES = 5000;
+/** Recursive listing without git: hidden entries and SKIP_DIRS are skipped. Symlinks are
+ *  ADDED as entries (never descended here) — listFiles decides whether to follow them. */
 function walk(root: string, out: Set<string>, dir = root) {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
     if (SKIP_DIRS.has(e.name) || e.name.startsWith(".")) continue;
@@ -179,21 +272,22 @@ function walk(root: string, out: Set<string>, dir = root) {
         `Run jgrep inside a project, or pass its path:  jgrep "..." ~/Documents/<project>`);
     }
     const p = path.join(dir, e.name);
-    e.isDirectory() ? walk(root, out, p) : out.add(p);
+    if (e.isDirectory()) walk(root, out, p);
+    else out.add(p);
   }
 }
 
 export function readText(file: string): string | null {
   const st = fs.statSync(file);
-  if (st.size > 1_000_000) return null;
+  if (st.size > MAX_FILE_BYTES) return null;
   const buf = fs.readFileSync(file);
   if (buf.subarray(0, 8000).includes(0)) return null; // binary
   return buf.toString("utf8");
 }
 
-export function chunkPaths(paths: string[]): Chunk[] {
+export function chunkPaths(paths: string[], opts: ListOptions = {}): Chunk[] {
   const chunks: Chunk[] = [];
-  for (const file of listFiles(paths)) {
+  for (const file of listFiles(paths, opts)) {
     const text = readText(file);
     if (text !== null) chunks.push(...(isMarkdownPath(file) ? chunkMarkdown(file, text) : chunk(file, text)));
   }
