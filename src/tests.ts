@@ -313,7 +313,7 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
     const malformed: number[] = [];
     b.forEach((ui, j) => {
       const p = res.answers[`t${j}`]?.noul;
-      if (Number.isFinite(p)) {
+      if (typeof p === "number" && Number.isFinite(p)) {
         cache[units[ui].key] = p;
         entries.push({ unit: ui, p });
       } else malformed.push(ui);

@@ -14,7 +14,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo
 import * as path from "node:path";
-import { DEFAULT_PRICE_PER_MTOK, type Fetch } from "./providers";
+import type { Fetch } from "./providers";
 import {
   buildRequest, jgrep, numberEnvelope, ENVELOPE_MAX_NUMBERS,
   type Chunk,

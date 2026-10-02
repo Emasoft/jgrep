@@ -91,7 +91,7 @@ test("vote suffixes compose after the normalized base: whitespace-variant re-run
   const calls: unknown[] = [];
   const fetchImpl = okFetch(calls);
   const cache1: Cache = {};
-  const r1 = await jgrep("swallows errors", [chunkOf(BASE)], opts(cache1, fetchImpl, { votes: 2 }));
+  await jgrep("swallows errors", [chunkOf(BASE)], opts(cache1, fetchImpl, { votes: 2 }));
   expect(calls).toHaveLength(1); // one request carrying both vote questions
   expect(Object.keys(cache1).every((k) => k.endsWith("#v0") || k.endsWith("#v1"))).toBe(true);
   saveCache(cache1, file);
@@ -128,7 +128,7 @@ test("saveCache: writes .tmp-<pid> then renames into place — no tmp file left 
   const dir = tmpDir();
   const file = path.join(dir, "cache.json");
   const spy = spyOn(fs, "renameSync");
-  let renameArgs: unknown[] = [];
+  let renameArgs: unknown[];
   try {
     saveCache({ a: 1 }, file);
     expect(spy).toHaveBeenCalledTimes(1);

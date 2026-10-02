@@ -221,7 +221,7 @@ export function listFiles(paths: string[], opts: ListOptions = {}): string[] {
       // process cwd failed with "outside repository" for any directory in another repo
       // than the cwd's, and the silent walk fallback hid that (.gitignore then ignored).
       execFileSync("git", ["-C", p, "ls-files", "-z", "-co", "--exclude-standard"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
-        .split("\0").filter(Boolean).forEach((f) => listed.add(path.join(p, f)));
+        .split("\0").filter(Boolean).forEach((f) => { listed.add(path.join(p, f)); });
     } catch (e) {
       // "not a git repository" is the expected non-repo case: walk silently. Anything else
       // (git missing, dubious ownership, a corrupt index) used to fall back silently too,
@@ -467,7 +467,9 @@ export function cacheFilePath(env: Record<string, string | undefined> = process.
   return path.join(xdg && path.isAbsolute(xdg) ? xdg : path.join(home, ".cache"), "jgrep", "cache.json");
 }
 const CACHE_FILE = cacheFilePath();
-export type Cache = Record<string, any>;
+/** Persistent answers: a chunk key -> p (number), a rows key -> its answer record. Values come
+ *  from a JSON file a user can edit, so every read checks the shape (unknown, not any). */
+export type Cache = Record<string, unknown>;
 
 /** WI-6 size cap: at most this many entries survive a save; the OLDEST-inserted
  *  keys are evicted first, so the newest judgments always survive. */
@@ -861,7 +863,7 @@ export async function jgrep(question: string, input: Chunk[], o: Options): Promi
       let complete = true;
       for (let v = 0; v < votes; v++) {
         const p = res.answers[qid(j, v)]?.noul;
-        if (Number.isFinite(p)) {
+        if (typeof p === "number" && Number.isFinite(p)) {
           ps.push(p);
           if (votes > 1) cache[`${keyOf(ci)}#v${v}`] = p;
         } else complete = false;
@@ -985,7 +987,7 @@ export async function jgrep(question: string, input: Chunk[], o: Options): Promi
         const missing: Hit[] = [];
         bp.forEach(({ hit, cacheKey }, j) => {
           const p = res.answers[`c${j}`]?.noul;
-          if (Number.isFinite(p)) { cache[cacheKey] = p; got.push({ hit, p }); }
+          if (typeof p === "number" && Number.isFinite(p)) { cache[cacheKey] = p; got.push({ hit, p }); }
           else missing.push(hit);
         });
         return { index, got, missing };

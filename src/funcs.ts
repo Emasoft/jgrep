@@ -65,7 +65,7 @@ const SIG_PATTERNS: Record<string, RegExp[]> = {
   // java + csharp share the visibility/modifiers + [return type] + name + "(" shape;
   // the lazy return-type loop admits multi-token generic types (`public static <T> T foo(`)
   java: [
-    /^\s*(?:(?:public|private|protected|internal|static|final|abstract|virtual|override|sealed|async|synchronized|partial|unsafe|extern|new)\s+)+(?:[\w<>\[\],?.]*\s+)*?[A-Za-z_]\w*\s*\(/,
+    /^\s*(?:(?:public|private|protected|internal|static|final|abstract|virtual|override|sealed|async|synchronized|partial|unsafe|extern|new)\s+)+(?:[\w<>[\],?.]*\s+)*?[A-Za-z_]\w*\s*\(/,
     /^\s*(?:(?:public|private|protected|internal|static|final|abstract|sealed|partial)\s+)*(?:class|interface|enum|record|struct)\s+[A-Za-z_]\w*/,
   ],
   kotlin: [
@@ -84,11 +84,11 @@ const SIG_PATTERNS: Record<string, RegExp[]> = {
   ],
   c: [
     // `type name(` at column 0 — a definition only when the line has no trailing `;`
-    /^[A-Za-z_][\w\s\*]*[\s\*]+[A-Za-z_]\w*\s*\(/,
+    /^[A-Za-z_][\w\s*]*[\s*]+[A-Za-z_]\w*\s*\(/,
   ],
   cpp: [
     // like c plus namespaces (`Foo::bar`), destructors (`~Foo`) and separators via `:`
-    /^[A-Za-z_~][\w:<>,\s\*&~]*[\s\*&:]+~?[A-Za-z_]\w*(?:::\w+)?\s*\(/,
+    /^[A-Za-z_~][\w:<>,\s*&~]*[\s*&:]+~?[A-Za-z_]\w*(?:::\w+)?\s*\(/,
   ],
   bash: [
     /^function\s+[A-Za-z_]\w*/,

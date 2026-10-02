@@ -222,11 +222,11 @@ async function main() {
       try {
         execFileSync("git", ["worktree", "remove", "--force", wtDir], { cwd: repo, stdio: "pipe" });
       } catch {
-        try { fs.rmSync(wtDir, { recursive: true, force: true }); } catch {}
-        try { execFileSync("git", ["worktree", "prune"], { cwd: repo, stdio: "pipe" }); } catch {}
+        try { fs.rmSync(wtDir, { recursive: true, force: true }); } catch { /* best-effort cleanup of a scratch worktree */ }
+        try { execFileSync("git", ["worktree", "prune"], { cwd: repo, stdio: "pipe" }); } catch { /* best-effort: a stale entry is pruned on a later run */ }
       }
     } else {
-      try { fs.rmSync(wtDir, { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(wtDir, { recursive: true, force: true }); } catch { /* best-effort cleanup of a scratch dir */ }
     }
   }
 

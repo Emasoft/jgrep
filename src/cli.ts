@@ -166,7 +166,8 @@ const c = (code: string, s: string) => (tty ? `\x1b[${code}m${s}\x1b[0m` : s);
 /** Repo text printed to the terminal loses its C0 control characters (TAB and newline
  *  kept) and DEL: a hostile repo's chunk could otherwise push ANSI/OSC escape sequences
  *  through jgrep — retitle the window, clear the screen, forge output (audit NIT). */
-export const safeText = (s: string): string => s.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
+export const safeText = (s: string): string =>
+  [...s].filter((ch) => { const n = ch.charCodeAt(0); return n === 9 || n === 10 || (n >= 32 && n !== 127); }).join("");
 
 export function parse(argv: string[]) {
   const o = {
@@ -208,7 +209,7 @@ export function parse(argv: string[]) {
     else if (a === "--retries") o.retries = Number(argv[++i]);
     else if (a === "--rate") o.rate = Number(argv[++i]);
     else if (a === "--fail-fast") o.failFast = true;
-    else if (a === "--staged") (o.diff ??= []).push("--staged");
+    else if (a === "--staged") { o.diff ??= []; o.diff.push("--staged"); }
     else if (a === "--rows") o.rows = argv[++i] ?? "";
     else if (a === "--questions") o.questions = argv[++i] ?? "";
     else if (a === "--out") o.out = argv[++i] ?? "";
@@ -292,7 +293,6 @@ function warnUnderpriced(w: Wiring) {
  *  upstream #14 object instead. Exit 0. Returns false on a real run. */
 function reportEstimate(w: Wiring, json: boolean): boolean {
   if (!w.estimate) return false;
-  const tokens = estimateTokens(w.estimate);
   // --funcs: pass 1 is exact; the upper bound adds pass 2 over every candidate file.
   const upper = w.estimateUpper && { requests: w.estimate.requests + w.estimateUpper.requests, chars: w.estimate.chars + w.estimateUpper.chars };
   if (json) {

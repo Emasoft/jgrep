@@ -522,6 +522,10 @@ export function errorTextOf(body: string): string {
   return body;
 }
 
+/** One answer as Jev returns it — noul (probability), choice (label + probabilities) or
+ *  score (value + confidence); the fields of the other types are absent. */
+export interface JevAnswer { type: string; noul?: number; choice?: string; probabilities?: Record<string, number>; score?: number; confidence?: number }
+
 /** POST one System One request with per-attempt timeouts, a batch deadline that
  *  includes retries, Retry-After-aware backoff and typed errors (WI-11). The
  *  caller owns `body` (including `body.model`) — it is never mutated here. */
@@ -530,7 +534,7 @@ export async function postSystemOne(
   backend: Backend,
   apiKey: string,
   opts: PostOpts = {},
-): Promise<{ answers: Record<string, any>; usage?: { input_tokens: number }; cost?: number; model?: string }> {
+): Promise<{ answers: Record<string, JevAnswer>; usage?: { input_tokens: number }; cost?: number; model?: string }> {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const maxRetries = opts.maxRetries ?? 4;
   const requestTimeoutMs = opts.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
@@ -564,8 +568,8 @@ export async function postSystemOne(
 
     // What failed THIS attempt (a retryable status or a retryable transport error).
     let retryStatus: number | undefined;
-    let retryKind: JevErrorKind = "server_unreachable";
-    let retryDetail = "";
+    let retryKind: JevErrorKind; // both are set on every path that reaches the retry code below
+    let retryDetail: string;
     let retryCause: unknown;
     let retryAfterRaw: string | null = null;
 
@@ -605,12 +609,12 @@ export async function postSystemOne(
           || typeof (parsed as Record<string, unknown>).answers !== "object") {
           throw malformedResponseError(backend, text.slice(0, SNIPPET_MAX));
         }
-        const p = parsed as Record<string, any>;
-        const usage = p.usage !== null && typeof p.usage === "object" ? (p.usage as { input_tokens: number }) : undefined;
+        const p = parsed as { answers: Record<string, JevAnswer>; usage?: unknown; cost?: unknown; cost_usd?: unknown; model?: unknown };
+        const usage = p.usage !== null && typeof p.usage === "object" ? (p.usage as { input_tokens: number; cost?: unknown }) : undefined;
         return {
-          answers: p.answers as Record<string, any>,
+          answers: p.answers,
           usage,
-          cost: firstNumeric(p.cost, p.usage?.cost, p.cost_usd),
+          cost: firstNumeric(p.cost, usage?.cost, p.cost_usd),
           model: typeof p.model === "string" ? p.model : undefined,
         };
       }

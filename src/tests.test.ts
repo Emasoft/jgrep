@@ -81,8 +81,7 @@ test("selectTests: a failed batch is isolated into errors (no throw, no p:NaN en
   const diff = "diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n@@ -1 +1 @@\n-a\n+b\n";
   const tests = ["a", "b", "c"].map((n) => ({ file: `t/${n}.test.ts`, signature: `it("${n}")` }));
   let n = 0;
-  const fetchImpl = (async (_u: string, init: any) => {
-    const body = JSON.parse(init.body);
+  const fetchImpl = (async () => {
     if (n++ === 0) return new Response("bad", { status: 400 }); // first batch: fatal-class, not retried
     return new Response(JSON.stringify({ answers: {} }), { status: 200 }); // answered nothing
   }) as any;

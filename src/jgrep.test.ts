@@ -1,4 +1,7 @@
 import { test, expect } from "bun:test";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { chunk, diffChunks, buildRequest, jgrep } from "./jgrep";
 process.env.JGREP_NO_MAIN = "1";
 const { parse } = await import("./cli");
@@ -155,7 +158,6 @@ test("estimateTokens is within 15% of provider-billed tokens (upstream live meas
 });
 
 test("--estimate --json prints the estimate object for code, --tests and --rows, with no key", () => {
-  const fs = require("node:fs"), os = require("node:os"), path = require("node:path");
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-est-"));
   const env = { PATH: process.env.PATH ?? "", HOME: home }; // no key, empty cache
   const cli = path.resolve(import.meta.dir, "cli.ts");
@@ -194,7 +196,6 @@ test("--estimate --json prints the estimate object for code, --tests and --rows,
 });
 
 test("B5 --rows --estimate prices rows x questions packs, not the files of the current directory", () => {
-  const fs = require("node:fs"), os = require("node:os"), path = require("node:path");
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "jgrep-est-rows-"));
   const env = { PATH: process.env.PATH ?? "", HOME: home }; // no key, empty cache
   const cli = path.resolve(import.meta.dir, "cli.ts");

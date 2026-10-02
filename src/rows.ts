@@ -3,7 +3,7 @@
 // rows per request. Output is the table with one answer column per question.
 import fs from "node:fs";
 import { createHash } from "node:crypto";
-import { BACKENDS, DEFAULT_PRICE_PER_MTOK, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
+import { BACKENDS, DEFAULT_PRICE_PER_MTOK, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type JevAnswer, type PostOpts } from "./providers";
 import { runPool, type PoolResult } from "./pool";
 import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
 import {
@@ -13,7 +13,7 @@ import {
 
 export type Row = Record<string, string>;
 export type Questions = Record<string, { type: "noul" | "choice" | "score"; instructions: string; [k: string]: unknown }>;
-export type Answer = { type: string; noul?: number; choice?: string; score?: number; confidence?: number; probabilities?: Record<string, number> };
+export type Answer = JevAnswer;
 
 // ---- input ------------------------------------------------------------------
 export function parseCsv(text: string): { columns: string[]; rows: Row[] } {
@@ -163,7 +163,10 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
   const apiKeyOf = (): string => { apiKey ??= resolveApiKey(backend); return apiKey; };
   const answers: (Record<string, Answer> | null)[] = new Array(rows.length).fill(null); // errored rows stay null — dense, never holes
   const todo: number[] = [];
-  rows.forEach((r, i) => { const hit = cache[key(model, qJson, r)]; if (hit) answers[i] = hit; else todo.push(i); });
+  rows.forEach((r, i) => {
+    const hit = cache[key(model, qJson, r)];
+    if (hit !== null && typeof hit === "object") answers[i] = hit as Record<string, Answer>; else todo.push(i);
+  });
   // Defensive normalization (same rule as jgrep()): a 0/fractional batch would spin
   // the loop forever (+= 0) or overlap packs. parse() rejects those; library callers
   // get floored and clamped at 1 instead.

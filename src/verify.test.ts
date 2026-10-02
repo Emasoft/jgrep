@@ -106,7 +106,7 @@ test("verify above hysteresis: pass-2 p >= threshold * 0.6 — the hit stands", 
 
 test("verify below hysteresis: pass-2 p < threshold * 0.6 — the hit drops out of `hits`, stays in `all`", async () => {
   const cs = chunk("f.ts", src, { minLines: 3, maxLines: 60 }).slice(1, 2);
-  const { calls, fetchImpl } = voteFetch([0.95], 0.3); // 0.3 < 0.42
+  const { fetchImpl } = voteFetch([0.95], 0.3); // 0.3 < 0.42
   const r = await jgrep("swallows errors", cs, { ...opts({ verify: true }), fetchImpl, cache: {} });
   expect(r.hits).toEqual([]); // dropped
   expect(r.all.map((h) => h.p)).toEqual([0.95]); // but still reported with its main-pass p
@@ -138,7 +138,7 @@ test("votes + verify compose (drop): a median hit whose strict re-ask sinks belo
 test("verify fail-open: a failed verification request keeps the hit and reports the chunk error", async () => {
   const cs = chunk("f.ts", src, { minLines: 3, maxLines: 60 }).slice(1, 2);
   let n = 0;
-  const fetchImpl = (async (_url: unknown, init: { body: string }) => {
+  const fetchImpl = (async () => {
     if (n++ === 0) {
       const answers = { c0: { type: "noul", noul: 0.95 } };
       return new Response(JSON.stringify({ answers, usage: { input_tokens: 10 } }), { status: 200 });
