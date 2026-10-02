@@ -432,7 +432,18 @@ export const settledCost = (res: { usage?: { input_tokens?: number }; cost?: num
 export class BudgetMeter {
   spent = 0;
   reserved = 0;
+  /** Highest provider-REPORTED $/Mtok seen this run (cost / input_tokens). Reservations are
+   *  priced at pricePerMtok (JEV_PRICE_PER_MTOK or the default); when the provider really
+   *  bills more, concurrent reservations under-price and a wave can overshoot the cap. */
+  seenPerMtok = 0;
   constructor(readonly budget: number, readonly pricePerMtok: number) {}
+  /** One stderr line when the observed rate is >10% above the reservation price (smaller
+   *  gaps are estimator noise), else undefined. */
+  underpricedWarning(): string | undefined {
+    if (!(this.seenPerMtok > this.pricePerMtok * 1.1)) return undefined;
+    return `warning: the provider billed ~$${this.seenPerMtok.toPrecision(3)}/Mtok this run, above the $${this.pricePerMtok}/Mtok that --budget reserves at; ` +
+      `set JEV_PRICE_PER_MTOK=${this.seenPerMtok.toPrecision(3)} so the cap reserves enough`;
+  }
   /** Reserve, send, settle. Throws budget_exhausted — with nothing sent — when the
    *  request does not fit. budget_exhausted is non-retryable but deliberately NOT fatal
    *  (errors.ts FATAL_KINDS): the breaker never trips on it, so every remaining batch
@@ -450,6 +461,8 @@ export class BudgetMeter {
     try {
       const res = await send();
       real = settledCost(res, this.pricePerMtok);
+      const tok = res.usage?.input_tokens;
+      if (res.cost !== undefined && tok) this.seenPerMtok = Math.max(this.seenPerMtok, (res.cost / tok) * 1e6);
       return res;
     } catch (e) {
       // A failure the provider may still have billed keeps its reservation as spend
@@ -484,7 +497,7 @@ export interface Options {
   envelopes?: boolean;         // --envelopes (WI-9): append each chunk's numbers ("[numbers: 42, 7]") to the judged text
   budget?: number;             // --budget (WI-7): once metered cost exceeds this many dollars, un-run chunks error budget_exhausted
   pricePerMtok?: number;       // $/Mtok for the --budget meter when the provider reports no cost (default DEFAULT_PRICE_PER_MTOK)
-  meter?: BudgetMeter;         // internal: a meter shared across runs (jgrepFuncs' two passes); else built from budget
+  meter?: BudgetMeter;         // a meter shared across runs (jgrepFuncs' two passes, the CLI's under-pricing check); else built from budget
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
 }
 export interface ChunkError { file: string; start: number; end: number; kind: JevErrorKind; message: string; hint?: string }

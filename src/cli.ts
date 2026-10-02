@@ -3,7 +3,7 @@
 import fs from "node:fs";
 // @ts-expect-error — no @types/node in this zero-dep Bun-only repo; only createHash is used
 import { createHash } from "node:crypto";
-import { chunkPaths, diffChunks, estimateLine, estimateTokens, gitDiff, jgrep, jgrepFuncs, loadCache, parseTagCategories, saveCache, type Estimate, type Hit, type Kind } from "./jgrep";
+import { BudgetMeter, chunkPaths, diffChunks, estimateLine, estimateTokens, gitDiff, jgrep, jgrepFuncs, loadCache, parseTagCategories, saveCache, type Estimate, type Hit, type Kind } from "./jgrep";
 import { readRows, loadQuestions, scoreRows, flattenAnswers, toCsv } from "./rows";
 import { loadTests, selectTests } from "./tests";
 import { resolvePricePerMtok, resolveProvider, type Backend } from "./providers";
@@ -258,6 +258,15 @@ interface Wiring {
   pricePerMtok: number; // $/Mtok for the cost estimate — resolved (and validated) up front
   estimate?: Estimate;  // --estimate: dry-run sink; the run counts requests instead of sending them
   budget?: number;      // --budget > $JEV_BUDGET > undefined (no cap); metered per batch when set
+  meter?: BudgetMeter;  // the run's meter when a budget is set — created here so the summary can read its under-pricing check
+}
+
+/** After the summary: the meter's one-line warning when the provider billed above the
+ *  $/Mtok the reservations were priced at (PR #2 open item: the cap is only as exact as
+ *  that price). No budget = no meter = nothing to warn about. */
+function warnUnderpriced(w: Wiring) {
+  const msg = w.meter?.underpricedWarning();
+  if (msg) console.error(c("33", msg));
 }
 
 /** --estimate: ONE dry-run implementation for every mode (code, --diff, --rows, --tests).
@@ -367,6 +376,7 @@ async function main() {
     estimate: o.estimate ? { requests: 0, chars: 0, files: {} } : undefined,
     budget: o.budget ?? resolveBudgetEnv(process.env), // --budget (WI-7): flag > $JEV_BUDGET > unlimited
   };
+  if (wiring.budget !== undefined) wiring.meter = new BudgetMeter(wiring.budget, pricePerMtok);
   if (o.tests) return testsMain(o, wiring);
   if (o.rows) return rowsMain(o, wiring);
   if (!o.question) { console.error(USAGE); process.exit(2); }
@@ -446,6 +456,7 @@ async function main() {
       + (budgetStopped ? ` · stopped by --budget at $${cost.toFixed(4)} (limit $${wiring.budget})` : "");
     console.error(c("90", r.errors.length ? summary + erroredSuffix(r.errors) : summary));
     printExamples(r.errors.map((e) => ({ line: `  ${e.kind}: ${e.file}:${e.start}-${e.end} ${e.message.slice(0, 120)}`, hint: e.hint })));
+    warnUnderpriced(wiring);
     // grep semantics when clean; 2 when any chunk errored (partial failure).
     process.exitCode = r.errors.length > 0 ? 2 : (r.hits.length > 0 ? 0 : 1);
   } finally {
@@ -485,6 +496,7 @@ async function testsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
       + (budgetStopped ? ` · stopped by --budget at $${cost.toFixed(4)} (limit $${wiring.budget})` : "");
     console.error(c("90", r.errors.length ? summary + erroredSuffix(r.errors) : summary));
     printExamples(r.errors.map((e) => ({ line: `  ${e.kind}: ${e.file} ${e.message.slice(0, 120)}`, hint: e.hint })));
+    warnUnderpriced(wiring);
     // grep semantics when clean; 2 when any batch errored (partial failure) — same rule as code mode.
     process.exitCode = r.errors.length > 0 ? 2 : (r.selected.length ? 0 : 1);
   } finally {
@@ -555,6 +567,7 @@ async function rowsMain(o: ReturnType<typeof parse>, wiring: Wiring) {
       + (budgetStopped ? ` · stopped by --budget at $${cost.toFixed(4)} (limit $${wiring.budget})` : "");
     console.error(c("90", r.errors.length ? summary + erroredSuffix(r.errors) : summary));
     printExamples(r.errors.map((e) => ({ line: `  ${e.kind}: row ${e.row} ${e.message.slice(0, 120)}`, hint: e.hint })));
+    warnUnderpriced(wiring);
     if (wrote) console.error(c("90", `wrote ${o.out}`));
     // grep semantics when clean; 2 when any row errored (partial failure) — same rule as code mode.
     process.exitCode = r.errors.length > 0 ? 2 : (o.questions || hits ? 0 : 1);

@@ -161,6 +161,7 @@ export interface SelectOptions {
   ratePerSec?: number;         // token-bucket pacing across all requests; 0/undefined = unlimited
   failFast?: boolean;          // rethrow the first fatal error instead of isolating it
   estimate?: Estimate;         // dry run: count requests/chars into this sink, never call the provider
+  meter?: BudgetMeter;         // a caller-owned meter (the CLI reads its under-pricing check); else built from budget
   budget?: number;             // --budget: hard cap via reservation, same as jgrep()/scoreRows(); undefined = no cap
   pricePerMtok?: number;       // $/Mtok for the budget reservation and token-priced spend (default DEFAULT_PRICE_PER_MTOK)
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
@@ -225,7 +226,7 @@ export async function selectTests(diff: string, tests: TestFile[], o: SelectOpti
   // --budget (audit MAJOR): --tests used to have no meter, so --budget / $JEV_BUDGET were
   // silently ignored here while every other mode honoured them. Same opt-in reservation
   // meter as jgrep()/scoreRows(); no budget = no meter.
-  const meter = o.budget !== undefined ? new BudgetMeter(o.budget, price) : undefined;
+  const meter = o.meter ?? (o.budget !== undefined ? new BudgetMeter(o.budget, price) : undefined);
   const worker = async (b: number[], index: number): Promise<BatchOutcome> => {
     const state = { diff: compact, tests: b.map((i, j) => ({ id: `t${j}`, file: tests[i].file, signature: tests[i].signature })) };
     const questions: Record<string, unknown> = {};

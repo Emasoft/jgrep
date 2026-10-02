@@ -95,6 +95,7 @@ export interface RowsOptions {
   ratePerSec?: number;         // token-bucket pacing across all requests; 0/undefined = unlimited
   failFast?: boolean;          // rethrow the first fatal error instead of isolating it
   estimate?: Estimate;         // dry run: count requests/chars into this sink, never call the provider
+  meter?: BudgetMeter;         // a caller-owned meter (the CLI reads its under-pricing check); else built from budget
   budget?: number;             // --budget: hard cap via reservation, same as jgrep(); undefined = no cap
   pricePerMtok?: number;       // $/Mtok for the budget reservation and token-priced spend (default DEFAULT_PRICE_PER_MTOK)
   fetchImpl?: Fetch; cache?: Cache; onProgress?: (done: number, total: number) => void;
@@ -145,7 +146,7 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
   let hadSuccess = false;
   // --budget (B4): rows used to ignore the budget entirely (cli.ts passed it, RowsOptions
   // dropped it). Same opt-in reservation meter as jgrep(); no budget = no meter.
-  const meter = o.budget !== undefined ? new BudgetMeter(o.budget, price) : undefined;
+  const meter = o.meter ?? (o.budget !== undefined ? new BudgetMeter(o.budget, price) : undefined);
   const worker = async (b: number[], index: number): Promise<PackOutcome> => {
     const req = buildRowsRequest(b.map((i) => rows[i]), questions, model);
     // --estimate: count before apiKeyOf() so a dry run needs no key.

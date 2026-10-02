@@ -329,3 +329,41 @@ test("cli e2e: --estimate prints the per-file table and the estimated line — e
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }, 20_000);
+
+// ---- --budget: warn when the configured $/Mtok is below what the provider bills ----
+
+/** Fake gateway that reports a cost 10x the pinned JEV_PRICE_PER_MTOK (0.042). */
+const startPriceyGateway = () =>
+  Bun.serve({
+    port: 0,
+    fetch: async (req: Request) => {
+      const body: { state: { chunks?: { id: string }[] } } = await req.json();
+      const answers: Record<string, unknown> = {};
+      for (const c of body.state.chunks ?? []) answers[c.id] = { type: "noul", noul: 0.9 };
+      return new Response(JSON.stringify({ answers, usage: { input_tokens: 1000 }, cost: (1000 * 0.42) / 1e6 }), { status: 200 });
+    },
+  });
+
+test("BudgetMeter: tracks the provider's observed $/Mtok and warns only when it is above the reservation price", async () => {
+  const { BudgetMeter } = await import("./jgrep");
+  const m = new BudgetMeter(100, 0.042);
+  await m.run({}, "gateway", async () => ({ answers: {}, usage: { input_tokens: 1000 }, cost: (1000 * 0.42) / 1e6 }));
+  expect(m.seenPerMtok).toBeCloseTo(0.42, 9);
+  expect(m.underpricedWarning()).toContain("0.42");
+  const ok = new BudgetMeter(100, 0.042);
+  await ok.run({}, "gateway", async () => ({ answers: {}, usage: { input_tokens: 1000 }, cost: (1000 * 0.043) / 1e6 }));
+  expect(ok.underpricedWarning()).toBeUndefined(); // within 10%: estimator noise, no warning
+});
+
+test("cli e2e: --budget with JEV_PRICE_PER_MTOK below the billed rate prints one under-pricing warning", async () => {
+  const server = startPriceyGateway();
+  try {
+    const p = await spawn(["bun", "src/cli.ts", "--no-cache", "--api", "gateway", "--budget", "100", "swallows errors", "src/errors.ts"], gatewayEnv(server.port));
+    expect(p.stderr).toMatch(/warning: the provider billed ~\$0\.42\d*\/Mtok/);
+    expect(p.stderr).toContain("JEV_PRICE_PER_MTOK");
+    const q = await spawn(["bun", "src/cli.ts", "--no-cache", "--api", "gateway", "swallows errors", "src/errors.ts"], gatewayEnv(server.port));
+    expect(q.stderr).not.toContain("warning: the provider billed"); // no budget: nothing is reserved, nothing to warn about
+  } finally {
+    server.stop(true);
+  }
+}, 20_000);
