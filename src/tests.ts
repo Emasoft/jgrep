@@ -23,7 +23,10 @@ export interface TestFile { file: string; signature: string }
 export interface Selected { file: string; p: number; reason: "direct" | "import" | "package" | "jev" | "cached" }
 
 // ponytail: patterns cover js/ts, python, go, ruby, rust, java, elixir; add flags when a stack is missing.
-export const TEST_FILE_RE = /(^|\/)(tests?|__tests__|spec|specs)\/|(\.|_)(test|spec|tst|test-d)\.[cm]?[jt]sx?$|(^|\/)test_[^/]*\.py$|_test\.(py|go|rb|exs)$|_spec\.rb$|(^|\/)[^/]*Tests?\.(java|kt|swift|cs)$|(^|\/)tests\.rs$/;
+// A file under a tests/ or spec/ directory counts only when it is SOURCE code: the old
+// bare-directory rule also selected README.md, results/*.jsonl and fixture data (e.g. this
+// repo's bench/tests/), which `--tests | xargs <runner>` then handed to the test runner.
+export const TEST_FILE_RE = /(^|\/)(tests?|__tests__|spec|specs)\/(.*\/)?[^/]+\.([cm]?[jt]sx?|py|go|rb|rs|java|kt|kts|swift|cs|exs?|php|scala|dart|c|cc|cpp|m)$|(\.|_)(test|spec|tst|test-d)\.[cm]?[jt]sx?$|(^|\/)test_[^/]*\.py$|_test\.(py|go|rb|exs)$|_spec\.rb$|(^|\/)[^/]*Tests?\.(java|kt|swift|cs)$|(^|\/)tests\.rs$/;
 
 export function findTestFiles(files: string[]): string[] {
   return files.filter((f) => TEST_FILE_RE.test(f));

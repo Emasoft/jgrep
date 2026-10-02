@@ -167,3 +167,11 @@ test("python and multi-line JS imports are recognized", async () => {
   expect([...packageMatches(["src/flask/__init__.py"], tests, () => "", has, "")].sort()).toEqual(["a", "b"]);
   expect(signature("x.ts", 'import {\n  a,\n} from "zod";\nconst q = 1;')).toContain('} from "zod";');
 });
+
+test("findTestFiles: only SOURCE files under a tests/ or spec/ dir count — docs, data and fixtures do not", () => {
+  const files = [
+    "bench/tests/README.md", "bench/tests/results/flask.jsonl", "spec/fixtures/data.json", "tests/snap.txt",
+    "bench/tests/run.ts", "tests/test_a.py", "spec/models/user_spec.rb", "__tests__/a.jsx", "src/x.test.ts",
+  ];
+  expect(findTestFiles(files)).toEqual(["bench/tests/run.ts", "tests/test_a.py", "spec/models/user_spec.rb", "__tests__/a.jsx", "src/x.test.ts"]);
+});
