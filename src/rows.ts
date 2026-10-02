@@ -6,7 +6,10 @@ import { createHash } from "node:crypto";
 import { BACKENDS, DEFAULT_PRICE_PER_MTOK, postSystemOne, resolveApiKey, RateLimiter, type Backend, type Fetch, type PostOpts } from "./providers";
 import { runPool, type PoolResult } from "./pool";
 import { isFatalError, JevProviderError, type JevErrorKind } from "./errors";
-import { DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, HARD_MAX_BYTES, KEY_WORKED_EARLIER_HINT, BudgetMeter, normalizeForCache, settledCost, type Cache, type Estimate } from "./jgrep";
+import {
+  DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_SEC, DEFAULT_TIMEOUT_SEC, HARD_MAX_BYTES, KEY_WORKED_EARLIER_HINT, MAX_REQUEST_BYTES,
+  BudgetMeter, byteLen, fitChunk, normalizeForCache, packBatches, settledCost, type Cache, type Estimate,
+} from "./jgrep";
 
 export type Row = Record<string, string>;
 export type Questions = Record<string, { type: "noul" | "choice" | "score"; instructions: string; [k: string]: unknown }>;
@@ -111,7 +114,42 @@ export interface RowsResult { answers: (Record<string, Answer> | null)[]; tokens
 
 /** One request-pack's outcome; runPool results are completion-ordered, so the pack
  *  index rides along and `answers` is re-associated after the pool settles. */
-interface PackOutcome { index: number; rowResults: { row: number; answers: Record<string, Answer> }[] }
+interface PackOutcome { index: number; unitResults: { unit: number; answers: Record<string, Answer> }[] }
+
+/** A row's JSON over this many bytes is judged in parts (half a request: room for the
+ *  questions and the other rows of a pack). */
+export const ROW_PART_BYTES = MAX_REQUEST_BYTES / 2;
+
+/** USER 2026-10-02: never truncate to fit the context — split. A row over ROW_PART_BYTES
+ *  becomes several part-rows: its small fields repeated in every part, each big field cut
+ *  into context-sized pieces (line boundaries with overlap, giant lines by characters) and
+ *  part k carrying piece k of every big field. A row that fits is returned as-is. */
+export function rowParts(row: Row, maxBytes: number = ROW_PART_BYTES): Row[] {
+  if (byteLen(JSON.stringify(row)) <= maxBytes) return [row];
+  const entries = Object.entries(row);
+  const share = Math.floor(maxBytes / entries.length);
+  const big = entries.filter(([, v]) => byteLen(v) > share);
+  const small = Object.fromEntries(entries.filter(([, v]) => byteLen(v) <= share));
+  const room = Math.max(1, Math.floor((maxBytes - byteLen(JSON.stringify(small))) / big.length));
+  const pieces = big.map(([k, v]) => [k, fitChunk({ file: k, start: 1, end: v.split("\n").length, text: v }, "code", room).map((c) => c.text)] as const);
+  const n = Math.max(...pieces.map(([, ps]) => ps.length));
+  return Array.from({ length: n }, (_, i) => ({ ...row, ...small, ...Object.fromEntries(pieces.map(([k, ps]) => [k, ps[i] ?? ""])) }));
+}
+
+/** USER 2026-10-02: a per-ROW verdict judged in parts takes the best part: noul -> the
+ *  highest probability, score -> the highest score, choice -> the label of the most
+ *  confident part. Missing answers lose to any real one. */
+export function combineParts(parts: Record<string, Answer>[]): Record<string, Answer> {
+  if (parts.length === 1) return parts[0];
+  const strength = (a: Answer): number =>
+    a.type === "noul" ? (a.noul ?? -Infinity)
+      : a.type === "score" ? (a.score ?? -Infinity)
+      : a.type === "choice" ? (a.probabilities?.[a.choice ?? ""] ?? -Infinity)
+      : -Infinity; // "missing"
+  const out: Record<string, Answer> = {};
+  for (const name of Object.keys(parts[0])) out[name] = parts.map((p) => p[name]).reduce((best, a) => (strength(a) > strength(best) ? a : best));
+  return out;
+}
 
 export async function scoreRows(rows: Row[], questions: Questions, o: RowsOptions): Promise<RowsResult> {
   const backend = o.backend ?? BACKENDS.typesafe;
@@ -130,8 +168,14 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
   // the loop forever (+= 0) or overlap packs. parse() rejects those; library callers
   // get floored and clamped at 1 instead.
   const per = Math.max(1, Math.floor(Math.min(o.batch, Math.floor(MAX_QUESTIONS_PER_REQUEST / Object.keys(questions).length))));
-  const batches: number[][] = [];
-  for (let i = 0; i < todo.length; i += per) batches.push(todo.slice(i, i + per));
+  // Units = (row, part): an oversized row is judged in parts (rowParts) and its verdict is
+  // the best part's (combineParts). Packs hold at most `per` units AND MAX_REQUEST_BYTES of
+  // request, so a pack of big rows is split into smaller packs instead of overflowing.
+  const units = todo.flatMap((row) => rowParts(rows[row]).map((data) => ({ row, data })));
+  const partsOf = new Map<number, number>();
+  for (const u of units) partsOf.set(u.row, (partsOf.get(u.row) ?? 0) + 1);
+  const unitIdx = units.map((_, i) => i);
+  const batches = packBatches(unitIdx, per, MAX_REQUEST_BYTES, (ui) => byteLen(JSON.stringify(buildRowsRequest([units[ui].data], questions, model))));
   // Same defaults and PostOpts wiring as jgrep() — resolved once, read-only in the worker.
   const timeoutMs = (o.timeoutSec ?? DEFAULT_TIMEOUT_SEC) * 1000;
   const post: PostOpts = {
@@ -151,9 +195,9 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
   // dropped it). Same opt-in reservation meter as jgrep(); no budget = no meter.
   const meter = o.meter ?? (o.budget !== undefined ? new BudgetMeter(o.budget, price) : undefined);
   const worker = async (b: number[], index: number): Promise<PackOutcome> => {
-    const req = buildRowsRequest(b.map((i) => rows[i]), questions, model);
+    const req = buildRowsRequest(b.map((ui) => units[ui].data), questions, model);
     // --estimate: count before apiKeyOf() so a dry run needs no key.
-    if (o.estimate) { o.estimate.requests++; o.estimate.chars += JSON.stringify(req).length; return { index, rowResults: [] }; }
+    if (o.estimate) { o.estimate.requests++; o.estimate.chars += JSON.stringify(req).length; return { index, unitResults: [] }; }
     const go = () => postSystemOne(req, backend, apiKeyOf(), {
       ...post,
       deadlineMs: Date.now() + timeoutMs, // per-batch deadline, retries included (§1.6.1)
@@ -161,16 +205,13 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
     const res = await (meter ? meter.run(req, backend.name, go) : go()); // throws budget_exhausted unsent
     tokens += res.usage?.input_tokens ?? 0;
     cost = (cost ?? 0) + settledCost(res, price);
-    const rowResults = b.map((ri, j) => {
+    const unitResults = b.map((ui, j) => {
       const a: Record<string, Answer> = {};
       for (const name of Object.keys(questions)) a[name] = res.answers[`r${j}.${name}`] ?? { type: "missing" };
-      // Same rule as before: a row with any missing answer is not cached. Complete rows
-      // go into the in-memory cache object now — cli.ts persists it in a finally (Step 7).
-      if (Object.values(a).every((x) => x.type !== "missing")) cache[key(model, qJson, rows[ri])] = a;
-      return { row: ri, answers: a };
+      return { unit: ui, answers: a };
     });
     hadSuccess = true; // this pack's request succeeded — set before returning (plan §1.5)
-    return { index, rowResults };
+    return { index, unitResults };
   };
   let pool: PoolResult<PackOutcome>;
   try {
@@ -187,7 +228,20 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
       e.hint = [e.hint, KEY_WORKED_EARLIER_HINT].filter(Boolean).join(" ");
     throw e;
   }
-  for (const r of pool.results) for (const rr of r.rowResults) answers[rr.row] = rr.answers;
+  // A row's verdict needs ALL its parts answered; then the best part wins (combineParts).
+  // Same caching rule as before: a row with any missing answer is not cached; complete
+  // rows go into the in-memory cache object — cli.ts persists it in a finally (Step 7).
+  const got = new Map<number, Record<string, Answer>[]>();
+  for (const r of pool.results) for (const ur of r.unitResults) {
+    const row = units[ur.unit].row;
+    got.set(row, [...(got.get(row) ?? []), ur.answers]);
+  }
+  for (const [row, parts] of got) {
+    if (parts.length !== partsOf.get(row)) continue; // a part errored: the row is reported below, never half-judged
+    const a = combineParts(parts);
+    answers[row] = a;
+    if (Object.values(a).every((x) => x.type !== "missing")) cache[key(model, qJson, rows[row])] = a;
+  }
   // Not failFast: recorded 401/403s get the same expired-vs-wrong-key distinction. One
   // clean place — mutate the JevProviderError's hint in pool.errors BEFORE mapping onto
   // rows, so the amended hint is what RowError carries down to the CLI.
@@ -196,8 +250,10 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
       if (e.error.kind === "invalid_api_key") e.error.hint = [e.error.hint, KEY_WORKED_EARLIER_HINT].filter(Boolean).join(" ");
     }
   }
+  // One error per row (a row judged in several parts may fail in several packs).
+  const erroredRows = new Set<number>();
   const errors: RowError[] = pool.errors.flatMap((e) =>
-    batches[e.index].map((row) => ({
+    [...new Set(batches[e.index].map((ui) => units[ui].row))].filter((row) => !erroredRows.has(row) && erroredRows.add(row)).map((row) => ({
       row, kind: e.error.kind, message: e.error.message,
       // The provider error's actionable hint rides along (same rule as jgrep()'s
       // ChunkError) — incl. the KEY_WORKED_EARLIER_HINT amended above.
@@ -209,7 +265,12 @@ export async function scoreRows(rows: Row[], questions: Questions, o: RowsOption
     const settled = new Set<number>(pool.results.map((r) => r.index).concat(pool.errors.map((e) => e.index)));
     for (let bi = 0; bi < batches.length; bi++) {
       if (settled.has(bi)) continue;
-      for (const row of batches[bi]) errors.push({ row, kind: "circuit_breaker_open", message: "not attempted: provider failing consistently (circuit breaker open)" });
+      for (const ui of batches[bi]) {
+        const row = units[ui].row;
+        if (erroredRows.has(row)) continue;
+        erroredRows.add(row);
+        errors.push({ row, kind: "circuit_breaker_open", message: "not attempted: provider failing consistently (circuit breaker open)" });
+      }
     }
   }
   // `requests` counts only packs actually sent: packs the breaker never dispatched and

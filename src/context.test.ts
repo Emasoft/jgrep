@@ -100,3 +100,39 @@ test("--verify and --tag batches are packed under the request budget too", async
   expect(r.hits.every((h) => h.tag === "bug")).toBe(true);
 });
 
+test("--rows: a pack whose rows exceed the budget is split into smaller packs; every row is answered", async () => {
+  const rows = Array.from({ length: 16 }, (_, i) => ({ id: String(i), bio: `creator ${i} `.repeat(400) })); // ~5 KB per row
+  const { bodies, fetchImpl } = recorder();
+  const r = await scoreRows(rows, { match: { type: "noul", instructions: "beauty" } }, { batch: 16, concurrency: 2, apiKey: "k", fetchImpl, cache: {} });
+  expect(bodies.length).toBeGreaterThan(1); // before: all 16 rows in one ~80 KB request
+  for (const b of bodies) expect(bytes(b)).toBeLessThanOrEqual(MAX_REQUEST_BYTES);
+  expect(r.answers.every((a) => a !== null)).toBe(true);
+  expect(r.errors).toEqual([]);
+});
+
+test("--rows: ONE row over the context is judged in parts; noul = best part, choice = label of the most confident part", async () => {
+  const bio = Array.from({ length: 3000 }, (_, i) => `post ${i}: travel diary entry`).join("\n") + "\nfinal post: BEAUTY tutorial";
+  const rows = [{ name: "big", bio }];
+  const bodies: string[] = [];
+  const fetchImpl = (async (_u: unknown, init: { body: string }) => {
+    bodies.push(init.body);
+    const body = JSON.parse(init.body);
+    const answers: Record<string, unknown> = {};
+    for (const [id] of Object.entries(body.questions)) {
+      const r = body.state.rows[Number(/^r(\d+)\./.exec(id)![1])];
+      const hit = r.bio.includes("BEAUTY");
+      answers[id] = id.endsWith(".match") ? { type: "noul", noul: hit ? 0.95 : 0.1 }
+        : { type: "choice", choice: hit ? "beauty" : "travel", probabilities: hit ? { beauty: 0.9, travel: 0.1 } : { beauty: 0.3, travel: 0.6 } };
+    }
+    return new Response(JSON.stringify({ answers, usage: { input_tokens: 1 } }), { status: 200 });
+  }) as unknown as Fetch;
+  const q = { match: { type: "noul" as const, instructions: "beauty content" }, topic: { type: "choice" as const, instructions: "main topic", criteria: { beauty: "beauty", travel: "travel" } } };
+  const r = await scoreRows(rows, q, { batch: 16, concurrency: 1, apiKey: "k", fetchImpl, cache: {} });
+  expect(bodies.length).toBeGreaterThan(1); // before: one ~100 KB request
+  for (const b of bodies) expect(bytes(b)).toBeLessThanOrEqual(MAX_REQUEST_BYTES);
+  const sent = bodies.map((b) => JSON.parse(b).state.rows.map((x: { bio: string }) => x.bio).join("\n")).join("\n");
+  for (const l of bio.split("\n")) expect(sent.includes(l)).toBe(true); // nothing truncated
+  expect(r.answers[0]!.match.noul).toBe(0.95);   // best part, not the first and not an average
+  expect(r.answers[0]!.topic.choice).toBe("beauty"); // label of the most confident part (0.9 > 0.6)
+});
+
